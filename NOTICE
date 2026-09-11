@@ -1,0 +1,13 @@
+EXL3-AMD
+
+Project additions are provided under the root MIT LICENSE.
+Vendored source retains its own notices, including vendor/rocm-exl3/LICENSE
+and the RDNA small-M notices under vendor/rocm-exl3/ and kernels/exl3/.
+
+Direct upstream: CarouselAether/rocm_exl3
+Revision: 550dcfed786ad7bffa08b7a6b2a216fc474cbbb5
+Foundation: Turboderp and ExLlamaV3 contributors.
+
+This is a modified source distribution. See docs/UPSTREAMS.md.
+Weights, calibration/reference corpora, private installation/build records
+and research history are excluded. Model and dataset terms are separate.

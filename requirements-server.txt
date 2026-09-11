@@ -1,0 +1,6 @@
+# HTTP overlay; use the existing inference interpreter with --target and --no-deps.
+# Shared dependencies must satisfy these packages (see docs/DEPENDENCIES.md).
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.52.4
+sse-starlette==3.4.11

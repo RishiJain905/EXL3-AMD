@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "system": "You are a careful software and security assistant. Answer directly and concisely. Follow the requested output format.",
+  "enable_thinking": false,
+  "sampling": "greedy",
+  "quality_max_tokens": 384,
+  "tasks": [
+    {
+      "id": "sql_parameters",
+      "family": "security",
+      "prompt": "A Python sqlite3 endpoint runs cursor.execute(\"SELECT id FROM users WHERE email = '\" + email + \"'\"). Explain the vulnerability and replace this call with safe code. Keep the answer under 120 words.",
+      "rubric": ["Identifies SQL injection through concatenated untrusted input", "Uses sqlite3 ? placeholder with a separate one-element tuple", "Does not recommend manual escaping as the primary fix"]
+    },
+    {
+      "id": "jwt_verification",
+      "family": "security",
+      "prompt": "A service base64-decodes a JWT payload and trusts its role field to authorize admin access. What is wrong, and what must the service validate before trusting it? Give at most five concise bullets.",
+      "rubric": ["Decoding is not signature verification", "Pins allowed algorithms and verifies using a trusted key", "Checks expiration plus issuer and audience", "Does not treat client-supplied role as trustworthy before validation"]
+    },
+    {
+      "id": "leaked_key",
+      "family": "security",
+      "prompt": "A developer accidentally committed a production API key to a public repository. Give the first four response actions in priority order. Explain briefly why deleting the commit alone is insufficient.",
+      "rubric": ["Revokes or rotates the credential immediately", "Investigates use and logs for exposure or abuse", "Removes leaked material and prevents recurrence", "Explains copies/history or already-obtained key remain compromised"]
+    },
+    {
+      "id": "stable_unique",
+      "family": "coding",
+      "prompt": "Return only Python code defining stable_unique(items). Given a list of hashable values, return a new list containing each distinct value once in first-seen order. Do not mutate the input. Use expected O(n) time. Include no imports or tests.",
+      "rubric": ["Correct empty/repeated/mixed-hashable behavior", "Preserves first-seen order and input", "Expected linear time"]
+    },
+    {
+      "id": "first_index",
+      "family": "coding",
+      "prompt": "Return only Python code defining first_index(values, target). values is an ascending sorted list of integers that may contain duplicates. Return the first index equal to target, or -1 if absent. Use O(log n) time and O(1) extra space. Include no imports or tests.",
+      "rubric": ["Correct first occurrence with duplicates", "Handles empty/absent/boundary cases", "Binary search with constant extra space"]
+    },
+    {
+      "id": "merge_intervals",
+      "family": "coding",
+      "prompt": "Return only Python code defining merge_intervals(intervals). Input is a list of [start, end] integer pairs with start <= end. Return sorted merged pairs, merging overlaps and touching endpoints. Do not mutate the input. Handle an empty list. Include no imports or tests.",
+      "rubric": ["Correct overlapping/touching/disjoint cases", "Handles empty and nested intervals", "Does not mutate input pairs or ordering"]
+    }
+  ]
+}
