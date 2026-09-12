@@ -24,6 +24,23 @@ A model-selectable EXL3 inference runtime for AMD GPUs, with a Python CLI and a 
 
 EXL3 stores packed low-bit weights inside Safetensors. It needs a compatible loader and decode kernels; it cannot simply be handed to this project's llama.cpp/GGUF path. [Format and architecture](docs/EXL3.md).
 
+## What we built on the upstream foundation
+
+EXL3-AMD uses a modified copy of CarouselAether's ROCm port, pinned at `550dcfed786ad7bffa08b7a6b2a216fc474cbbb5`. Our contribution combines new project code with targeted changes to that inherited backend. The EXL3 format, base model execution, AMD port and integrated MTP implementation come from the upstream authors.
+
+| Area | Upstream foundation | Our additions and modifications |
+| --- | --- | --- |
+| AMD execution and MTP verification | Turboderp's packed-weight decoding and CarouselAether's HIP/RDNA kernels and dispatch | WSL dispatch repairs, shared packed projection kernels for eligible 2–9 token rows, graph integration and decode fusions. The small-row kernels reuse decoded weight fragments during MTP verification. |
+| KV cache and long context | Inherited packed Q8/Q4 storage, rotation and attention kernels | CLI/server cache selection for target and draft, plus an opt-in Q8 attention scheduling/reduction profile with explicit GPU, shape and context guards. |
+| Conversion and native builds | ExLlamaV3's converter and the ROCm build system | K2 encoder shared-memory repairs, memory-bounded conversion buffers, Qwen text/source adaptation, build compatibility fixes and guarded object reuse. |
+| CLI and installation | Upstream model loading, tokenization and generation | The `run.py` interface with familiar `-m`, `-c` and MTP flags; model-independent installation registration; extension verification, GPU ownership, configurable resource monitoring and private run artifacts. |
+| Serving and function tools | An [HTTP server already exists upstream](vendor/rocm-exl3/rocm_tools/exl3_server/README.md); its disconnect/stream-cleanup design informed this work | Our text-only HTTP adapter, serialized request lifecycle, Qwen XML/Hermes JSON tool parsing, structured responses, validation and recoverable malformed-tool errors. Persistent serving has no overall lifetime cap. |
+| Measurements and verification | Upstream operators, model/runtime interfaces and evaluation utilities | Independent packed-weight/operator checks, model and HTTP regression fixtures, occupied-context checks, and corrected MTP throughput accounting that groups tokens by emitting GPU iteration. |
+
+The implementation is in [scripts](scripts/), [src/quantlab](src/quantlab/), [kernel work](kernels/exl3/README.md) and the modified [vendored backend](vendor/rocm-exl3/). [UPSTREAMS.md](docs/UPSTREAMS.md) gives component-level credit and source references.
+
+This comparison is against the pinned upstream revision. Aether's server exposes broader sampling and endpoint options; our adapter concentrates on the documented text/tool contract and tested AMD/WSL path. These additions do not establish a general speed advantage over Aether's runtime or compatibility with every EXL3 model. See [validation scope](docs/VALIDATION.md) and [measurement guidance](docs/OPTIMIZATION.md).
+
 ## Install once
 
 Provision a compatible ROCm environment and build the extension using [BUILD.md](docs/BUILD.md). Fill in the installation worksheet with your interpreter, SDK, GPU target and extension hash:
@@ -97,8 +114,18 @@ Some tests need inference or HTTP dependencies. Skips are not GPU validation. A 
 
 Run artifacts can contain prompts, outputs, token IDs and local paths. Keep them in ignored `artifacts/`; installation records belong in ignored `.runtime/` or local configs. Models, native binaries, developer jobs, private research history and calibration/reference corpora are excluded from Git.
 
-## Credits and license
+## Upstream contributors and license
 
-Thanks to **[Daniel Lougen / DJLougen](https://huggingface.co/DJLougen) and GestaltLabs** for the [Qwen3.8-27B-EXL3-11.5GB release](https://huggingface.co/GestaltLabs/Qwen3.8-27B-EXL3-11.5GB), a motivating example of practical EXL3 publishing. No weights from that release are bundled.
+| Contributor / project | Work this runtime builds on |
+| --- | --- |
+| [Turboderp and ExLlamaV3 contributors](https://github.com/turboderp-org/exllamav3) | EXL3 format, converter, model/cache/generator, base kernels and packed-weight decoding. |
+| [CarouselAether / rocm_exl3](https://github.com/CarouselAether/rocm_exl3/tree/550dcfed786ad7bffa08b7a6b2a216fc474cbbb5) | The direct AMD/ROCm upstream: HIP/RDNA kernels, dispatch, compatibility, build integration and the inherited HTTP server. |
+| [Cornell RelaxML / QTIP](https://github.com/Cornell-RelaxML/qtip), [paper](https://arxiv.org/abs/2406.11235) | Quantization research underlying EXL3. |
+| [Flash Linear Attention contributors](https://github.com/fla-org/flash-linear-attention) | Gated DeltaNet chunk/prefill operations used by the inherited model path. |
+| [PyTorch](https://github.com/pytorch/pytorch), [Triton](https://github.com/triton-lang/triton), [AMD ROCm](https://github.com/ROCm) contributors | Tensor execution, GPU compilation and the ROCm software stack. |
+| Hugging Face [Transformers](https://github.com/huggingface/transformers), [Tokenizers](https://github.com/huggingface/tokenizers), [Safetensors](https://github.com/huggingface/safetensors) contributors | Model tokenization, chat templates and tensor containers. |
+| [Daniel Lougen / DJLougen](https://huggingface.co/DJLougen) and [GestaltLabs](https://huggingface.co/GestaltLabs/Qwen3.8-27B-EXL3-11.5GB) | Published EXL3 quantization and model-card guidance that helped shape this project's target direction and quantization/runtime investigation. |
 
-Project additions include CLI/HTTP integration, compatibility repairs and AMD runtime/kernel changes. [UPSTREAMS.md](docs/UPSTREAMS.md) identifies inherited implementations and authors. Project code is [MIT licensed](LICENSE); vendored code retains its [upstream notices](vendor/rocm-exl3/LICENSE). Model and dataset terms are separate. See [NOTICE](NOTICE).
+**Daniel Lougen's EXL3 quant and accompanying [Qwen3.8-27B-EXL3-11.5GB model card](https://huggingface.co/GestaltLabs/Qwen3.8-27B-EXL3-11.5GB) were concrete technical references for this work.** They helped guide our target direction toward a compact 27B native EXL3 deployment with integrated MTP and informed our quantization/runtime investigation. This credits the published quantization and documentation as technical guidance; our AMD integration and separately converted model are distinct work. No GestaltLabs weights or helper implementation are bundled here.
+
+Project code is [MIT licensed](LICENSE); vendored code retains its [upstream notices](vendor/rocm-exl3/LICENSE). Model and dataset terms are separate. See [NOTICE](NOTICE) and [UPSTREAMS.md](docs/UPSTREAMS.md).
