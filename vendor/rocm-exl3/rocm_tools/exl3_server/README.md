@@ -47,7 +47,7 @@ Server flags:
 | `-host` / `-port` | bind address, default `127.0.0.1:3953` |
 | `-cs` | cache size in tokens; **default = the model's max context** (long-context models advertise 256K-1M — pass `-cs`/`-cq` to keep the KV cache sane) |
 | `-key` | require an API key (`Authorization: Bearer` or `x-api-key`) |
-| `-smn` | model name reported by the API (default: model dir name) |
+| `-smn` | model name reported by the API (default: `exl3-model`) |
 | `-maxr` | server-side cap on response tokens (default: fill remaining context) |
 | `-ctk` | default chat-template kwargs as JSON, e.g. `'{"enable_thinking": false}'` |
 | `-lw` / `-lmr` | loop-detection stop (off by default) |
@@ -56,11 +56,13 @@ Server flags:
 
 - `POST /v1/chat/completions` — prompt is built with the **model's own chat
   template** (`tokenizer_config.json`, rendered by HF `apply_chat_template`).
-  Streaming and non-streaming, `n > 1`, `stop`, `logit_bias`, `seed`, `tools`
-  (passed to the template), `chat_template_kwargs`, `continue_final_message`.
+  Non-streaming `n` supports 1–16 choices; streaming requires `n=1`. Also
+  supports `stop`, `logit_bias`, `seed`, `tools` (passed to the template),
+  `chat_template_kwargs`, and `continue_final_message`.
 - `POST /v1/completions` — raw prompt used **verbatim** (special tokens are
   encoded), so the client's own instruct template applies. Extensions:
-  `add_bos` (default true), `parse_special` (default true).
+  `add_bos` (default true), `parse_special` (default true). Non-streaming `n`
+  supports 1–16 choices; streaming requires `n=1`.
 - `POST /completion` (alias `/completions`) — **llama.cpp-native** endpoint for
   clients using ST's *llama.cpp* preset and similar tools. Native param names
   (`n_predict`, `repeat_penalty`, `repeat_last_n`, `ignore_eos`, pair-style
@@ -70,7 +72,8 @@ Server flags:
   (mirostat, dynatemp, typical_p, grammar) are accepted and ignored.
 - `POST /apply-template` — render the model's chat template without generating;
   returns `{"prompt": ...}`. Handy for debugging what the model actually sees.
-- `GET /v1/models`, `GET /health`, `GET /props` (includes `chat_template`),
+- `GET /v1/models`, `GET /health`, `GET /props` (honors `-key`, includes
+  `chat_template`, and never returns the local model path),
   `POST /tokenize`, `POST /detokenize`.
 
 Sampling fields honored per request (all completion endpoints): `temperature`,
@@ -85,6 +88,12 @@ works. XTC uses exl3's built-in `SS_XTC`; DRY is implemented in
 by default; matches stop at sequence breakers). CLI defaults:
 `-xtcp/-xtct/-drym/-dryb/-dryal/-dryln`. When neither XTC nor DRY is active a
 request uses the stock fused sampler path.
+
+Custom `dry_sequence_breakers` are limited to 64 strings, 256 UTF-8 bytes per
+string and 4096 UTF-8 bytes total. Empty strings and exact duplicates are
+ignored, order does not create a distinct cache entry, and the server retains
+at most 32 recently used breaker sets. For a non-loopback bind, use `-key` and
+set request-rate and body-size limits at the reverse proxy.
 
 Concurrent requests are batched transparently by the dynamic generator.
 Disconnecting a client (e.g. SillyTavern's stop button) cancels its job: every

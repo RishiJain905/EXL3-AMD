@@ -76,6 +76,10 @@ from exllamav3.generator.sampler import (
     SS_Temperature, SS_MinP, SS_TopK, SS_TopP, SS_XTC, SS_AdaptiveP, SS_Sample,
 )
 from dry_sampler import SS_DRY, breaker_token_ids
+from request_validation import (
+    MAX_COMPLETIONS_PER_REQUEST,
+    normalize_dry_breakers,
+)
 
 DEFAULT_DRY_BREAKERS = ("\n", ":", "\"", "*")
 
@@ -139,7 +143,7 @@ class ChatCompletionRequest(SamplingFields):
     stream: bool = False
     stream_options: dict | None = None
     stop: str | list[str] | None = None
-    n: int = 1
+    n: int = Field(default = 1, ge = 1, le = MAX_COMPLETIONS_PER_REQUEST)
     tools: list[dict] | None = None
     # Template control extensions (llama.cpp / vLLM style)
     chat_template_kwargs: dict | None = None
@@ -153,7 +157,7 @@ class CompletionRequest(SamplingFields):
     stream: bool = False
     stream_options: dict | None = None
     stop: str | list[str] | None = None
-    n: int = 1
+    n: int = Field(default = 1, ge = 1, le = MAX_COMPLETIONS_PER_REQUEST)
     # Extensions for raw-prompt clients (SillyTavern Text Completion etc.)
     add_bos: bool = True
     parse_special: bool = True
@@ -258,19 +262,18 @@ def make_sampler(req: SamplingFields):
     ]
     if use_dry:
         breakers = req.dry_sequence_breakers
-        if isinstance(breakers, str):
-            try:
-                breakers = json.loads(breakers)
-            except json.JSONDecodeError:
-                raise HTTPException(400, "dry_sequence_breakers must be a JSON array of strings")
-        if breakers is None:
-            breakers = list(DEFAULT_DRY_BREAKERS)
+        try:
+            breakers = normalize_dry_breakers(
+                DEFAULT_DRY_BREAKERS if breakers is None else breakers
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
         stack.append(SS_DRY(
             multiplier = dry_mult,
             base = pick(req.dry_base, a.dry_base),
             allowed_length = pick(req.dry_allowed_length, a.dry_allowed_length),
             penalty_last_n = dry_last_n,
-            breaker_ids = breaker_token_ids(state.tokenizer, tuple(breakers)),
+            breaker_ids = breaker_token_ids(state.tokenizer, breakers),
         ))
     if temperature == 0.0 or top_k == 1:
         stack.append(SS_Argmax())
@@ -551,11 +554,13 @@ async def health():
 
 
 @app.get("/props")
-async def props():
+async def props(request: Request):
+    check_auth(request)
     hf_tok = getattr(state.tokenizer, "hf_tokenizer", None)
     return {
         "model": state.model_name,
-        "model_path": state.args.model_dir,
+        # Preserve the llama.cpp-compatible key without disclosing a workstation path.
+        "model_path": "",
         "n_ctx": state.context_length,
         "has_chat_template": state.has_chat_template,
         "chat_template": getattr(hf_tok, "chat_template", None) or "",
@@ -957,7 +962,7 @@ async def native_completion(request: Request, body: NativeCompletionRequest):
 @torch.inference_mode()
 def main(args):
     state.args = args
-    state.model_name = args.served_model_name or Path(args.model_dir).name
+    state.model_name = args.served_model_name or "exl3-model"
 
     # Default the cache to the model's native max context (like llama.cpp's n_ctx_train
     # default). Long-context models advertise huge maximums, so warn about the allocation.
@@ -1031,7 +1036,7 @@ if __name__ == "__main__":
     parser.add_argument("-host", "--host", type = str, default = "127.0.0.1", help = "Bind address, default: 127.0.0.1")
     parser.add_argument("-port", "--port", type = int, default = 3953, help = "Port, default: 3953")
     parser.add_argument("-key", "--api_key", type = str, default = None, help = "Require this API key (Bearer token or x-api-key header)")
-    parser.add_argument("-smn", "--served_model_name", type = str, default = None, help = "Model name reported by the API, default: model directory name")
+    parser.add_argument("-smn", "--served_model_name", type = str, default = None, help = "Model name reported by the API, default: exl3-model")
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = None, help = "Server-side cap on tokens per response, default: fill remaining context")
     parser.add_argument("-ctk", "--chat_template_kwargs", type = str, default = None, help = "Default kwargs for the chat template as JSON, e.g. '{\"enable_thinking\": false}'")
     parser.add_argument("-lw", "--loop_window", type = int, default = 0, help = "Loop detection window in tokens, 0 to disable (default)")

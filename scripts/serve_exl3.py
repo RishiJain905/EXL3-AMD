@@ -24,7 +24,7 @@ class Engine:
 
     def __init__(self, args):
         self.args = args
-        self.model_name = args.alias or args.candidate.name
+        self.model_name = args.alias or 'exl3'
         self.context = args.context
         self.draft_confidence = args.draft_confidence
         try:

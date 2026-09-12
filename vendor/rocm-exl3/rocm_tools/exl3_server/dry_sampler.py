@@ -14,14 +14,17 @@ Lives in exl3_server (not in the exllamav3 tree) on purpose; it only uses the pu
 sampler-step API (SS_Base, SamplingState, reqs_past_ids).
 """
 
+from collections import OrderedDict
+
 import torch
 from exllamav3.generator.sampler.custom import SS_Base, SS, SamplingState
+from request_validation import MAX_DRY_BREAKER_CACHE_ENTRIES, normalize_dry_breakers
 
 # Cap on how far a suffix match is extended. 1.75^(64-2) is ~1e15, which already acts as a
 # hard ban after subtraction from the logit; longer matches change nothing but cost time.
 MAX_MATCH_LEN = 64
 
-_breaker_cache: dict[tuple, torch.Tensor] = {}
+_breaker_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 
 
 def breaker_token_ids(tokenizer, breakers: tuple[str, ...]) -> torch.Tensor:
@@ -29,9 +32,11 @@ def breaker_token_ids(tokenizer, breakers: tuple[str, ...]) -> torch.Tensor:
     Token IDs that act as sequence breakers: any token whose decoded piece contains one of
     the breaker strings, plus direct encodings of each breaker. Cached per breaker set.
     """
+    breakers = normalize_dry_breakers(breakers)
     key = (id(tokenizer), breakers)
     cached = _breaker_cache.get(key)
     if cached is not None:
+        _breaker_cache.move_to_end(key)
         return cached
     ids = set()
     pieces = tokenizer.get_id_to_piece_list()
@@ -47,6 +52,8 @@ def breaker_token_ids(tokenizer, breakers: tuple[str, ...]) -> torch.Tensor:
         ids.update(enc.flatten().tolist())
     t = torch.tensor(sorted(ids), dtype = torch.long)
     _breaker_cache[key] = t
+    if len(_breaker_cache) > MAX_DRY_BREAKER_CACHE_ENTRIES:
+        _breaker_cache.popitem(last = False)
     return t
 
 

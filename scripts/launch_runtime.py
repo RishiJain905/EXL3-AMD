@@ -237,7 +237,7 @@ def parser():
     p.add_argument('--expected-results', type=Path)
     p.add_argument('--host', choices=('127.0.0.1',), default='127.0.0.1', help='serve: loopback binding')
     p.add_argument('--port', type=int, default=8000, help='serve: HTTP port')
-    p.add_argument('--alias', help='serve: public API model name')
+    p.add_argument('--alias', help='serve: public API model name (default: exl3)')
     p.add_argument('--request-timeout', type=int, default=120, help='serve: per-request seconds, including queue wait')
     p.add_argument('--output', type=Path, help='New private run directory; never overwritten')
     p.add_argument('--execute', action='store_true')
