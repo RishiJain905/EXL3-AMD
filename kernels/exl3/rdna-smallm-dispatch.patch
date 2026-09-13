@@ -1,0 +1,45 @@
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_rdna.hip
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_rdna.hip
+@@ -172,6 +172,8 @@
+ // -----------------------------------------------------------------------------
+ // Launch
+ // -----------------------------------------------------------------------------
++
++#include "rdna-smallm.hip.h"
+ 
+ static void exl3_gemv_rdna_launch
+ (
+@@ -372,6 +374,13 @@
+     half*           A_had_ptr = *(half* const*)           kernel_args[8];
+     const half*     svh_ptr   = *(const half* const*)     kernel_args[9];
+ 
++    if (exl3_smallm_try_launch(A_ptr, B_ptr, C_ptr, size_m, size_k, size_n,
++        K, cb, c_fp32, suh_ptr, A_had_ptr, svh_ptr, stream))
++    {
++        if (launched_kernel) *launched_kernel = nullptr;
++        return true;
++    }
++
+     if (!exl3_gemv_rdna_eligible(size_m, size_k, size_n, K, suh_ptr, A_had_ptr)) return false;
+ 
+     exl3_gemv_rdna_launch
+@@ -659,6 +668,8 @@
+         );
+ }
+ 
++#include "rdna-smallm-graph.hip.h"
++
+ bool exl3_gemv_graph_try_launch
+ (
+     const half* A_ptr,
+@@ -678,7 +689,9 @@
+     Graph* graph
+ )
+ {
+-    if (size_m != 1) return false;
++    if (size_m != 1)
++        return exl3_smallm_graph_try(A_ptr, B_ptr, C_ptr, suh_ptr, A_had_ptr, svh_ptr,
++            size_m, size_k, size_n, K, cb, c_fp32, device, stream, graph);
+     if (K < 1 || K > 8) return false;
+     if (size_k % 128 || size_n % 128) return false;
+     if (!suh_ptr || !A_had_ptr || !svh_ptr) return false;

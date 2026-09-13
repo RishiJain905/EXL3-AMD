@@ -1,0 +1,18 @@
+--- a/exllamav3/exllamav3_ext/rocm/quant/quantize_rdna.hip
++++ b/exllamav3/exllamav3_ext/rocm/quant/quantize_rdna.hip
+@@ -83,3 +83,5 @@
+     const int max_batch_size = MIN((int) temp_costs.size(0), 2 * DevCtx::instance().get_num_sms(device));
+-    const int shmem = (K >= 2 ? 2 * edges * sizeof(half) : 0) + 512 + 64 + 128;
++    // K=2 needs 65536 bytes for costs alone, exceeding RDNA's 64 KiB
++    // workgroup limit once the 704-byte input/reduction scratch is included.
++    const int shmem = (K >= 3 ? 2 * edges * sizeof(half) : 0) + 512 + 64 + 128;
+     int cb = 0;
+--- a/exllamav3/exllamav3_ext/rocm/quant/quantize_tiles_kernel_rdna.hip.h
++++ b/exllamav3/exllamav3_ext/rocm/quant/quantize_tiles_kernel_rdna.hip.h
+@@ -71,3 +71,5 @@
+     half* sh_temp_costs = (half*) sh;
+-    half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
++    // Keep this threshold aligned with quantize_rdna.hip's launch allocation.
++    // K<=2 uses the existing per-block global ping-pong buffers.
++    half* temp_costs = K >= 3 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+     half* temp_costs_inc = temp_costs + edges;

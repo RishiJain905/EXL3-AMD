@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.h text eol=lf
+*.hip text eol=lf
+*.cu text eol=lf
+*.cuh text eol=lf
+*.patch text eol=lf whitespace=-blank-at-eol
+vendor/** -text whitespace=-trailing-space,-blank-at-eof

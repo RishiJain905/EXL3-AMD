@@ -1,0 +1,29 @@
+schema_version = 1
+
+[execution]
+allow_backend_probes = false
+allow_local_inference = false
+
+[limits]
+max_capture_seconds = 900
+# Applies to generation/evaluation, not persistent server lifetime.
+
+[runtime]
+# Paths below are examples. Copy this file to local.toml and use your installation.
+# Runtime/toolchain paths are Linux/WSL paths. Model paths may be Windows or Linux.
+distribution = 'Ubuntu'
+python = '/path/to/rocm-venv/bin/python'
+sdk = '/path/to/rocm-sdk'
+torch_lib = '/path/to/rocm-venv/lib/python3.12/site-packages/torch/lib'
+hsa_preload = '/opt/rocm/lib/libhsa-runtime64.so.1'
+gpu_arch = 'REPLACE_WITH_YOUR_GPU_TARGET'
+source_dir = 'vendor/rocm-exl3'
+extension_dir = '.runtime/lib'
+extension_sha256 = 'REPLACE_WITH_SHA256_OF_YOUR_BUILT_EXTENSION'
+# A full build of current source supports up to nine native token rows.
+# Older binaries must use their actual supported envelope.
+native_smallm_max_rows = 9
+# Optional HTTP-only package overlay, used by serve; omitted uses this default.
+# server_deps = '.runtime/server-deps'
+# Models are selected with -m after registration; no model path belongs here.
+lease_file = 'artifacts/locks/local-gpu.lock'

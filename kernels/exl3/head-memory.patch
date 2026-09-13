@@ -1,0 +1,147 @@
+--- a/exllamav3/modules/linear.py
++++ b/exllamav3/modules/linear.py
+@@ -511,7 +511,9 @@
+         if swap_to_device is not None and override_swap_device is not None:
+             swap_to_device = override_swap_device
+ 
+-        orig_weight = self.inner.get_weight_tensor().float()
++        orig_weight = self.inner.get_weight_tensor()
++        if not quant_args.get("compact_cpu_buffers", False):
++            orig_weight = orig_weight.float()
+         orig_bias = self.inner.get_bias_tensor()
+         self.inner = None
+ 
+--- a/exllamav3/modules/quant/exl3_lib/quantize.py
++++ b/exllamav3/modules/quant/exl3_lib/quantize.py
+@@ -538,7 +538,9 @@
+ 
+         # Work buffers
+         prod_cache = torch.zeros((size_k, size_n), dtype = torch.float, device = device)
+-        weight_q = torch.zeros((size_k, size_n), dtype = torch.float, device = buffer_device)
++        # Decoder outputs are half values widened to float: CPU half storage is exact.
++        q_dtype = torch.half if buffer_device.type == "cpu" and quant_args.get("compact_cpu_buffers", False) else torch.float
++        weight_q = torch.zeros((size_k, size_n), dtype = q_dtype, device = buffer_device)
+         encoded = torch.zeros((tiles_k, tiles_n, 256), dtype = torch.short, device = buffer_device)
+ 
+         for j in range(size_k, 0, -buf_size_k):
+@@ -547,7 +549,7 @@
+             # Current span is rows i:j
+             b_weight = weight[i:j].to(device)
+             b_weight_q = weight_q[i:j] if device == buffer_device else \
+-                torch.zeros_like(weight_q[i:j], device = device)
++                torch.zeros_like(weight_q[i:j], dtype = torch.float, device = device)
+             b_encoded = encoded[i // 16 : j // 16] if device == buffer_device else \
+                 torch.zeros_like(encoded[i // 16 : j // 16], device = device)
+             b_prod_cache = prod_cache[i:j]
+@@ -734,6 +736,28 @@
+         partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block)
+         total += partial.item()
+     return total
++
++
++def block_proxy_error_streamed(W, Q, H, device, column_block_size = 1024):
++    """Same quadratic proxy, streaming output columns instead of full E/W copies.
++
++    The codec and FP32 LDLQ arithmetic are unchanged. Column blocking changes
++    floating-point reduction order, so metric agreement is tolerance-based.
++    """
++    assert W.shape == Q.shape and W.shape[0] == H.shape[0] == H.shape[1]
++    assert column_block_size > 0
++    Hd = H.to(device)
++    num = 0.0
++    den = 0.0
++    for start in range(0, W.shape[1], column_block_size):
++        end = min(start + column_block_size, W.shape[1])
++        w = W[:, start:end].to(device = device, dtype = torch.float)
++        q = Q[:, start:end].to(device = device, dtype = torch.float)
++        error = w - q
++        num += block_trace(error, Hd)
++        den += block_trace(w, Hd)
++        del w, q, error
++    return num / max(den, 1e-8)
+ 
+ 
+ def ldlq_batched(
+@@ -1280,7 +1304,10 @@
+     progress_text = None if not progress_str else progress_str.replace("<step>", "Preparing")
+     with (ProgressBar(progress_text, 100) as pb):
+ 
+-        assert weight.dtype == torch.float
++        compact_cpu = quant_args.get("compact_cpu_buffers", False)
++        assert weight.dtype == torch.float or (compact_cpu and weight.dtype in (torch.half, torch.bfloat16))
++        if compact_cpu and weight.numel() > 5e8 and (verbose or return_weight_q):
++            raise ValueError("Large compact CPU quantization requires verbose=False and return_weight_q=False")
+         tiles_k = weight.shape[0] // 16
+ 
+         if "seed" in quant_args:
+@@ -1289,12 +1316,16 @@
+         devices = quant_args["devices"]
+         if weight.device != torch.device(devices[0]):
+             weight = weight.to(devices[0])
++        # Preserve source precision on the host; regularization still receives FP32.
++        weight = weight.float()
+ 
+         device = weight.device if swap_to_device is None else swap_to_device
+         k, n = weight.shape
+ 
+         # Get H, LDL decomp. and input/output sign flips
+         q_fallback, H, L, su, H_diag = finalize_capture_H(H_data, quant_args, verbose)
++        if compact_cpu and weight.numel() > 5e8 and q_fallback:
++            raise ValueError("Large compact CPU quantization requires a finalized LDLQ Hessian")
+         if H is not None and H.is_cuda:
+             H = H.to(device)
+         if L is not None and L.is_cuda:
+@@ -1362,18 +1393,22 @@
+         # Metrics
+         if not q_fallback:
+             try:
+-                E = weight_r - weight_q  # may run on CPU
+-                W = weight_r
+-                Hd = H.to(device)
+-                weight_r = None
+-                E = E.to(device)
+-                num = block_trace(E, Hd)
+-                E = None
+-                W = W.to(device)
+-                den = block_trace(W, Hd)
+-                W = None
+-                Hd = None
+-                proxy_err = num / max(den, 1e-8)
++                if compact_cpu and weight_r.device.type == "cpu":
++                    proxy_err = block_proxy_error_streamed(weight_r, weight_q, H, device)
++                    weight_r = None
++                else:
++                    E = weight_r - weight_q  # may run on CPU
++                    W = weight_r
++                    Hd = H.to(device)
++                    weight_r = None
++                    E = E.to(device)
++                    num = block_trace(E, Hd)
++                    E = None
++                    W = W.to(device)
++                    den = block_trace(W, Hd)
++                    W = None
++                    Hd = None
++                    proxy_err = num / max(den, 1e-8)
+             except torch.OutOfMemoryError:
+                 weight_r = None
+                 E = None
+@@ -1386,7 +1421,7 @@
+         # free_mem()
+ 
+         if return_weight_q or verbose:
+-            weight_q = weight_q.to(device)
++            weight_q = weight_q.to(device = device, dtype = torch.float)
+             weight_q = preapply_had_l(weight_q, had_k)
+             weight_q *= su
+             weight_q = preapply_had_r(weight_q, had_n)
+@@ -1396,6 +1431,9 @@
+                 weight = weight_copy.to(device)
+                 nmse = block_nmse(weight_q, weight)
+                 print(f"     - quant nmse: {nmse:.6f}")
++
++        if compact_cpu and not return_weight_q and not verbose:
++            weight_q = None
+ 
+         # Compile packed tensor
+         suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
