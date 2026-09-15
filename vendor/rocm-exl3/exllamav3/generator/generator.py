@@ -630,6 +630,10 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        # Warmup: while cal.total < cal.burn_in, estimate() returns 1.0 unconditionally and no
+        # labels are added during this drafting window, so per-step stopping cannot trigger.
+        # Defer confidence readbacks, retain GPU tensors, transfer once at the end.
+        warmup_defer = cal is not None and cal.total < cal.burn_in
         gpu_draft = getattr(self, "quantlab_gpu_draft", False) and cal is None
         device_draft_ids = []
         if gpu_draft:
@@ -659,27 +663,36 @@ class Generator:
                 device_draft_ids.append(new_ids)
                 batch_ids = new_ids
             else:
-                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
-                batch_ids.copy_(new_ids)
+                # Single GPU->CPU transfer into the draft column, then CPU->CPU into the
+                # next-step input. Blocking copy_ preserves readiness.
+                draft_column = self.draft_ids_pinned[:batch_size, idx:idx+1]
+                draft_column.copy_(new_ids)
+                batch_ids.copy_(draft_column)
             cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
-                c = draft_conf.float().cpu()
-                conf_cols.append(c)
-                est = [cal.estimate(v) for v in c.view(-1).tolist()]
-                reach = est if reach is None else [r * e for r, e in zip(reach, est)]
-                if idx + 1 < window and max(reach) < cal.confidence:
-                    window = idx + 1
-                    break
+                if warmup_defer:
+                    conf_cols.append(draft_conf)
+                else:
+                    c = draft_conf.float().cpu()
+                    conf_cols.append(c)
+                    est = [cal.estimate(v) for v in c.view(-1).tolist()]
+                    reach = est if reach is None else [r * e for r, e in zip(reach, est)]
+                    if idx + 1 < window and max(reach) < cal.confidence:
+                        window = idx + 1
+                        break
 
         if gpu_draft:
             self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(device_draft_ids, dim=1))
 
         if conf_cols and len(conf_cols) == window:
+            conf = torch.cat(conf_cols, dim = 1)
+            if warmup_defer:
+                conf = conf.float().cpu()
             self._draft_conf_round = {
                 "ids": self.draft_ids_pinned[:batch_size, :window],
-                "conf": torch.cat(conf_cols, dim = 1),
+                "conf": conf,
                 "window": window,
             }
 

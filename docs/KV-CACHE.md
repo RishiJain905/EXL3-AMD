@@ -3,9 +3,9 @@
 Supported attention caches: FP16 (`f16`, default), integer Q8 (`q8`) and integer Q4 (`q4`).
 
 ```powershell
-python run.py serve -m "MODEL_DIRECTORY" --cache-type f16 -c 4096 --alias exl3 --port 8000 --execute
-python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --alias exl3 --port 8000 --execute
-python run.py serve -m "MODEL_DIRECTORY" --cache-type q4 -c 4096 --alias exl3 --port 8000 --execute
+python run.py serve -m "MODEL_DIRECTORY" --cache-type f16 -c 4096 --alias exl3 --port 8000
+python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --alias exl3 --port 8000
+python run.py serve -m "MODEL_DIRECTORY" --cache-type q4 -c 4096 --alias exl3 --port 8000
 ```
 
 Run one server at a time. Add MTP flags only for compatible weights. Separate `-ctk q8 -ctv q4` settings work; mixing FP16 and quantized sides is rejected.

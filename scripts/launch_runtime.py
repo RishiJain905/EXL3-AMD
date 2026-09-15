@@ -1,5 +1,6 @@
 """Run the configured EXL3 model with serial, bounded Windows/WSL monitoring."""
 import argparse
+import codecs
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -100,7 +101,7 @@ def runtime_environment(runtime):
     sdk = runtime['sdk']
     env.update(LD_PRELOAD=runtime['hsa_preload'], ROCM_PATH=sdk, ROCM_HOME=sdk,
                HIP_PATH=sdk, EXL3_BACKEND='rocm', PYTORCH_ROCM_ARCH=runtime['gpu_arch'],
-               GPU_ARCHS=runtime['gpu_arch'], MAX_JOBS='2', PYTHONUTF8='1',
+               GPU_ARCHS=runtime['gpu_arch'], MAX_JOBS='2', PYTHONUTF8='1', PYTHONUNBUFFERED='1',
                HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
     env['PATH'] = str(Path(runtime['python']).parent) + ':' + sdk + '/bin:' + sdk + '/llvm/bin:' + env.get('PATH','')
     env.pop('PYTHONPATH', None)
@@ -165,6 +166,25 @@ def worker(request_file):
         child = subprocess.Popen(request['argv'], cwd=request['root'], env=runtime_environment(request['runtime']),
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         write_json(run / 'child.json', dict(pid=child.pid))
+        relay_offset = 0
+        relay_decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        def relay(final=False):
+            # Bounded tail of the retained log to the visible console; never
+            # loads the whole growing file. The child stays fully logged.
+            nonlocal relay_offset
+            while True:
+                try:
+                    with (run / 'process.log').open('rb') as view:
+                        view.seek(relay_offset)
+                        chunk = view.read(65536)
+                        relay_offset += len(chunk)
+                except OSError:
+                    return
+                text = relay_decoder.decode(chunk, final=final and not chunk)
+                sys.stdout.write(''.join(c for c in text if c.isprintable() or c in '\n\r\t'))
+                sys.stdout.flush()
+                if not final or not chunk:
+                    return
         try:
             while child.poll() is None:
                 rss = group_rss(child.pid)
@@ -183,8 +203,14 @@ def worker(request_file):
                 if reason:
                     terminate_group(child)
                     break
+                relay()
                 time.sleep(1)
             code = child.wait()
+        except KeyboardInterrupt:
+            # Ctrl+C can reach the WSL worker before Windows creates `stop`.
+            # The finally block still terminates/reaps the server, and only a
+            # confirmed clean shutdown below converts its signal exit to zero.
+            reason = reason or 'external_stop'
         except BaseException as exc:
             error = type(exc).__name__ + ': ' + str(exc)
             reason = reason or 'monitor_error'
@@ -192,6 +218,7 @@ def worker(request_file):
             if child.poll() is None:
                 terminate_group(child)
             code = child.returncode if child.returncode is not None else 1
+            relay(final=True)
     stopped_cleanly = clean_server_stop(request, run, code, reason, error)
     write_json(run / 'monitor.json', dict(exit_code=code, stop_reason='user_stop' if stopped_cleanly else reason, error=error,
                clean_server_shutdown=stopped_cleanly,
@@ -221,6 +248,8 @@ def parser():
     p.add_argument('--decode-fusions', choices=('off','gdn','gdn-mlp'), default='gdn')
     p.add_argument('--warps', type=int, choices=(4,8,16))
     p.add_argument('--smallm-kernel', choices=('dot','wmma','wmma-register'), default='dot', help='Experimental packed projection kernel')
+    p.add_argument('--prefill-gemm', choices=('blas','wmma'), default='blas',
+                   help='FP32-output prefill GEMM; WMMA requires the matching gfx1101 extension')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16), help='Experimental wide-projection split-K override')
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off',
                    help='Cache selected reconstructed draft projections on GPU (extra VRAM)')
@@ -239,8 +268,28 @@ def parser():
     p.add_argument('--port', type=int, default=8000, help='serve: HTTP port')
     p.add_argument('--alias', help='serve: public API model name (default: exl3)')
     p.add_argument('--request-timeout', type=int, default=120, help='serve: per-request seconds, including queue wait')
+    p.add_argument('--reasoning', choices=('on', 'off', 'auto'), default='auto', help='serve: thinking template mode')
+    p.add_argument('--reasoning-format', choices=('auto', 'deepseek', 'none'), default='auto',
+                   help='serve: reasoning_content splitting; none keeps raw text')
+    p.add_argument('--prefix-cache', choices=('off', 'on'), default='off',
+                   help='serve: reuse matching prompt prefixes and recurrent checkpoints')
+    p.add_argument('--chat-template-file', type=Path, default=None, help='serve: local trusted Jinja template override')
+    p.add_argument('--jinja', action='store_true', help='serve: accepted; rendering is always Jinja via Transformers')
+    p.add_argument('--temp', '--temperature', dest='temperature', type=float, default=0.0, help='serve: sampling default in [0,2]')
+    p.add_argument('--top-p', type=float, default=1.0, help='serve: sampling default in (0,1]')
+    p.add_argument('--top-k', type=int, default=0, help='serve: sampling default in [0,1000]')
+    p.add_argument('--min-p', type=float, default=0.0, help='serve: sampling default in [0,1)')
+    p.add_argument('--repeat-penalty', '--repetition-penalty', dest='repetition_penalty', type=float, default=1.0, help='serve: sampling default in (0,2]')
+    p.add_argument('--presence-penalty', type=float, default=0.0, help='serve: sampling default in [-2,2]')
+    p.add_argument('--frequency-penalty', type=float, default=0.0, help='serve: sampling default in [-2,2]')
+    p.add_argument('--seed', type=int, default=None, help='serve: sampling default seed')
+    p.add_argument('-b', '--batch-size', '--prefill-chunk', dest='prefill_chunk', type=int,
+                   help='Prompt tokens per prefill step, 256-8192, multiple of 256; default 1024 for serve, 256 otherwise')
+    p.add_argument('-ncmoe', '--n-cpu-moe', dest='n_cpu_moe', type=int, default=0,
+                   help='Keep routed experts of the first N MoE layers on CPU')
+    p.add_argument('-cmoe', '--cpu-moe', nargs='?', const='all', choices=('off', 'all'), default='off', help='Offload every MoE layer to CPU')
+    p.add_argument('--moe-cpu-threads', type=int, default=None, help='CPU MoE worker threads, 1-256')
     p.add_argument('--output', type=Path, help='New private run directory; never overwritten')
-    p.add_argument('--execute', action='store_true')
     p.add_argument('--telemetry-gpu', type=str, default=None,
                    help='Windows monitoring adapter description substring; selects the monitored DXGI adapter only, not the Torch device. '
                    'Without it, monitoring auto-selects only when exactly one physical AMD adapter with dedicated VRAM above 1 GiB exists; '
@@ -258,6 +307,16 @@ def main():
         raise SystemExit(worker(sys.argv[2]))
     p = parser()
     args = p.parse_args()
+    if args.prefill_chunk is None:
+        args.prefill_chunk = 1024 if args.mode == 'serve' else 256
+    if args.mode != 'serve':
+        serve_defaults = dict(reasoning='auto', reasoning_format='auto', chat_template_file=None,
+                              jinja=False, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0,
+                              repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0,
+                              seed=None, prefix_cache='off')
+        for name, default in serve_defaults.items():
+            if getattr(args, name) != default:
+                p.error('--' + name.replace('_', '-') + ' applies only to serve mode')
     for name in ('gpu_memory_fraction', 'max_gpu_memory_fraction', 'max_host_memory_fraction'):
         try:
             _resources().validate_fraction(getattr(args, name), '--' + name.replace('_', '-'))
@@ -320,9 +379,9 @@ def main():
         p.error(f'Invalid runtime metadata {config_path}: {exc}')
     if not all(isinstance(config.get(section), dict) for section in ('execution', 'limits', 'runtime')):
         p.error(f'Invalid runtime metadata {config_path}: requires [execution], [limits] and [runtime]')
-    if not args.execute or not all(config['execution'].get(k) is True for k in
-                                   ('allow_local_inference','allow_backend_probes')):
-        p.error('Requires --execute and both configured local execution permissions')
+    if not all(config['execution'].get(k) is True for k in
+               ('allow_local_inference','allow_backend_probes')):
+        p.error('Requires both configured local execution permissions')
     max_capture = config['limits'].get('max_capture_seconds')
     if isinstance(max_capture, bool) or not isinstance(max_capture, int) or max_capture < 1:
         p.error(f'Invalid runtime metadata {config_path}: [limits] max_capture_seconds must be a positive integer')
@@ -330,6 +389,46 @@ def main():
         p.error('--context must be a multiple of 256 and at least 1024')
     if not 1 <= args.max_tokens <= 8192:
         p.error('--max-tokens must be in [1,8192]')
+    serve_only = dict(reasoning=args.reasoning != 'auto', reasoning_format=args.reasoning_format != 'auto',
+                      chat_template_file=args.chat_template_file is not None, jinja=args.jinja,
+                      temperature=args.temperature != 0.0, top_p=args.top_p != 1.0,
+                      top_k=args.top_k != 0, min_p=args.min_p != 0.0,
+                      repetition_penalty=args.repetition_penalty != 1.0,
+                      presence_penalty=args.presence_penalty != 0.0,
+                      frequency_penalty=args.frequency_penalty != 0.0, seed=args.seed is not None,
+                      prefix_cache=args.prefix_cache != 'off')
+    if args.mode != 'serve' and any(serve_only.values()):
+        used = sorted(k for k, v in serve_only.items() if v)
+        p.error('Options apply only to serve mode: ' + ', '.join('--' + u.replace('_', '-') for u in used))
+    if not 0 <= args.temperature <= 2:
+        p.error('--temperature must be in [0,2]')
+    if not 0 < args.top_p <= 1:
+        p.error('--top-p must be in (0,1]')
+    if not 0 <= args.top_k <= 1000:
+        p.error('--top-k must be in [0,1000]')
+    if not 0 <= args.min_p < 1:
+        p.error('--min-p must be in [0,1)')
+    if not 0 < args.repetition_penalty <= 2:
+        p.error('--repetition-penalty must be in (0,2]')
+    if not -2 <= args.presence_penalty <= 2:
+        p.error('--presence-penalty must be in [-2,2]')
+    if not -2 <= args.frequency_penalty <= 2:
+        p.error('--frequency-penalty must be in [-2,2]')
+    if args.seed is not None and not 0 <= args.seed < 2 ** 63:
+        p.error('--seed must be in [0,2**63)')
+    if args.batch_greedy and (not (args.temperature == 0 or args.top_k == 1) or args.repetition_penalty != 1 or args.presence_penalty != 0 or args.frequency_penalty != 0):
+        p.error('--batch-greedy requires greedy sampling without penalties')
+    if not 256 <= args.prefill_chunk <= 8192 or args.prefill_chunk % 256:
+        p.error('--prefill-chunk must be a multiple of 256 in [256,8192]')
+    if args.n_cpu_moe < 0 or args.n_cpu_moe > 1024:
+        p.error('--n-cpu-moe must be in [0,1024]')
+    if args.cpu_moe == 'all' and args.n_cpu_moe:
+        p.error('--cpu-moe all conflicts with --n-cpu-moe')
+    if args.moe_cpu_threads is not None and not 1 <= args.moe_cpu_threads <= 256:
+        p.error('--moe-cpu-threads must be in [1,256]')
+    if args.chat_template_file is not None:
+        if '://' in str(args.chat_template_file) or not args.chat_template_file.is_file():
+            p.error('--chat-template-file must name a local file')
     if args.prompt and args.prompt_file:
         p.error('Use one of --prompt and --prompt-file')
     if args.mode == 'generate' and not (args.prompt or args.prompt_file):
@@ -386,11 +485,26 @@ def main():
             '--extension-dir', runtime['extension_dir'], '--expected-extension-sha256', runtime['extension_sha256'],
             '--output', linux_path(run/'result'), '--context', str(args.context),
             '--decode-fusions', args.decode_fusions, '--native-smallm', '--native-smallm-max-rows',
-            str(runtime.get('native_smallm_max_rows',3)), '--execute']
+            str(runtime.get('native_smallm_max_rows',3))]
+    argv += ['--prefill-chunk', str(args.prefill_chunk)]
+    if args.n_cpu_moe: argv += ['--n-cpu-moe', str(args.n_cpu_moe)]
+    if args.cpu_moe != 'off': argv += ['--cpu-moe', args.cpu_moe]
+    if args.moe_cpu_threads is not None: argv += ['--moe-cpu-threads', str(args.moe_cpu_threads)]
     if args.mode == 'serve':
         argv += ['--host', args.host, '--port', str(args.port), '--request-timeout', str(args.request_timeout)]
         if args.alias:
             argv += ['--alias', args.alias]
+        argv += ['--reasoning', args.reasoning, '--reasoning-format', args.reasoning_format,
+                 '--prefix-cache', args.prefix_cache]
+        if args.chat_template_file is not None:
+            argv += ['--chat-template-file', linux_path(args.chat_template_file.resolve())]
+        if args.jinja: argv += ['--jinja']
+        argv += ['--temperature', str(args.temperature), '--top-p', str(args.top_p),
+                '--top-k', str(args.top_k), '--min-p', str(args.min_p),
+                '--repetition-penalty', str(args.repetition_penalty),
+                '--presence-penalty', str(args.presence_penalty),
+                '--frequency-penalty', str(args.frequency_penalty)]
+        if args.seed is not None: argv += ['--seed', str(args.seed)]
     else:
         argv += ['--suite', linux_path(ROOT/'configs/evaluation.json'), '--mode', args.mode]
     if args.decode_fusions != 'off': argv += ['--native-smallm-graph']
@@ -399,6 +513,7 @@ def main():
     if args.draft_confidence is not None: argv += ['--draft-confidence', str(args.draft_confidence)]
     if args.warps: argv += ['--gemv-splitk-warps',str(args.warps)]
     argv += ['--smallm-kernel',args.smallm_kernel]
+    argv += ['--prefill-gemm',args.prefill_gemm]
     argv += ['--gpu-memory-fraction', str(args.gpu_memory_fraction)]
     if args.head_warps is not None: argv += ['--head-warps',str(args.head_warps)]
     argv += ['--cache-type-k',cache_k,'--cache-type-v',cache_v]

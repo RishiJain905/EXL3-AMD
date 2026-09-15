@@ -7,3 +7,11 @@ Developer tools include packed projection/small-M validation and conversion repa
 EXL3 decoding and base kernels originate with Turboderp/ExLlamaV3; RDNA/HIP primitives and the direct port originate with CarouselAether. Local changes reuse those components. See [UPSTREAMS.md](../../docs/UPSTREAMS.md), [LICENSE.upstream](LICENSE.upstream), and [rdna-smallm-LICENSE.txt](rdna-smallm-LICENSE.txt).
 
 Use isolated matching extensions and known fixtures for operator checks. Keep outputs and private paths outside Git. CPU tests do not validate GPU kernels or full models. [Build instructions](../../docs/BUILD.md).
+
+`check_hgemm.py` exposes `run_checks(torch, extension)` for the optional FP32-output
+prefill GEMM. The caller must already hold the GPU lease and supply a verified,
+loaded extension; the validator neither loads nor builds a binary. It checks
+numerical references, dispatch fallbacks, output canaries, invalid arguments,
+stream behavior and graph replay, including both sides of the 512-row WMMA
+dispatch boundary. [Initial measurements](../../docs/GPU-PERFORMANCE.md) and
+[full CLI follow-up](../../docs/RUNTIME-PERFORMANCE.md).

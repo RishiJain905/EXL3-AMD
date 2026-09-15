@@ -157,7 +157,7 @@ class MainRejectionTests(unittest.TestCase):
             for flags in (['--gpu-draft'],['--gpu-draft','--gpu-embedding'],
                           ['--gpu-draft','--mtp','4'],['--gpu-draft-metadata']):
                 self._assert_rejects(['launch','speed','--config',str(Path(tmp)/'missing.toml'),
-                                      '--output',str(out),'--execute',*flags],out)
+                                      '--output',str(out),*flags],out)
 
     def test_server_rejects_public_bind_before_launch(self):
         with patch("subprocess.Popen") as child, contextlib.redirect_stderr(io.StringIO()):
@@ -186,14 +186,15 @@ class MainRejectionTests(unittest.TestCase):
         mock_write.assert_not_called()
         self.assertFalse(output.exists(), "rejected run must not create output")
 
-    def test_missing_execute_flag_rejects(self):
+    def test_removed_execute_flag_rejects(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             cfg = tmp / "local.toml"
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out)], out)
+                                  "--output", str(out), "--execute"], out)
+
 
     def test_unpermitted_config_rejects(self):
         variants = [dict(infer=False), dict(probes=False),
@@ -207,7 +208,7 @@ class MainRejectionTests(unittest.TestCase):
                     self._write_config(cfg, **kwargs)
                     out = tmp / "run-out"
                     self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                          "--output", str(out), "--execute"], out)
+                                          "--output", str(out)], out)
 
     def test_invalid_context_rejects(self):
         for context in (512, 4097, 0, 1025):
@@ -218,7 +219,7 @@ class MainRejectionTests(unittest.TestCase):
                     self._write_config(cfg)
                     out = tmp / "run-out"
                     self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                          "--output", str(out), "--execute",
+                                          "--output", str(out),
                                           "--context", str(context)], out)
 
     def test_generate_without_prompt_rejects(self):
@@ -228,7 +229,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "generate", "--config", str(cfg),
-                                  "--output", str(out), "--execute"], out)
+                                  "--output", str(out)], out)
 
     def test_both_prompt_and_prompt_file_rejects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,7 +240,7 @@ class MainRejectionTests(unittest.TestCase):
             prompt_file.write_text("hi", encoding="utf-8")
             out = tmp / "run-out"
             self._assert_rejects(["launch", "generate", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--prompt", "hi", "--prompt-file", str(prompt_file)], out)
 
     def test_invalid_max_tokens_rejects(self):
@@ -251,7 +252,7 @@ class MainRejectionTests(unittest.TestCase):
                     self._write_config(cfg)
                     out = tmp / "run-out"
                     self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                          "--output", str(out), "--execute",
+                                          "--output", str(out),
                                           "--max-tokens", str(tokens)], out)
 
     def test_cache_mtp_without_mtp_rejects(self):
@@ -261,7 +262,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--cache-mtp", "fc"], out)
 
     def test_cache_mtp_with_gdn_mlp_rejects(self):
@@ -271,7 +272,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--mtp", "4", "--decode-fusions", "gdn-mlp",
                                   "--cache-mtp", "mlp"], out)
 
@@ -282,7 +283,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--draft-confidence", "0.4"], out)
 
     def test_draft_confidence_invalid_values_reject(self):
@@ -294,7 +295,7 @@ class MainRejectionTests(unittest.TestCase):
                     self._write_config(cfg)
                     out = tmp / "run-out"
                     self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                          "--output", str(out), "--execute",
+                                          "--output", str(out),
                                           "--mtp", "4", "--draft-confidence", value], out)
 
     def test_draft_confidence_with_gpu_draft_rejects(self):
@@ -304,7 +305,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--mtp", "4", "--gpu-embedding", "--gpu-draft",
                                   "--draft-confidence", "0.4"], out)
 
@@ -315,7 +316,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--cache-type-k", "q8"], out)
 
     def test_explicit_f16_quant_mix_rejects(self):
@@ -325,7 +326,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--cache-type-k", "f16", "--cache-type-v", "q4"], out)
 
     def test_conflicting_shorthand_rejects(self):
@@ -335,7 +336,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--cache-type", "q8", "--cache-type-k", "q4"], out)
 
     def test_fp8_cache_type_rejects(self):
@@ -345,7 +346,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--cache-type", "fp8"], out)
 
     def test_malformed_attention_profile_rejects(self):
@@ -355,7 +356,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--attention-profile", "bogus"], out)
 
     def test_quantized_cache_rejects_native_attention(self):
@@ -365,7 +366,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--cache-type", "q8", "--native-attention"], out)
 
     def test_quantized_cache_rejects_draft_step_graph(self):
@@ -375,7 +376,7 @@ class MainRejectionTests(unittest.TestCase):
             self._write_config(cfg)
             out = tmp / "run-out"
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                  "--output", str(out), "--execute",
+                                  "--output", str(out),
                                   "--mtp", "4", "--gpu-embedding", "--gpu-draft",
                                   "--gpu-draft-metadata", "--draft-step-graph",
                                   "--cache-type", "q8"], out)
@@ -419,8 +420,7 @@ class CachePrecisionForwardingTests(unittest.TestCase):
             cfg = tmp / "local.toml"
             out = tmp / "run-out"
             self._write_full_config(cfg, (tmp / "lock").as_posix())
-            argv = ["launch", mode, "--config", str(cfg), "--output", str(out),
-                   "--execute", *argv_extra]
+            argv = ["launch", mode, "--config", str(cfg), "--output", str(out), *argv_extra]
             child = MagicMock()
             child.poll.return_value = 0
             child.wait.return_value = 0
@@ -467,6 +467,26 @@ class CachePrecisionForwardingTests(unittest.TestCase):
         argv = self._run_and_capture_argv("serve", ["--cache-type", "q8"])
         self.assertIn("serve_exl3.py", argv[1])
         self._assert_pair(argv, "q8", "q8")
+
+    def test_prefix_cache_forwarded_only_to_serve(self):
+        argv = self._run_and_capture_argv("serve", ["--prefix-cache", "on"])
+        self.assertEqual(argv[argv.index("--prefix-cache") + 1], "on")
+        argv = self._run_and_capture_argv("speed", [])
+        self.assertNotIn("--prefix-cache", argv)
+
+
+    def test_prefill_defaults_preserve_benchmark_protocol(self):
+        for mode, extra, expected in (("serve", [], "1024"), ("speed", [], "256"),
+                                      ("serve", ["-b", "512"], "512")):
+            with self.subTest(mode=mode, extra=extra):
+                argv = self._run_and_capture_argv(mode, extra)
+                self.assertEqual(argv[argv.index("--prefill-chunk") + 1], expected)
+
+    def test_prefill_gemm_forwarded_to_server_and_evaluator(self):
+        for mode in ('serve', 'speed'):
+            with self.subTest(mode=mode):
+                argv = self._run_and_capture_argv(mode, ['--prefill-gemm', 'wmma'])
+                self.assertEqual(argv[argv.index('--prefill-gemm') + 1], 'wmma')
 
     def test_f16_keeps_native_attention_available(self):
         argv = self._run_and_capture_argv("speed", ["--native-attention"])
@@ -570,7 +590,7 @@ class MetadataResolutionTests(unittest.TestCase):
             _write_metadata(root / "configs" / "local.toml", (root / "lock").as_posix(),
                             candidate="/fake/legacy", distribution="legacy-dist")
             model = self._model(root)
-            request = self._run(root, ["speed", "--output", str(root / "run-out"), "--execute",
+            request = self._run(root, ["speed", "--output", str(root / "run-out"),
                                       "-m", str(model), "--mtp", "4", "--warps", "8"])
         self.assertEqual(request["runtime"]["distribution"], "install-dist")
         self.assertEqual(request["runtime"]["candidate"], launch.linux_path(model.resolve()))
@@ -589,7 +609,7 @@ class MetadataResolutionTests(unittest.TestCase):
             manifest.write_text("[]", encoding="utf-8")
             _write_metadata(legacy, (root / "lock").as_posix(), candidate="/fake/legacy",
                             manifest=manifest.as_posix())
-            request = self._run(root, ["speed", "--output", str(root / "run-out"), "--execute"])
+            request = self._run(root, ["speed", "--output", str(root / "run-out")])
         self.assertEqual(request["runtime"]["candidate"], "/fake/legacy")
         argv = request["argv"]
         self.assertEqual(argv[argv.index("--config") + 1], launch.linux_path(legacy.resolve()))
@@ -601,7 +621,7 @@ class MetadataResolutionTests(unittest.TestCase):
             root = Path(tmp)
             _write_metadata(root / ".runtime" / "installation.toml",
                             (root / "lock").as_posix())
-            self._assert_rejects(root, ["speed", "--output", str(root / "run-out"), "--execute"])
+            self._assert_rejects(root, ["speed", "--output", str(root / "run-out")])
 
     def test_linux_model_path_survives_windows_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -609,7 +629,7 @@ class MetadataResolutionTests(unittest.TestCase):
             _write_metadata(root / ".runtime" / "installation.toml",
                             (root / "lock").as_posix(), rows=9)
             request = self._run(root, ["serve", "-m", "/mnt/d/EXL3 Models/example",
-                "--output", str(root / "run-out"), "--execute", "--cache-type", "q8",
+                "--output", str(root / "run-out"), "--cache-type", "q8",
                 "--attention-profile", "long", "--spec-type", "draft-mtp", "--mtp", "6"])
         self.assertEqual(request["runtime"]["candidate"], "/mnt/d/EXL3 Models/example")
         self.assertEqual(request["argv"][request["argv"].index("--cache-type-k")+1], "q8")
@@ -628,13 +648,13 @@ class MetadataResolutionTests(unittest.TestCase):
                 _write_metadata(root / "configs" / "local.toml",
                                 (root / "lock").as_posix(), candidate="/fake/legacy")
                 self._assert_rejects(root, ["speed", "-m", str(root / "model"),
-                                          "--output", str(root / "run-out"), "--execute"])
+                                          "--output", str(root / "run-out")])
 
     def test_missing_metadata_rejects(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model = self._model(root)
-            self._assert_rejects(root, ["speed", "--output", str(root / "run-out"), "--execute",
+            self._assert_rejects(root, ["speed", "--output", str(root / "run-out"),
                                        "-m", str(model)])
 
     def test_malformed_installation_rejects(self):
@@ -644,7 +664,7 @@ class MetadataResolutionTests(unittest.TestCase):
             install.parent.mkdir(parents=True, exist_ok=True)
             install.write_text("[runtime\n", encoding="utf-8")
             model = self._model(root)
-            self._assert_rejects(root, ["speed", "--output", str(root / "run-out"), "--execute",
+            self._assert_rejects(root, ["speed", "--output", str(root / "run-out"),
                                        "-m", str(model)])
 
     def test_explicit_missing_config_never_falls_back(self):
@@ -654,7 +674,7 @@ class MetadataResolutionTests(unittest.TestCase):
                             (root / "lock").as_posix())
             model = self._model(root)
             self._assert_rejects(root, ["speed", "--config", str(root / "missing.toml"),
-                                       "--output", str(root / "run-out"), "--execute",
+                                       "--output", str(root / "run-out"),
                                        "-m", str(model)])
 
     def test_explicit_legacy_config_overrides_model(self):
@@ -664,7 +684,7 @@ class MetadataResolutionTests(unittest.TestCase):
             _write_metadata(legacy, (root / "lock").as_posix(), candidate="/fake/legacy")
             model = self._model(root)
             request = self._run(root, ["speed", "--config", str(legacy),
-                                      "--output", str(root / "run-out"), "--execute",
+                                      "--output", str(root / "run-out"),
                                       "-m", str(model)])
         self.assertEqual(request["runtime"]["candidate"], launch.linux_path(model.resolve()))
         self.assertNotIn("--candidate-manifest", request["argv"])
@@ -676,8 +696,8 @@ class MetadataResolutionTests(unittest.TestCase):
                             (root / "lock").as_posix(), candidate="/fake/stray",
                             manifest="/fake/stray-manifest.json")
             model = self._model(root)
-            self._assert_rejects(root, ["speed", "--output", str(root / "run-out"), "--execute"])
-            request = self._run(root, ["speed", "--output", str(root / "run-out"), "--execute",
+            self._assert_rejects(root, ["speed", "--output", str(root / "run-out")])
+            request = self._run(root, ["speed", "--output", str(root / "run-out"),
                                       "-m", str(model)])
         self.assertEqual(request["runtime"]["candidate"], launch.linux_path(model.resolve()))
         self.assertNotIn("--candidate-manifest", request["argv"])
@@ -690,7 +710,7 @@ class MetadataResolutionTests(unittest.TestCase):
             model = self._model(root)
             manifest = root / "manifest.json"
             manifest.write_text("[]", encoding="utf-8")
-            request = self._run(root, ["speed", "--output", str(root / "run-out"), "--execute",
+            request = self._run(root, ["speed", "--output", str(root / "run-out"),
                                       "-m", str(model), "--model-manifest", str(manifest)])
         argv = request["argv"]
         self.assertEqual(argv[argv.index("--candidate-manifest") + 1],
@@ -698,7 +718,9 @@ class MetadataResolutionTests(unittest.TestCase):
 
 class ServeLifetimeTests(unittest.TestCase):
     def _worker_run(self, timeout, *, elapsed, rss=1024, mem_gib=8, disk_gib=200,
-                    iters=1, pre_stop=False, mode=None, total_gib=24, limits=None):
+                    iters=1, pre_stop=False, mode=None, total_gib=24, limits=None,
+                    sleep_error=None, shutdown_state=None, child_exit=0,
+                    external_reason=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         run = Path(temporary.name) / "run"
@@ -712,11 +734,16 @@ class ServeLifetimeTests(unittest.TestCase):
         req.write_text(json.dumps(request), encoding="utf-8")
         if pre_stop:
             (run / "stop").touch()
+        if external_reason:
+            (run / "external-stop.json").write_text(json.dumps({"reason": external_reason}))
         child = MagicMock()
         child.pid = 4321
-        child.poll.side_effect = [None] * iters + [0, 0]
-        child.wait.return_value = 0
-        child.returncode = 0
+        child.poll.side_effect = [None, None] if sleep_error else [None] * iters + [child_exit, child_exit]
+        child.wait.return_value = child_exit
+        child.returncode = child_exit
+        def finish_shutdown(_child):
+            if shutdown_state is not None:
+                (run / "result/shutdown.json").write_text(json.dumps(shutdown_state))
         meminfo = (f"MemTotal: {total_gib * 1024 * 1024} kB\n"
                    f"MemAvailable: {mem_gib * 1024 * 1024} kB\n")
         real_read = Path.read_text
@@ -731,10 +758,10 @@ class ServeLifetimeTests(unittest.TestCase):
                 patch.object(launch, "group_rss", return_value=rss), \
                 patch.object(launch, "runtime_environment", return_value={}), \
                 patch.object(launch.time, "monotonic", side_effect=monotonic), \
-                patch.object(launch.time, "sleep"), \
+                patch.object(launch.time, "sleep", side_effect=sleep_error), \
                 patch("shutil.disk_usage", return_value=disk), \
                 patch.object(Path, "read_text", fake_read), \
-                patch.object(launch, "terminate_group") as term:
+                patch.object(launch, "terminate_group", side_effect=finish_shutdown) as term:
             code = launch.worker(str(req))
         monitor = json.loads((run / "monitor.json").read_text(encoding="utf-8"))
         return code, monitor, term
@@ -759,6 +786,46 @@ class ServeLifetimeTests(unittest.TestCase):
         _, monitor, term = self._worker_run(60, elapsed=901)
         term.assert_called_once()
         self.assertEqual(monitor["stop_reason"], "timeout")
+
+    def test_worker_ctrl_c_with_confirmed_server_shutdown_succeeds(self):
+        state = dict(ready=False, active=False, failed=0, model_load_count=1)
+        for child_exit in (0, -15):
+            with self.subTest(child_exit=child_exit):
+                code, monitor, term = self._worker_run(
+                    None, elapsed=1, sleep_error=KeyboardInterrupt(),
+                    shutdown_state=state, child_exit=child_exit)
+                term.assert_called_once()
+                self.assertEqual(code, 0)
+                self.assertEqual(monitor["exit_code"], child_exit)
+                self.assertEqual(monitor["stop_reason"], "user_stop")
+                self.assertTrue(monitor["clean_server_shutdown"])
+                self.assertIsNone(monitor["error"])
+
+    def test_worker_ctrl_c_does_not_hide_failed_or_incomplete_shutdown(self):
+        state = dict(ready=False, active=False, failed=0, model_load_count=1)
+        cases = [dict(shutdown_state=None),
+                 dict(shutdown_state=dict(state, failed=1)),
+                 dict(shutdown_state=dict(state, active=True)),
+                 dict(shutdown_state=state, external_reason="adapter_dedicated"),
+                 dict(shutdown_state=state, mode="speed")]
+        for case in cases:
+            with self.subTest(case=case):
+                code, monitor, term = self._worker_run(
+                    None, elapsed=1, sleep_error=KeyboardInterrupt(), child_exit=-15, **case)
+                term.assert_called_once()
+                self.assertNotEqual(code, 0)
+                self.assertFalse(monitor["clean_server_shutdown"])
+
+    def test_worker_real_monitor_error_still_fails_after_clean_shutdown(self):
+        state = dict(ready=False, active=False, failed=0, model_load_count=1)
+        code, monitor, term = self._worker_run(
+            None, elapsed=1, sleep_error=RuntimeError("monitor failed"),
+            shutdown_state=state, child_exit=-15)
+        term.assert_called_once()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(monitor["stop_reason"], "monitor_error")
+        self.assertEqual(monitor["error"], "RuntimeError: monitor failed")
+        self.assertFalse(monitor["clean_server_shutdown"])
 
     def _windows_run(self, mode, argv_extra, *, elapsed, sample, iters=1, gpu_total_gib=16, disk_gib=200):
         if os.name != "nt":
@@ -790,8 +857,7 @@ class ServeLifetimeTests(unittest.TestCase):
         disk.free = disk_gib * launch.GIB
         monotonic = [1000.0] + [1000.0 + elapsed] * (iters + 2)
         stdout = io.StringIO()
-        argv = ["launch", mode, "--config", str(cfg), "--output", str(out),
-                "--execute", *argv_extra]
+        argv = ["launch", mode, "--config", str(cfg), "--output", str(out), *argv_extra]
         with patch.object(sys, "argv", argv), \
                 patch("subprocess.Popen", return_value=child), \
                 patch.dict(sys.modules, {"quantlab": quantlab_package,

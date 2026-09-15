@@ -1,12 +1,14 @@
 """Explicit, independently selectable inference experiments; defaults stay unchanged."""
 
 
-def configure_native(binary, *, smallm_kernel='dot', head_warps=None):
+def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_gemm='blas'):
     """Reject optional kernels on older binaries instead of silently ignoring them."""
     import ctypes
     import os
     if smallm_kernel not in ('dot', 'wmma', 'wmma-register') or head_warps not in (None, 1, 4, 8, 16):
         raise ValueError('Unsupported native optimization setting')
+    if prefill_gemm not in ('blas', 'wmma'):
+        raise ValueError('Unsupported prefill GEMM setting')
     abi = None
     if smallm_kernel != 'dot' or head_warps is not None:
         try:
@@ -18,12 +20,25 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None):
         abi = version()
         if abi not in (1, 2) or (smallm_kernel == 'wmma-register' and abi < 2):
             raise ValueError('Unsupported native optimization ABI')
+    hgemm_abi = None
+    if prefill_gemm == 'wmma':
+        try:
+            version = ctypes.CDLL(str(binary)).quantlab_exl3_hgemm_abi
+        except AttributeError as error:
+            raise ValueError('WMMA prefill needs a binary with the prefill GEMM extension') from error
+        version.argtypes = []
+        version.restype = ctypes.c_int
+        hgemm_abi = version()
+        if hgemm_abi != 1:
+            raise ValueError('Unsupported prefill GEMM ABI')
+    os.environ['EXL3_HGEMM_IMPL'] = prefill_gemm
     os.environ['EXL3_SMALLM_WMMA'] = {'dot':'0', 'wmma':'1', 'wmma-register':'2'}[smallm_kernel]
     if head_warps is None:
         os.environ.pop('EXL3_SMALLM_HEAD_WARPS', None)
     else:
         os.environ['EXL3_SMALLM_HEAD_WARPS'] = str(head_warps)
-    return dict(smallm_kernel=smallm_kernel, head_warps=head_warps, optimization_abi=abi)
+    return dict(smallm_kernel=smallm_kernel, head_warps=head_warps, optimization_abi=abi,
+                prefill_gemm=prefill_gemm, prefill_gemm_abi=hgemm_abi)
 
 
 def install_optimizations(model, draft, *, gpu_embedding=False, batch_greedy=False,

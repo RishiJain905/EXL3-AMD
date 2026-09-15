@@ -72,6 +72,7 @@ def parser():
     p.add_argument('--decode-fusions', choices=('off', 'gdn', 'gdn-mlp', 'gdn-mlp-mgemv'), default='off')
     p.add_argument('--gemv-splitk-warps', type=int, choices=(4, 8, 16))
     p.add_argument('--smallm-kernel', choices=('dot','wmma','wmma-register'), default='dot')
+    p.add_argument('--prefill-gemm', choices=('blas','wmma'), default='blas')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16))
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off')
     p.add_argument('--draft-step-graph', action='store_true', help='Experimental whole MTP step graph; requires GPU drafting and metadata')
@@ -96,7 +97,13 @@ def parser():
                    help='Enable two/three-row GDN/MLP graphs in the v2 experimental binary')
     p.add_argument('--expected-results', type=Path,
                    help='Retained result.json; fail immediately on an input/output token mismatch')
-    p.add_argument('--execute', action='store_true')
+    p.add_argument('-b', '--batch-size', '--prefill-chunk', dest='prefill_chunk', type=int, default=256,
+                   help='Prompt tokens per prefill step, 256-8192, multiple of 256 (llama.cpp -b analogue)')
+    p.add_argument('-ncmoe', '--n-cpu-moe', dest='n_cpu_moe', type=int, default=0,
+                   help='Keep routed experts of the first N MoE layers on CPU')
+    p.add_argument('-cmoe', '--cpu-moe', nargs='?', const='all', choices=('off', 'all'), default='off',
+                   help='Offload every MoE layer experts to CPU; not dynamic caching')
+    p.add_argument('--moe-cpu-threads', type=int, default=None, help='CPU MoE worker threads, 1-256')
     _resources().add_allocator_arg(p)
     _cache_precision().add_cache_precision_args(p)
     return p
@@ -139,11 +146,19 @@ def main():
     if args.native_smallm_graph and (not args.native_smallm or args.decode_fusions not in ('gdn', 'gdn-mlp')):
         p.error('Small-M graph requires --native-smallm and gdn or gdn-mlp fusions')
     config = tomllib.loads(args.config.read_text())
-    if not args.execute or not all(config['execution'].get(k) is True for k in
-                                  ('allow_local_inference', 'allow_backend_probes')):
-        p.error('Requires --execute and both local permissions')
+    if not all(config['execution'].get(k) is True for k in
+               ('allow_local_inference', 'allow_backend_probes')):
+        p.error('Requires both configured local permissions')
     if not 1024 <= args.context <= 262144 or args.context % 256:
         p.error('Context must be a multiple of 256 in [1024, 262144]')
+    if not 256 <= args.prefill_chunk <= 8192 or args.prefill_chunk % 256:
+        p.error('--prefill-chunk must be a multiple of 256 in [256,8192]')
+    if args.n_cpu_moe < 0 or args.n_cpu_moe > 1024:
+        p.error('--n-cpu-moe must be in [0,1024]')
+    if args.cpu_moe == 'all' and args.n_cpu_moe:
+        p.error('--cpu-moe all conflicts with --n-cpu-moe')
+    if args.moe_cpu_threads is not None and not 1 <= args.moe_cpu_threads <= 256:
+        p.error('--moe-cpu-threads must be in [1,256]')
     candidate = args.candidate.resolve()
     output = args.output.resolve()
     if candidate == output or candidate in output.parents or output in candidate.parents:
@@ -231,7 +246,8 @@ def main():
         spec.loader.exec_module(extension)
         from quantlab.methods.exl3.optimizations import configure_native
         status['native_optimizations'] = configure_native(binary,
-            smallm_kernel=args.smallm_kernel, head_warps=args.head_warps)
+            smallm_kernel=args.smallm_kernel, head_warps=args.head_warps,
+            prefill_gemm=args.prefill_gemm)
         sys.path.insert(0, str(args.source_dir))
         from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer, Generator, Job, ArgmaxSampler
         from quantlab.methods.exl3.compat import install, prepare_loaded_module
@@ -245,13 +261,25 @@ def main():
                extension_sha256=args.expected_extension_sha256, harness_sha256=digest(__file__),
                suite_sha256=digest(args.suite), allocator_limit_bytes=allocator_limit,
                gpu_memory_fraction=gpu_fraction)
-        record('adaptive', dynamic_draft_tokens=args.draft_confidence is not None,
-               draft_confidence=args.draft_confidence)
         raw_config = json.loads((candidate / 'config.json').read_text())
         if raw_config.get('model_type') in ('qwen3_5', 'qwen3_5_moe') and 'text_config' in raw_config:
             cfg, _ = mapped_text_config(candidate)
         else:
             cfg = Config.from_directory(str(candidate))
+        cpu_moe = (1 << 30) if args.cpu_moe == 'all' else args.n_cpu_moe
+        if cpu_moe:
+            text = raw_config.get('text_config', raw_config)
+            experts = text.get('num_experts', text.get('num_local_experts', 0)) or 0
+            if not experts or not text.get('num_hidden_layers'):
+                raise ValueError('CPU MoE offload requires a block-sparse MoE model')
+            extension = sys.modules.get('exllamav3_ext')
+            for symbol in ('exl3_moe_cpu_make_layer', 'exl3_moe_cpu_forward'):
+                if extension is None or not hasattr(extension, symbol):
+                    raise ValueError(f'Extension lacks CPU MoE symbol: {symbol}')
+            cfg.infer_params.moe_cpu_offload = min(cpu_moe, 1 << 30)
+            if args.moe_cpu_threads is not None:
+                cfg.infer_params.moe_cpu_threads = args.moe_cpu_threads
+            record('cpu_moe', layers=cfg.infer_params.moe_cpu_offload, threads=args.moe_cpu_threads)
         max_context = raw_config.get('text_config', raw_config).get('max_position_embeddings')
         if max_context is None or args.context > max_context:
             raise ValueError('Requested context exceeds or lacks model metadata limit')
@@ -333,7 +361,7 @@ def main():
                 raise ValueError('Prompt/output exceeds context')
             (output / (name + '-input.json')).write_text(json.dumps(dict(
                 prompt=prompt, rendered=rendered, input_token_ids=ids.flatten().tolist(), metadata=metadata), indent=2))
-            gen = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=256, max_q_size=3,
+            gen = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=args.prefill_chunk, max_q_size=3,
                             draft_model=draft if args.mtp else None, draft_cache=draft_cache,
                             num_draft_tokens=args.draft_tokens if args.mtp else None, enable_defrag=False,
                             cpu_cache_size=0, recurrent_cache_size=1024**3, record_draft_stats=True,
