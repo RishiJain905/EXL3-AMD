@@ -93,7 +93,7 @@ class FakeEngine:
 # ---------------------------------------------------------------------------
 
 def make_scope(path, method="POST", body=b"", headers=None):
-    hdrs = [(b"content-type", b"application/json")]
+    hdrs = [(b"host", b"127.0.0.1"), (b"content-type", b"application/json")]
     if body is not None and method in ("POST", "PUT", "PATCH"):
         hdrs.append((b"content-length", str(len(body)).encode()))
     if headers:
@@ -419,9 +419,18 @@ class ValidationTests(ServerTestBase):
             ("include-usage-nonstrict", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "stream_options": {"include_usage": "yes"}}),
             ("n-two", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "n": 2}),
             ("n-bool", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "n": True}),
-            ("temperature-half", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.5}),
+            ("temperature-high", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "temperature": 2.5}),
             ("temperature-str", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "temperature": "0"}),
-            ("top-p-half", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "top_p": 0.9}),
+            ("top-p-zero", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "top_p": 0}),
+            ("top-k-negative", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "top_k": -1}),
+            ("min-p-one", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "min_p": 1.0}),
+            ("repetition-zero", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "repetition_penalty": 0}),
+            ("presence-high", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "presence_penalty": 3}),
+            ("seed-negative", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "seed": -1}),
+            ("template-kwargs-nondict", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": True}),
+            ("template-kwargs-unknown", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"thinking": True}}),
+            ("template-kwargs-nonstrict", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"enable_thinking": "yes"}}),
+            ("template-kwargs-in-completion", "/v1/completions", {"prompt": "hi", "chat_template_kwargs": {"enable_thinking": True}}),
         ]
         for name, path, body in cases:
             with self.subTest(name=name):
@@ -433,9 +442,19 @@ class ValidationTests(ServerTestBase):
         ok = {"messages": [{"role": "user", "content": "hi"}], "n": 1, "temperature": 0, "top_p": 1}
         status, payload = await self._post("/v1/chat/completions", json.dumps(ok).encode())
         self.assertEqual(status, 200, payload)
-        ok2 = {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.0, "top_p": 1.0}
-        status, payload = await self._post("/v1/chat/completions", json.dumps(ok2).encode())
-        self.assertEqual(status, 200, payload)
+        eng = FakeEngine()
+        app = create_app(eng, request_timeout=5, max_pending=4)
+        ok2 = {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.7, "top_p": 0.9,
+               "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1, "presence_penalty": 0.1,
+               "frequency_penalty": 0.2, "seed": 7,
+               "chat_template_kwargs": {"enable_thinking": True}}
+        h = Harness(json.dumps(ok2).encode())
+        await run_app(app, make_scope("/v1/chat/completions"), h)
+        self.assertEqual(status_of(h), 200, json_of(h))
+        call = eng.prepare_calls[-1]
+        self.assertEqual(call["sampling"]["temperature"], 0.7)
+        self.assertEqual(call["sampling"]["seed"], 7)
+        self.assertEqual(call["template_kwargs"], {"enable_thinking": True})
 
     async def test_invalid_json_400(self):
         status, payload = await self._post("/v1/chat/completions", b"{not json")
@@ -586,8 +605,8 @@ class AdmissionTests(ServerTestBase):
         # holder succeeds while the waiter, delayed by the queue, times out
         # during its own generation (it would succeed unqueued).
         eng = FakeEngine()
-        eng.item_delay = 0.08  # ~0.16s per request (2 pulls)
-        app = create_app(eng, request_timeout=0.25, max_pending=4)
+        eng.item_delay = 0.3  # ~0.6s per request; leave scheduling margin on WSL.
+        app = create_app(eng, request_timeout=0.9, max_pending=4)
         h1 = Harness(chat_body())
         t1 = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h1, timeout=5))
         self.assertTrue(await wait_until(lambda: eng.started.is_set(), timeout=2))
@@ -926,12 +945,13 @@ class ToolCallSuccessTests(ServerTestBase):
         self.assertEqual(msg["content"], "checking ")
         self.assertEqual(msg["tool_calls"], calls)
 
-    async def test_ordinary_request_keeps_old_kwargs(self):
+    async def test_ordinary_request_keeps_tool_kwargs_absent(self):
         eng = FakeEngine()
         app, h = await self._post(eng, chat_body())
         self.assertEqual(status_of(h), 200)
         self.assertEqual(set(eng.prepare_calls[0]),
-                         {"messages", "prompt", "max_tokens"})
+                         {"messages", "prompt", "max_tokens", "sampling", "template_kwargs"})
+        self.assertIsNone(eng.prepare_calls[0]["template_kwargs"])
         self.assertFalse(app.state.gate.lock.locked())
 
 

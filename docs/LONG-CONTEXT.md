@@ -5,8 +5,8 @@
 Increase capacity incrementally. Reduced KV precision saves memory, but attention still reads more history as occupied context grows.
 
 ```powershell
-python run.py context -m "MODEL_DIRECTORY" --cache-type q8 -c 32768 --execute
-python run.py context-speed -m "MODEL_DIRECTORY" --cache-type q8 --spec-type draft-mtp --spec-draft-n-max 6 --draft-confidence 0.6 -c 32768 --execute
+python run.py context -m "MODEL_DIRECTORY" --cache-type q8 -c 32768
+python run.py context-speed -m "MODEL_DIRECTORY" --cache-type q8 --spec-type draft-mtp --spec-draft-n-max 6 --draft-confidence 0.6 -c 32768
 ```
 
 `context-speed` fills `context - 256` input tokens. Default task `docstring` generates 192 tokens; `--context-speed-task canonical` uses the fixed coding-suite question and 128 tokens. Keep tasks fixed across comparisons.

@@ -58,27 +58,32 @@ Registration writes ignored `.runtime/installation.toml`. It installs nothing, s
 From the repository root, replace `MODEL_DIRECTORY` with a complete local EXL3 folder. Relative paths work; `-m` never downloads a model.
 
 ```powershell
-python run.py -m "MODEL_DIRECTORY" -c 4096 -n 256 -p "Write Python binary search." --execute
-python run.py speed -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --execute
-python run.py quality -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --execute
+python run.py -m "MODEL_DIRECTORY" -c 4096 -n 256 -p "Write Python binary search."
+python run.py speed -m "MODEL_DIRECTORY" --cache-type q8 -c 4096
+python run.py quality -m "MODEL_DIRECTORY" --cache-type q8 -c 4096
 
 # Requires integrated MTP weights.
-python run.py -m "MODEL_DIRECTORY" --cache-type q8 --spec-type draft-mtp --spec-draft-n-max 4 -c 4096 -n 256 -p "Explain parameterized SQL queries." --execute
+python run.py -m "MODEL_DIRECTORY" --cache-type q8 --spec-type draft-mtp --spec-draft-n-max 4 -c 4096 -n 256 -p "Explain parameterized SQL queries."
 ```
 
-Use `python3` on Linux. Sampling is greedy and thinking disabled. Speed mode uses warmed fixed-length continuations; quality mode is a small coding/SQL/security smoke suite. [Measurement and tuning](docs/OPTIMIZATION.md).
+Use `python3` on Linux. Commands run once the registered installation allows local inference and backend probes. Benchmark modes use greedy sampling; serve defaults to greedy with per-request sampling overrides. Reasoning follows the model template by default. Speed mode uses warmed fixed-length continuations; quality mode is a small coding/SQL/security smoke suite. [Measurement and tuning](docs/OPTIMIZATION.md).
 
 ## Serve a harness
 
 ```powershell
-python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 --spec-type draft-mtp --spec-draft-n-max 4 -c 4096 --alias exl3 --port 8000 --execute
+python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 --spec-type draft-mtp --spec-draft-n-max 4 -c 4096 --alias exl3 --port 8000
 ```
 
-Omit MTP flags for models without MTP. Wait for `http://127.0.0.1:8000/health`, then use OpenAI Chat Completions with base URL `http://127.0.0.1:8000/v1`, model `exl3`, `temperature: 0`, `top_p: 1` and `n: 1`.
+Omit MTP flags for models without MTP. Wait for `http://127.0.0.1:8000/health`, then use OpenAI Chat Completions with base URL `http://127.0.0.1:8000/v1`, model `exl3` and `n: 1`. Greedy decoding is the default; sampling, reasoning, and prefill-chunk controls are documented under [HTTP API](docs/SERVING.md).
 
 The server has no overall lifetime timeout. Explicit shutdown and resource/error safeguards remain active. `--request-timeout` applies to individual requests. Serving is loopback-only, with one active GPU request and four queued requests.
 
 [HTTP API](docs/SERVING.md) · [Client-independent function tools](docs/TOOL-CALLING.md)
+
+[llama.cpp flag mapping and limits](docs/LLAMA-CPP-COMPATIBILITY.md).
+[Storage, chunk tuning, and prefix-reuse measurements](docs/PREFILL-PERFORMANCE.md).
+[Native prefill GPU measurements](docs/GPU-PERFORMANCE.md).
+[Full CLI decode and prefill follow-up](docs/RUNTIME-PERFORMANCE.md).
 
 ## Main flags
 
@@ -97,9 +102,13 @@ The server has no overall lifetime timeout. Explicit shutdown and resource/error
 | `--draft-confidence` | Optional adaptive confidence, strictly between 0 and 1 |
 | `--attention-profile default\|long` | Default scheduling or guarded Q8 long-context optimization |
 | `--output` | New private artifact directory; existing directories refused |
-| `--execute` | Execute using enabled local permissions |
+| `--reasoning on\|off\|auto` | Serve thinking-template mode; default auto respects the template |
+| `--temperature`, `--top-p`, `--top-k`, `--min-p`, penalties, `--seed` | Serve sampling defaults with per-request overrides; default greedy |
+| `-b / --prefill-chunk` | Prompt tokens per prefill step, 256–8192 in multiples of 256; default 1024 for serve, 256 otherwise |
+| `--prefix-cache on\|off` | Serve: reuse matching KV/recurrent checkpoints; default off, up to 1 GiB host checkpoint memory |
+| `-ncmoe / --n-cpu-moe`, `--cpu-moe all` | Keep first-N (or all) MoE-layer experts on CPU; MoE models only, not validated on GPU |
 
-Context must fit model metadata and memory, including output and draft reserve. Allocation alone is not useful-context validation. GGUF names such as `q8_0`, separate draft-model files and llama.cpp offload flags are unsupported. See [KV cache](docs/KV-CACHE.md) and [long context](docs/LONG-CONTEXT.md).
+Context must fit model metadata and memory, including output, reasoning, and draft reserve. Allocation alone is not useful-context validation. GGUF names such as `q8_0`, separate draft-model files, and most llama.cpp knobs (`ngl`, `mmap`, RoPE overrides) are unsupported; only the mapped `-b` and `-ncmoe` analogues exist. See [KV cache](docs/KV-CACHE.md) and [long context](docs/LONG-CONTEXT.md).
 
 Resource flags: `--gpu-memory-fraction` (0.90), `--max-gpu-memory-fraction` (0.95), `--max-host-memory-fraction` (0.50), `--min-free-ram-gib` (1) and `--min-free-disk-gib` (1). [Scope and limits](docs/DEPENDENCIES.md#resource-controls).
 
@@ -110,7 +119,7 @@ $env:PYTHONPATH = 'src'
 python -m unittest discover -s tests -v
 ```
 
-Some tests need inference or HTTP dependencies. Skips are not GPU validation. A clean build and a broad hardware/model matrix remain release work. No universal throughput, BF16 fidelity, stochastic sampling or unattended-service claim is made.
+Some tests need inference or HTTP dependencies. Skips are not GPU validation. A clean build and a broad hardware/model matrix remain release work. No universal throughput, BF16 fidelity, broad sampling quality or unattended-service claim is made.
 
 Run artifacts can contain prompts, outputs, token IDs and local paths. Keep them in ignored `artifacts/`; installation records belong in ignored `.runtime/` or local configs. Models, native binaries, developer jobs, private research history and calibration/reference corpora are excluded from Git.
 

@@ -7,18 +7,23 @@ Engine contract:
   - ``model_name: str``, ``context: int``
   - ``status() -> dict`` with a ``ready`` boolean plus counters.
   - ``prepare(*, messages=None, prompt=None, max_tokens=256, tools=None,
-    tool_choice=None, parallel_tool_calls=True)`` -> opaque prepared object;
-    raises ``ValueError`` for context/template problems. The tool kwargs are
-    only passed for tool-related chat requests; ordinary requests keep the
-    original three kwargs.
+    tool_choice=None, parallel_tool_calls=True, sampling=None,
+    template_kwargs=None)`` -> opaque prepared object; raises ``ValueError``
+    for context/template problems. The tool kwargs are only passed for
+    tool-related chat requests; ordinary requests keep the original three
+    kwargs. ``sampling`` is the validated sampling dict (always passed);
+    ``template_kwargs`` carries ``enable_thinking`` when the client sent it.
   - ``generate(prepared)`` -> async generator yielding dicts with ``text``
-    (incremental string) and ``done`` (bool); the final item carries
+    (incremental string), optional ``reasoning`` (incremental reasoning
+    string, chat only), and ``done`` (bool); the final item carries
     ``finish_reason`` (``'stop'``/``'length'``/``'tool_calls'``) and ``usage``
-    (``prompt_tokens``/``completion_tokens``/``total_tokens``). A tool-call
-    turn carries a complete ``tool_calls`` list (OpenAI assistant shape, with
-    JSON-string arguments) in ONE event; the engine never emits partial
-    executable calls. Malformed/truncated/constraint-violating model output
-    raises ``quantlab.tool_calls.ToolCallError`` (a ``ValueError``).
+    (``prompt_tokens``/``completion_tokens``/``total_tokens``, plus an
+    optional ``timings`` object with ``*_seconds`` and
+    ``*_tokens_per_second`` fields). A tool-call turn carries a complete
+    ``tool_calls`` list (OpenAI assistant shape, with JSON-string arguments)
+    in ONE event; the engine never emits partial executable calls.
+    Malformed/truncated/constraint-violating model output raises
+    ``quantlab.tool_calls.ToolCallError`` (a ``ValueError``).
 
 All prepare/generate work is serialized through one ``asyncio.Lock`` held for
 the whole request, streaming included. A bounded waiting count caps queueing;
@@ -40,6 +45,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 
+from quantlab.sampling import check_sampling as _sampling_params
 from quantlab.tool_calls import ToolCallError, loads_json
 
 MAX_BODY_BYTES = 1024 * 1024  # 1 MiB request cap, enforced while reading.
@@ -103,18 +109,58 @@ _CHAT_KEYS = frozenset(
         "n",
         "temperature",
         "top_p",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "chat_template_kwargs",
         "tools",
         "tool_choice",
         "parallel_tool_calls",
     }
 )
 _COMPLETION_KEYS = frozenset(
-    {"model", "prompt", "max_tokens", "stream", "stream_options", "n", "temperature", "top_p"}
+    {"model", "prompt", "max_tokens", "stream", "stream_options", "n", "temperature",
+     "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty",
+     "frequency_penalty", "seed"}
 )
 _ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 _TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _TOOL_CHOICE_STRINGS = frozenset({"auto", "none", "required"})
 _MAX_TOOLS = 128
+
+
+class _LocalRequestsOnly:
+    """Reject browser cross-site requests before body parsing or GPU admission."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
+        headers = scope.get('headers', [])
+        def values(name):
+            return [value.decode('latin-1') for key, value in headers if key.lower() == name]
+        hosts = values(b'host')
+        match = re.fullmatch(r'(127\.0\.0\.1|localhost)(?::([0-9]{1,5}))?',
+                             hosts[0], re.IGNORECASE) if len(hosts) == 1 else None
+        if not match or (match[2] is not None and not 1 <= int(match[2]) <= 65535):
+            return await _error(400, 'invalid local Host header', 'invalid_request_error',
+                                'invalid_host')(scope, receive, send)
+        origins = values(b'origin')
+        expected_origin = scope.get('scheme', 'http') + '://' + hosts[0].lower()
+        if len(origins) > 1 or (origins and origins[0].lower() != expected_origin):
+            return await _error(403, 'cross-origin requests are not allowed', 'invalid_request_error',
+                                'invalid_origin')(scope, receive, send)
+        if scope.get('method') == 'POST':
+            types = values(b'content-type')
+            if len(types) != 1 or types[0].split(';', 1)[0].strip().lower() != 'application/json':
+                return await _error(415, 'Content-Type must be application/json', 'invalid_request_error',
+                                    'unsupported_media_type')(scope, receive, send)
+        return await self.app(scope, receive, send)
 
 
 def _is_int(value: Any) -> bool:
@@ -179,15 +225,29 @@ def _check_stream(body: dict) -> tuple[bool, bool]:
     return stream, include_usage
 
 
-def _check_sampling(body: dict) -> None:
-    if "n" in body and (not _is_int(body["n"]) or body["n"] != 1):
-        raise _Invalid("only n=1 is supported")
-    if "temperature" in body and (
-        not _is_number(body["temperature"]) or body["temperature"] != 0
-    ):
-        raise _Invalid("only temperature=0 (greedy) is supported")
-    if "top_p" in body and (not _is_number(body["top_p"]) or body["top_p"] != 1):
-        raise _Invalid("only top_p=1 is supported")
+def _check_sampling(body: dict) -> dict:
+    try:
+        params = _sampling_params(body)
+        return {key: value for key, value in params.items() if key in body}
+    except ValueError as exc:
+        raise _Invalid(str(exc))
+
+
+_TEMPLATE_KWARGS_KEYS = frozenset({"enable_thinking"})
+
+
+def _check_template_kwargs(body: dict) -> dict | None:
+    if "chat_template_kwargs" not in body:
+        return None
+    kwargs = body["chat_template_kwargs"]
+    if not isinstance(kwargs, dict):
+        raise _Invalid("chat_template_kwargs must be an object")
+    for key in kwargs:
+        if key not in _TEMPLATE_KWARGS_KEYS:
+            raise _Invalid(f"unsupported parameter: 'chat_template_kwargs.{key}'")
+    if "enable_thinking" in kwargs and not _is_bool(kwargs["enable_thinking"]):
+        raise _Invalid("chat_template_kwargs.enable_thinking must be a boolean")
+    return dict(kwargs)
 
 
 def _normalize_content(value: Any, ctx: str, *, allow_null: bool) -> str | None:
@@ -351,7 +411,7 @@ def _check_parallel_tool_calls(body: dict) -> bool:
     return parallel
 
 
-_ASSISTANT_KEYS = frozenset({"role", "content", "tool_calls"})
+_ASSISTANT_KEYS = frozenset({"role", "content", "tool_calls", "reasoning_content"})
 _TOOL_KEYS = frozenset({"role", "content", "tool_call_id", "name"})
 _TEXT_KEYS = frozenset({"role", "content"})
 
@@ -438,7 +498,13 @@ def _check_messages(body: dict) -> list[dict]:
                     f"messages[{i}].content may be null "
                     "only when tool_calls are present"
                 )
+            if "reasoning_content" in message:
+                history = message["reasoning_content"]
+                if history is not None and not isinstance(history, str):
+                    raise _Invalid(f"messages[{i}].reasoning_content must be a string")
             entry: dict[str, Any] = {"role": role, "content": content}
+            if message.get("reasoning_content") is not None:
+                entry["reasoning_content"] = message["reasoning_content"]
             if calls is not None:
                 entry["tool_calls"] = calls
             checked.append(entry)
@@ -719,6 +785,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
 
     gate = _Gate(max_pending)
     app = FastAPI(title="quantlab-server")
+    app.add_middleware(_LocalRequestsOnly)
     app.state.gate = gate  # introspection/testing; not part of the API
 
     async def _read_body(request: Request) -> bytes:
@@ -808,10 +875,11 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
         try:
             body = _parse(raw)
             _reject_unknown(body, allowed)
-            _check_sampling(body)
+            sampling = _check_sampling(body)
             model = _check_model(body, engine.model_name)
             max_tokens = _check_max_tokens(body, allow_alias=(kind == "chat"))
             stream, include_usage = _check_stream(body)
+            template_kwargs = _check_template_kwargs(body) if kind == "chat" else None
             if kind == "chat":
                 messages = _check_messages(body)
                 prompt = None
@@ -881,13 +949,17 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                             tools=tools if tools is not None else [],
                             tool_choice=tool_choice,
                             parallel_tool_calls=parallel,
+                            sampling=sampling,
+                            template_kwargs=template_kwargs,
                         )
                     else:
                         prepared = engine.prepare(
-                            messages=messages, max_tokens=max_tokens
+                            messages=messages, max_tokens=max_tokens,
+                            sampling=sampling, template_kwargs=template_kwargs,
                         )
                 else:
-                    prepared = engine.prepare(prompt=prompt, max_tokens=max_tokens)
+                    prepared = engine.prepare(prompt=prompt, max_tokens=max_tokens,
+                                              sampling=sampling)
             except ToolCallError as exc:
                 return _error(
                     502,
@@ -906,10 +978,12 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                     )
                     else "invalid_request_error"
                 )
-                return _error(400, message, "invalid_request_error", code)
+                public_message = ('Prompt plus output exceeds configured context' if code == 'context_length_exceeded'
+                                  else 'Prompt, template, or generation options rejected by engine')
+                return _error(400, public_message, "invalid_request_error", code)
             except Exception as exc:
                 return _error(
-                    500, f"engine error: {exc}", "internal_error", "internal_error"
+                    500, "engine error; consult private server logs", "internal_error", "internal_error"
                 )
             try:
                 gen = engine.generate(prepared)
@@ -922,7 +996,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                 )
             except Exception as exc:
                 return _error(
-                    500, f"engine error: {exc}", "internal_error", "internal_error"
+                    500, "engine error; consult private server logs", "internal_error", "internal_error"
                 )
             if not hasattr(gen, "__anext__") or not hasattr(gen, "aclose"):
                 return _error(
@@ -951,6 +1025,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
             # Non-streaming: race every pull against disconnect/deadline, not
             # just between tokens, and close the generator on every exit.
             texts: list[str] = []
+            reasoning_parts: list[str] = []
             tool_calls: list[dict] = []
             finish_reason = "stop"
             usage: dict | None = None
@@ -974,6 +1049,8 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                     if reason == "exhausted":
                         raise RuntimeError("engine ended without a final event")
                     texts.append(item.get("text", "") or "")
+                    if kind == "chat":
+                        reasoning_parts.append(item.get("reasoning", "") or "")
                     emitted = item.get("tool_calls")
                     if isinstance(emitted, list) and emitted:
                         tool_calls.extend(emitted)
@@ -992,7 +1069,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                 )
             except Exception as exc:
                 return _error(
-                    500, f"engine error: {exc}", "internal_error", "internal_error"
+                    500, "engine error; consult private server logs", "internal_error", "internal_error"
                 )
             finally:
                 locked = False
@@ -1001,6 +1078,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                 finally:
                     gate.lock.release()
             text = "".join(texts)
+            reasoning_text = "".join(reasoning_parts)
             if kind == "chat":
                 if tool_calls:
                     chat_message: dict[str, Any] = {
@@ -1010,6 +1088,8 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                     }
                 else:
                     chat_message = {"role": "assistant", "content": text}
+                if reasoning_text:
+                    chat_message["reasoning_content"] = reasoning_text
                 return JSONResponse(
                     {
                         "id": completion_id,
@@ -1129,6 +1209,9 @@ async def _stream_body(
                 if reason == "exhausted":
                     raise RuntimeError("engine ended without a final event")
                 text = item.get("text", "") or ""
+                thinking = item.get("reasoning", "") or "" if kind == "chat" else ""
+                if thinking:
+                    yield chat_chunk({"reasoning_content": thinking})
                 if text:
                     yield chat_chunk({"content": text}) if kind == "chat" else text_chunk(
                         text
@@ -1184,7 +1267,7 @@ async def _stream_body(
         except Exception as exc:
             try:
                 yield _sse_error(
-                    500, f"engine error: {exc}", "internal_error", "internal_error"
+                    500, "engine error; consult private server logs", "internal_error", "internal_error"
                 )
             except (GeneratorExit, asyncio.CancelledError):
                 raise

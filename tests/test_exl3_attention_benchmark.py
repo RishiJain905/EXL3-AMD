@@ -172,7 +172,7 @@ class OccupiedCodingModeTests(unittest.TestCase):
 
     def test_launcher_rejects_canonical_before_config(self):
         argv = ['launch_runtime.py', 'generate', '--context-speed-task', 'canonical',
-                '--prompt', 'hi', '--config', 'definitely-missing.toml', '--execute']
+                '--prompt', 'hi', '--config', 'definitely-missing.toml']
         saved, sys.argv = sys.argv, argv
         try:
             stderr = io.StringIO()

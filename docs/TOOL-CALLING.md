@@ -11,7 +11,7 @@ Tool support is automatic for a recognized chat template; no extra launch flag i
 Select a local model directory; the installed backend is selected automatically:
 
 ```powershell
-python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --alias exl3 --port 8000 --request-timeout 900 --execute
+python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --alias exl3 --port 8000 --request-timeout 900
 ```
 
 Normal launches need no `--config`. First build and register a compatible backend using [BUILD.md](BUILD.md). Wait for `/health` before connecting a harness. The server has no overall lifetime timeout; `--request-timeout 900` applies to each request separately.
@@ -26,7 +26,8 @@ Configure a compatible client with these values:
 | Base URL | `http://127.0.0.1:8000/v1` |
 | Model | The server's `--alias`, here `exl3` |
 | API key if required by client | Any local placeholder; loopback server has no authentication |
-| Sampling | `temperature: 0`, `top_p: 1`, `n: 1` |
+| Sampling | Greedy default; `temperature`, `top_p`, `top_k`, `min_p`, penalties, `seed` overridable, `n: 1` |
+| Reasoning | `reasoning_content` split from `<think>` blocks; interleaved field `reasoning_content` |
 | Tool capability | Enable in the client if it requires a capability declaration |
 
 Clients speaking only Anthropic Messages, OpenAI Responses, legacy `functions`, or requiring strict constrained tool schemas need a protocol adapter or additional runtime support. Those APIs are not implemented here. Compatibility means the documented Chat Completions contract, not every harness protocol or every EXL3 model.
@@ -49,10 +50,11 @@ OpenCode's provider model entry must advertise `tool_call: true`. A minimal exam
       "models": {
         "exl3": {
           "name": "exl3",
-          "limit": {"context": 4096, "output": 1024},
+          "limit": {"context": 4096, "output": 2048},
           "tool_call": true,
-          "temperature": false,
-          "reasoning": false,
+          "temperature": true,
+          "reasoning": true,
+          "interleaved": {"field": "reasoning_content"},
           "attachment": false,
           "modalities": {"input": ["text"], "output": ["text"]}
         }
@@ -62,7 +64,7 @@ OpenCode's provider model entry must advertise `tool_call: true`. A minimal exam
 }
 ```
 
-Select `exl3-amd/exl3` in OpenCode. Keep the harness's normal permissions: enabling model tool support does not grant tools permission to run. OpenCode documents [provider/model selection](https://opencode.ai/docs/models/) and [tool permissions](https://opencode.ai/docs/permissions/).
+Select `exl3-amd/exl3` in OpenCode. Keep the harness's normal permissions: enabling model tool support does not grant tools permission to run. The output budget leaves room for reasoning: `max_tokens` counts reasoning plus visible tokens. OpenCode documents [provider/model selection](https://opencode.ai/docs/models/) and [tool permissions](https://opencode.ai/docs/permissions/).
 
 ## API contract
 
@@ -87,12 +89,12 @@ Send standard Chat Completions function definitions:
   }],
   "tool_choice": "auto",
   "parallel_tool_calls": false,
-  "max_tokens": 512,
+  "max_tokens": 1024,
   "temperature": 0
 }
 ```
 
-A call returns assistant `tool_calls` with unique IDs, function names and JSON **string** arguments, and `finish_reason: "tool_calls"`. Execute calls in the harness, then append the returned assistant message and one `role: "tool"` message per call, with the matching `tool_call_id` and text result. Resend that history for the next turn. Every pending call needs a result, including a text error result when execution fails. Multiple results may arrive in any order; the adapter associates them by ID and normalizes their order for the native template.
+A call returns assistant `tool_calls` with unique IDs, function names and JSON **string** arguments, and `finish_reason: "tool_calls"`. Thinking models also return `reasoning_content`; resend it with the assistant message on tool round trips. Execute calls in the harness, then append the returned assistant message and one `role: "tool"` message per call, with the matching `tool_call_id` and text result. Resend that history for the next turn. Every pending call needs a result, including a text error result when execution fails. Multiple results may arrive in any order; the adapter associates them by ID and normalizes their order for the native template.
 
 Supported choices are `auto` (default with definitions), `none`, `required`, and a named function object. `parallel_tool_calls: false` limits a response to one call; it does not control harness scheduling. Choice constraints are enforced after generation. Arguments receive basic type/required-property/enum validation; the harness remains responsible for its full schema, authorization, and execution. `strict: true`, legacy `functions`/`function_call`, built-in hosted tools and the Responses API are not supported.
 
@@ -113,7 +115,7 @@ $tool = @{type='function'; function=@{
   parameters=@{type='object'; properties=@{asset=@{type='string'}}; required=@('asset'); additionalProperties=$false}
 }}
 $messages = @(@{role='user'; content='Look up ALPHA7 and tell me its owner.'})
-$body = @{model=$model; messages=$messages; tools=@($tool); temperature=0; max_tokens=256
+$body = @{model=$model; messages=$messages; tools=@($tool); temperature=0; max_tokens=1024
   tool_choice=@{type='function'; function=@{name='lookup_asset'}}; parallel_tool_calls=$false}
 $first = Invoke-RestMethod $uri -Method Post -ContentType 'application/json' -Body ($body | ConvertTo-Json -Depth 20)
 $assistant = $first.choices[0].message
@@ -124,7 +126,7 @@ if ($call.function.name -ne 'lookup_asset' -or $arguments.asset -ne 'ALPHA7') { 
 $result = @{owner='Mira-927'} | ConvertTo-Json -Compress
 $messages += $assistant
 $messages += @{role='tool'; tool_call_id=$call.id; content=$result}
-$body = @{model=$model; messages=$messages; tools=@($tool); tool_choice='none'; temperature=0; max_tokens=192}
+$body = @{model=$model; messages=$messages; tools=@($tool); tool_choice='none'; temperature=0; max_tokens=512}
 $final = Invoke-RestMethod $uri -Method Post -ContentType 'application/json' -Body ($body | ConvertTo-Json -Depth 20)
 if ($final.choices[0].message.content -notmatch 'Mira-927') { throw 'Tool result was not recovered' }
 $final.choices[0].message.content

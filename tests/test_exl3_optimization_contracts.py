@@ -65,7 +65,7 @@ class LaunchExtensionRejectionTests(unittest.TestCase):
                     self._write_config(cfg)
                     out = tmp / "run-out"
                     self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                          "--output", str(out), "--execute", *extra], out, needle)
+                                          "--output", str(out), *extra], out, needle)
 
     def test_draft_step_graph_requires_metadata_and_full_head(self):
         cases = [
@@ -81,7 +81,7 @@ class LaunchExtensionRejectionTests(unittest.TestCase):
                     self._write_config(cfg)
                     out = tmp / "run-out"
                     self._assert_rejects(["launch", "speed", "--config", str(cfg),
-                                          "--output", str(out), "--execute", *extra], out, needle)
+                                          "--output", str(out), *extra], out, needle)
 
 
 class NativeAbiTests(unittest.TestCase):
@@ -107,6 +107,37 @@ class NativeAbiTests(unittest.TestCase):
             result = configure_native("new.so", smallm_kernel="wmma-register")
             self.assertEqual(result["optimization_abi"], 2)
             self.assertEqual(os.environ["EXL3_SMALLM_WMMA"], "2")
+
+    def test_prefill_rejects_missing_or_unknown_abi(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch('ctypes.CDLL', return_value=SimpleNamespace()):
+                with self.assertRaisesRegex(ValueError, 'prefill GEMM extension'):
+                    configure_native('old.so', prefill_gemm='wmma')
+            def version():
+                return 2
+            library = SimpleNamespace(quantlab_exl3_hgemm_abi=version)
+            with patch('ctypes.CDLL', return_value=library):
+                with self.assertRaisesRegex(ValueError, 'prefill GEMM ABI'):
+                    configure_native('unknown.so', prefill_gemm='wmma')
+            self.assertNotIn('EXL3_HGEMM_IMPL', os.environ)
+
+    def test_prefill_cli_setting_overrides_inherited_environment(self):
+        def version():
+            return 1
+        library = SimpleNamespace(quantlab_exl3_hgemm_abi=version)
+        with patch('ctypes.CDLL', return_value=library), \
+                patch.dict(os.environ, {'EXL3_HGEMM_IMPL': 'unexpected'}, clear=True):
+            result = configure_native('new.so', prefill_gemm='wmma')
+            self.assertEqual(result['prefill_gemm_abi'], 1)
+            self.assertEqual(os.environ['EXL3_HGEMM_IMPL'], 'wmma')
+            configure_native('new.so')
+            self.assertEqual(os.environ['EXL3_HGEMM_IMPL'], 'blas')
+
+    def test_invalid_prefill_setting_rejects_before_loading_library(self):
+        with patch('ctypes.CDLL') as library:
+            with self.assertRaisesRegex(ValueError, 'prefill GEMM setting'):
+                configure_native('unused', prefill_gemm='unknown')
+            library.assert_not_called()
 
 
 class ShortlistValidationTests(unittest.TestCase):

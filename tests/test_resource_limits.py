@@ -340,7 +340,7 @@ class WindowsAdapterTests(unittest.TestCase):
         monotonic = [1000.0] + [1000.0 + elapsed] * (iters + 2)
         stdout = io.StringIO()
         argv = ["launch", mode, "--config", str(cfg), "--output", str(out),
-                "--execute", *argv_extra]
+                *argv_extra]
         with patch.object(sys, "argv", argv), \
                 patch("subprocess.Popen", return_value=child), \
                 patch.dict(sys.modules, {"quantlab": quantlab_package,

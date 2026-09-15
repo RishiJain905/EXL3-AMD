@@ -36,10 +36,15 @@ Copy `configs/local.example.toml` to ignored `configs/local.toml` if it does not
 
 Use `native_smallm_max_rows = 9` with the current full build; never declare a larger envelope than the binary implements.
 
+The current ROCm build also includes prefill GEMM ABI 1 for the optional
+`--prefill-gemm wmma` path. Older registered binaries continue to support the
+default `blas` setting; selecting WMMA requires rebuilding and registering
+the resulting binary with its actual SHA-256.
+
 ```powershell
 python scripts/register_runtime.py configs/local.toml
 python run.py --help
-python run.py -m "MODEL_DIRECTORY" -c 4096 -n 32 -p "Say hello." --execute
+python run.py -m "MODEL_DIRECTORY" -c 4096 -n 32 -p "Say hello."
 ```
 
 Use `python3` on Linux. Registration writes ignored `.runtime/installation.toml`, selects no model and refuses overwrite. The launcher verifies the extension hash and permission gates before execution.
