@@ -249,7 +249,7 @@ def parser():
     p.add_argument('--warps', type=int, choices=(4,8,16))
     p.add_argument('--smallm-kernel', choices=('dot','wmma','wmma-register'), default='dot', help='Experimental packed projection kernel')
     p.add_argument('--prefill-gemm', choices=('blas','wmma'), default='blas',
-                   help='FP32-output prefill GEMM; WMMA requires the matching gfx1101 extension')
+                   help='FP32-output prefill GEMM; WMMA requires a matching extension (gfx1101 or experimental gfx1200/gfx1201)')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16), help='Experimental wide-projection split-K override')
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off',
                    help='Cache selected reconstructed draft projections on GPU (extra VRAM)')

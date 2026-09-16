@@ -247,7 +247,7 @@ def main():
         from quantlab.methods.exl3.optimizations import configure_native
         status['native_optimizations'] = configure_native(binary,
             smallm_kernel=args.smallm_kernel, head_warps=args.head_warps,
-            prefill_gemm=args.prefill_gemm)
+            prefill_gemm=args.prefill_gemm, native_smallm=args.native_smallm)
         sys.path.insert(0, str(args.source_dir))
         from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer, Generator, Job, ArgmaxSampler
         from quantlab.methods.exl3.compat import install, prepare_loaded_module
@@ -284,7 +284,8 @@ def main():
         if max_context is None or args.context > max_context:
             raise ValueError('Requested context exceeds or lacks model metadata limit')
         install(cfg, native_smallm=args.native_smallm, native_smallm_max_rows=args.native_smallm_max_rows,
-                native_attention=args.native_attention)
+                native_attention=args.native_attention,
+                native_smallm_codebooks=status['native_optimizations']['smallm_codebooks'])
         record('gemv_environment', values={k: os.environ.get(k) for k in (
             'EXL3_GEMV', 'EXL3_GEMV_SPLITK', 'EXL3_GEMV_SPLITK_WARPS',
             'EXL3_GEMV_LDS', 'EXL3_GEMV_GRAPH', 'EXL3_MGEMV',

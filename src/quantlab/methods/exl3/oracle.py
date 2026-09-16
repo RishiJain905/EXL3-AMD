@@ -1,4 +1,4 @@
-"""Independent CPU reader for native EXL3 cb=0, K=2/3/4 packed weights.
+"""Independent CPU reader for native EXL3 cb=0/2, K=2/3/4 packed weights.
 
 Format reference: https://github.com/CarouselAether/rocm_exl3 at
 550dcfed786ad7bffa08b7a6b2a216fc474cbbb5, quant/pack.cu,
@@ -21,17 +21,19 @@ import numpy as np
 DECODE_TILE_BATCH = 256
 
 
-def decode_trellis(trellis, K):
+def decode_trellis(trellis, K, *, codebook=0):
     """Return decoded float32 weights in (input, output) orientation.
 
     ``trellis`` must be an int16 ndarray of shape (input/16, output/16,
-    16*K). This API supports only cb=0 (neither mcg nor mul1).
-    Codebook addition rounds to FP16, exactly as the native decoder does.
+    16*K). Codebooks 0 (default) and 2 (mul1) are supported.
+    Codebook arithmetic rounds to FP16, exactly as the native decoder does.
     Intermediate arrays cover at most DECODE_TILE_BATCH tiles; only the
     returned float32 matrix scales with the full decoded weight size.
     """
     if isinstance(K, (bool, np.bool_)) or not isinstance(K, (int, np.integer)) or K not in (2, 3, 4):
         raise ValueError("K must be integer 2, 3 or 4")
+    if isinstance(codebook, (bool, np.bool_)) or not isinstance(codebook, (int, np.integer)) or codebook not in (0, 2):
+        raise ValueError("codebook must be integer 0 or 2")
     packed = np.asarray(trellis)
     if packed.dtype.kind != "i" or packed.dtype.itemsize != 2:
         raise ValueError("trellis must have int16 dtype")
@@ -56,10 +58,18 @@ def decode_trellis(trellis, K):
         words = batch.reshape(len(batch), -1, 2)[..., ::-1].reshape(batch.shape)
         bits = ((words[..., None] >> shifts) & 1).reshape(len(batch), -1)
         states = np.sum(bits[:, indices] << shifts, axis=-1, dtype=np.uint64)
-        mixed = ((states * 89226354 + 64248484) & 0x8FFF8FFF) ^ 0x3B603B60
-        low = (mixed & 65535).astype(np.uint16).view(np.float16).astype(np.float32)
-        high = (mixed >> 16).astype(np.uint16).view(np.float16).astype(np.float32)
-        values = (low + high).astype(np.float16).astype(np.float32)
+        if codebook == 0:
+            mixed = ((states * 89226354 + 64248484) & 0x8FFF8FFF) ^ 0x3B603B60
+            low = (mixed & 65535).astype(np.uint16).view(np.float16).astype(np.float32)
+            high = (mixed >> 16).astype(np.uint16).view(np.float16).astype(np.float32)
+            values = (low + high).astype(np.float16).astype(np.float32)
+        else:
+            product = (states * 0x83DCD12D) & 0xFFFFFFFF
+            byte_sum = sum((product >> shift) & 255 for shift in (0, 8, 16, 24))
+            # 0x6400 + sum represents the exact integer 1024 + sum in half.
+            # Evaluate the half FMA exactly before its one final half rounding.
+            inv, bias = np.array([0x1EEE, 0xC931], dtype=np.uint16).view(np.float16).astype(np.float64)
+            values = ((1024 + byte_sum).astype(np.float64) * inv + bias).astype(np.float16).astype(np.float32)
         output[tile_rows[:, None] * 16 + row, tile_cols[:, None] * 16 + col] = values
     return output
 
@@ -75,14 +85,14 @@ def _hadamard128_last(values):
     return result.reshape(values.shape)
 
 
-def reconstruct(trellis, K, suh, svh):
+def reconstruct(trellis, K, suh, svh, *, codebook=0):
     """Return diag(suh) H128 W_hat H128 diag(svh), shape (input, output).
 
     Both dimensions must be multiples of 128. Transforms and scaling use
     float32: this is a mathematical oracle, not an emulation of native
     FP16 butterfly rounding or the packed GEMM's accumulation order.
     """
-    weights = decode_trellis(trellis, K)
+    weights = decode_trellis(trellis, K, codebook=codebook)
     if any(size % 128 for size in weights.shape):
         raise ValueError("reconstruction dimensions must be multiples of 128")
     scales = []

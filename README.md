@@ -2,7 +2,7 @@
 
 A model-selectable EXL3 inference runtime for AMD GPUs, with a Python CLI and a local OpenAI-compatible HTTP server. Built on [Turboderp's ExLlamaV3](https://github.com/turboderp-org/exllamav3) and [CarouselAether's ROCm port](https://github.com/CarouselAether/rocm_exl3/tree/550dcfed786ad7bffa08b7a6b2a216fc474cbbb5).
 
-**Status: experimental source release.** PowerShell launches inference through WSL; Linux can launch the backend directly. The validated GPU path is RDNA3/gfx1101 with a Qwen-family EXL3 model. Other models are selectable when supported by the vendored backend, but are not all validated. Models, native binaries and a turnkey installer are not bundled.
+**Status: experimental source release.** PowerShell launches inference through WSL; Linux can launch the backend directly. The validated GPU path is RDNA3/gfx1101 with a Qwen-family EXL3 model. RDNA4/gfx1200/gfx1201 support is experimental and awaits hardware validation. Fused small-batch projections support the default and mul1 codebooks within the documented [compatibility envelope](docs/GPU-COMPATIBILITY.md). Other models are selectable when supported by the vendored backend, but are not all validated. Models, native binaries and a turnkey installer are not bundled.
 
 | Component | Language / packages |
 | --- | --- |
@@ -84,6 +84,7 @@ The server has no overall lifetime timeout. Explicit shutdown and resource/error
 [Storage, chunk tuning, and prefix-reuse measurements](docs/PREFILL-PERFORMANCE.md).
 [Native prefill GPU measurements](docs/GPU-PERFORMANCE.md).
 [Full CLI decode and prefill follow-up](docs/RUNTIME-PERFORMANCE.md).
+[Mul1 model, speed and occupied 120K validation](docs/MUL1-VALIDATION.md).
 
 ## Main flags
 

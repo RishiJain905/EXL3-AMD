@@ -1,5 +1,65 @@
 # Release validation
 
+## mul1 and RDNA4 update: 2026-09-16
+
+Implementation proceeded in two stages with bounded OMP assistance: mul1
+small-M support first, then the shared RDNA4 WMMA adapter. Native builds used
+the existing ROCm 7.2.4 environment and fresh output directories. CPU test
+results and cross-compilation are not RDNA4 hardware validation.
+
+- Linux: 452 tests, 442 passed and 10 Windows-only skips. Windows: all 67
+  launcher tests and four new validator contract tests passed. CLI help and
+  whitespace checks passed. The Linux suite includes model storage/codebook
+  audit checks, legacy-binary decode-fusion fallback regressions and bounded
+  conversion-error metrics against the original full-tensor formulas.
+- The mul1-stage gfx1101 build passed 408 packed projection/graph cases and
+  56 prefill GEMM checks. Coverage includes cb0/mul1, bits 2/3/4, rows 1–9,
+  FP16/FP32 output, all three small-M variants, split-K, non-default streams,
+  canaries, external capture and native MLP graph pointer patching. Packed
+  decode matched the independent CPU reader exactly; worst projection/MLP
+  relative L2 error was 0.000927 (gates 0.005/0.01).
+- Standalone WMMA probes compiled for gfx1101, gfx1200 and gfx1201. Extracted
+  RDNA4 code objects contain native FP16, BF16 and INT8 WMMA instructions.
+  On gfx1101, all scalar-reference primitive checks and 2,304 checks of the
+  actual RDNA4 input/accumulator adapters passed. Each conversion direction
+  is checked independently, including integers above FP32's exact range.
+- A fresh full extension compiled and linked all 110 source units for gfx1101,
+  gfx1200 and gfx1201. All three code objects were extracted and confirmed;
+  all 327 recorded native source/build fingerprints matched the final build.
+  The final multi-target binary passed the same 408 packed/graph and 56
+  prefill checks plus the primitive suite through the public guarded validator
+  on gfx1101. Both validator and monitor exited successfully.
+- The local dense Qwen-family 27B model matched the previously registered
+  binary's input hashes and all 160 output tokens across a 32-token warmup
+  and 128-token generation case. Settings: context 4096, Q8 K/V, MTP depth 4,
+  WMMA register-B small-M and WMMA prefill. This is a bounded cb0 model
+  regression, not a mul1 model test or throughput study. The accepted binary
+  was registered locally with the previous registration retained as a backup.
+
+- A complete BF16-source 27B mul1 model was converted to 9.402 decimal GB,
+  including MTP and metadata. All 409 mul1 markers were verified. Large-head
+  error reporting completed with bounded memory, and its packed head matched
+  the pre-fix weights byte for byte. All 14 comparison processes and their
+  monitors exited successfully; repeated speed-run output tokens matched.
+- With the same mul1 weights, fused versus older fallback decode measured
+  31.90 versus 12.37 tokens/s on SQL and 58.15 versus 17.72 on binary search,
+  with exact output-token agreement. Both models recovered all three values
+  from 119,808 occupied input tokens. Fixed 128-token coding decode at that
+  occupancy measured 25.51 / 31.56 tokens/s for baseline/candidate.
+- The candidate failed the first-occurrence coding task on duplicate inputs;
+  the baseline passed. Target-only and older-binary controls reproduce the
+  candidate's incorrect answer. Its head uses 3 bits versus the baseline's 4,
+  and calibration is only 4 x 512 tokens. This is not a quality-equivalent
+  replacement or a BF16-fidelity claim. See [MUL1-VALIDATION.md](MUL1-VALIDATION.md)
+  for the complete protocol, quality review, memory measurements and limits.
+
+The existing ROCm `SharedSignalPool` teardown warning remains reproducible
+with baseline and candidate tests. No RDNA4 device was available. RDNA4
+numerical inference, performance, sustained serving, clean installation and
+broader model/MoE validation remain outstanding.
+See [GPU-COMPATIBILITY.md](GPU-COMPATIBILITY.md) for the exact envelope,
+implementation references and tester commands.
+
 ## Full CLI follow-up: 2026-09-14–15
 
 The decode-first follow-up retained a small MTP host-readback reduction and

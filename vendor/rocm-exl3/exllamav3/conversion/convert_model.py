@@ -11,7 +11,7 @@ from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
 from ..util import Timer, human_time
 from ..util.tensor import save_tensor_image
-from ..util.measures import cosine_error, sqnr
+from ..util.measures import state_error
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy
@@ -337,12 +337,7 @@ def prepare_state(args, job_state, config, model, tokenizer):
 
 
 def get_state_error(x, ref):
-     x = x.view(-1, x.shape[-1]).float()
-     ref = ref.view(-1, ref.shape[-1]).float()
-     err = torch.linalg.norm(x - ref, 'fro') / torch.linalg.norm(ref, 'fro')
-     sq = sqnr(x, ref)
-     cos = cosine_error(x, ref)
-     return err.item(), cos, sq
+    return state_error(x, ref)
 
 
 def make_quant_args(args, idx, K, devices, device_ratios = None):

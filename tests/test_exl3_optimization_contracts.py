@@ -85,6 +85,21 @@ class LaunchExtensionRejectionTests(unittest.TestCase):
 
 
 class NativeAbiTests(unittest.TestCase):
+    def test_smallm_capability_uses_loaded_binary_and_preserves_legacy(self):
+        with patch('ctypes.CDLL', return_value=SimpleNamespace()):
+            self.assertEqual(configure_native('old.so', native_smallm=True)['smallm_codebooks'], [0])
+        for mask, expected in ((1, [0]), (5, [0, 2])):
+            def capability():
+                return mask
+            with patch('ctypes.CDLL', return_value=SimpleNamespace(quantlab_exl3_smallm_codebooks=capability)):
+                self.assertEqual(configure_native('new.so', native_smallm=True)['smallm_codebooks'], expected)
+        for mask in (0, 2, 4, 7, -1):
+            def capability():
+                return mask
+            with patch('ctypes.CDLL', return_value=SimpleNamespace(quantlab_exl3_smallm_codebooks=capability)):
+                with self.assertRaisesRegex(ValueError, 'codebook capability'):
+                    configure_native('unknown.so', native_smallm=True)
+
     def _abi_lib(self, abi):
         def version():
             return abi

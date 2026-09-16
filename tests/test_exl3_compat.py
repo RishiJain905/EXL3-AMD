@@ -192,6 +192,37 @@ class CompatTests(unittest.TestCase):
         layer.in_features, layer.out_features = width, 256
         return layer
 
+    def test_mul1_requires_verified_capability_and_survives_reinstall(self):
+        install(self.config, native_smallm=True, native_smallm_max_rows=9)
+        layer = self.supported_layer()
+        layer.mul1 = True
+        layer.forward(Tensor((1, 9, 128)), {})
+        self.assertEqual(len(layer.calls), 9)
+        install(self.config, native_smallm=True, native_smallm_max_rows=9,
+                native_smallm_codebooks=(0, 2))
+        for bits in (2, 3, 4):
+            for rows in range(2, 10):
+                layer = self.supported_layer(bits)
+                layer.mul1 = True
+                layer.forward(Tensor((1, rows, 128)), {})
+                self.assertEqual(len(layer.calls), 1)
+                self.assertNotIn('reconstruct', layer.calls[0][1])
+        for bits, mcg, width in ((5, False, 128), (2, True, 128), (2, False, 127)):
+            layer = self.supported_layer(bits, width)
+            layer.mul1, layer.mcg = True, mcg
+            layer.forward(Tensor((1, 3, width)), {})
+            self.assertEqual(len(layer.calls), 3)
+        install(self.config, native_smallm=True, native_smallm_max_rows=9)
+        layer = self.supported_layer()
+        layer.mul1 = True
+        layer.forward(Tensor((1, 3, 128)), {})
+        self.assertEqual(len(layer.calls), 3)
+
+    def test_invalid_codebook_capabilities_rejected(self):
+        for codebooks in ((), (2,), (0, 1, 2), (False,), (0, 2.0)):
+            with self.assertRaises(ValueError):
+                install(self.config, native_smallm=True, native_smallm_codebooks=codebooks)
+
     def test_native_smallm_max_rows_validated_and_exported(self):
         for bad in (2, 4, 6, 7, 8, 10, 0, "5", None):
             with self.assertRaises(ValueError, msg=repr(bad)):

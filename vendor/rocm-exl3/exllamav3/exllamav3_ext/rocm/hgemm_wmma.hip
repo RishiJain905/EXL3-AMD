@@ -389,12 +389,15 @@ bool hgemm_wmma_try(at::Tensor a, at::Tensor b, at::Tensor c, cudaStream_t strea
     if (!storage_covers(b, K64 * N64, 2)) return false;
     if (!storage_covers(c, (M64 - 1) * ldc64 + N64, 4)) return false;
 
-    // Arch gate: gfx1101 only (prefix match admits feature-suffixed names).
+    // Explicit WMMA targets; gfx12 uses the shared fragment adapter. This is
+    // an opt-in path. Hardware validation is recorded separately per target.
     // The gcnArchName field exists only on ROCm; elsewhere unsupported.
 #if defined(USE_ROCM)
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, a.get_device()) != cudaSuccess) return false;
-    if (std::strncmp(prop.gcnArchName, "gfx1101", 7) != 0) return false;
+    if (std::strncmp(prop.gcnArchName, "gfx1101", 7) != 0 &&
+        std::strncmp(prop.gcnArchName, "gfx1200", 7) != 0 &&
+        std::strncmp(prop.gcnArchName, "gfx1201", 7) != 0) return false;
     if (prop.gcnArchName[7] != '\0' && prop.gcnArchName[7] != ':') return false;
 #else
     return false;

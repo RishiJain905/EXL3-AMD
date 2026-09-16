@@ -9,7 +9,7 @@
 // dq_dispatch, WmmaFragA/B/C and rdna_wmma helpers already included
 // transitively. No includes needed.
 
-template <int M, int BITS, bool FP32, int WARPS, bool GRAPH = false, bool REGISTER_B = false>
+template <int M, int BITS, int CB, bool FP32, int WARPS, bool GRAPH = false, bool REGISTER_B = false>
 static __global__ __launch_bounds__(WARPS * 32)
 __attribute__((amdgpu_flat_work_group_size(WARPS * 32, WARPS * 32)))
 void exl3_smallm_wmma(const half* __restrict__ A, const uint16_t* __restrict__ B,
@@ -42,7 +42,7 @@ void exl3_smallm_wmma(const half* __restrict__ A, const uint16_t* __restrict__ B
         const uint32_t* packed = (const uint32_t*)
             (B + (tile_k * n_tiles + tile_n) * (16 * BITS));
         FragB frag0, frag1;
-        dq_dispatch<BITS, 0>(packed, lane << 3, frag0, frag1);
+        dq_dispatch<BITS, CB>(packed, lane << 3, frag0, frag1);
 
         if constexpr (REGISTER_B)
         {

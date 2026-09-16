@@ -20,19 +20,19 @@ void exl3_smallm_graph_in(const half* A, const uint16_t* B, void* C,
                                   suh + offset, 0.088388347648f);
 }
 
-template <int M, int BITS, bool FP32>
+template <int M, int BITS, int CB, bool FP32>
 static void exl3_smallm_graph_typed(const Exl3GemvGraphParams* pb,
     int k, int n, cudaStream_t stream)
 {
     int warps = exl3_smallm_warps(k, n);
     #define SMALLM_GRAPH_DOT(W) do { \
         if (exl3_smallm_use_register_b()) \
-            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, FP32, W, true, true>), \
+            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W, true, true>), \
                 dim3(n / 16), dim3(W * 32), 0, stream, nullptr, nullptr, nullptr, k, n, pb); \
         else if (exl3_smallm_use_wmma()) \
-            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, FP32, W, true>), \
+            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W, true>), \
                 dim3(n / 16), dim3(W * 32), 0, stream, nullptr, nullptr, nullptr, k, n, pb); \
-        else hipLaunchKernelGGL((exl3_smallm_dot<M, BITS, FP32, W, true>), \
+        else hipLaunchKernelGGL((exl3_smallm_dot<M, BITS, CB, FP32, W, true>), \
             dim3(n / 16), dim3(W * 32), 0, stream, nullptr, nullptr, nullptr, k, n, pb); \
     } while (0)
     switch (warps)
@@ -55,7 +55,7 @@ static bool exl3_smallm_graph_try(const half* a, const uint16_t* b, void* c,
     const char* smallm = std::getenv("EXL3_SMALLM");
     const char* enabled = std::getenv("EXL3_SMALLM_GRAPH");
     if (!smallm || atoi(smallm) != 1 || !enabled || atoi(enabled) != 1 ||
-        (m < 2 || m > 9) || bits < 2 || bits > 4 || cb != 0 ||
+        (m < 2 || m > 9) || bits < 2 || bits > 4 || (cb != 0 && cb != 2) ||
         k % 128 || n % 128 || !suh || !ah || !svh || !graph ||
         exl3_gemv_env_mode() != 2 || !exl3_gemv_graph_enabled()) return false;
     // The ordinary eager pass prewarms this storage. Never allocate in capture.
@@ -71,26 +71,32 @@ static bool exl3_smallm_graph_try(const half* a, const uint16_t* b, void* c,
     graph->record_param(kernel, GP_gemm_A_had, 4);
     graph->record_param(kernel, GP_gemm_B_svh, 5);
     graph->record_param(kernel, GP_end, 0);
-    #define SMALLM_GRAPH_TYPED(M, K) \
-        if (fp32) exl3_smallm_graph_typed<M, K, true>(pb,k,n,stream); \
-        else exl3_smallm_graph_typed<M, K, false>(pb,k,n,stream)
-    #define SMALLM_GRAPH_BITS(M) \
+    #define SMALLM_GRAPH_TYPED(M, K, C) \
+        if (fp32) exl3_smallm_graph_typed<M, K, C, true>(pb,k,n,stream); \
+        else exl3_smallm_graph_typed<M, K, C, false>(pb,k,n,stream)
+    #define SMALLM_GRAPH_BITS(M, C) \
         switch (bits) { \
-            case 2: SMALLM_GRAPH_TYPED(M, 2); break; \
-            case 3: SMALLM_GRAPH_TYPED(M, 3); break; \
-            case 4: SMALLM_GRAPH_TYPED(M, 4); break; \
+            case 2: SMALLM_GRAPH_TYPED(M, 2, C); break; \
+            case 3: SMALLM_GRAPH_TYPED(M, 3, C); break; \
+            case 4: SMALLM_GRAPH_TYPED(M, 4, C); break; \
+        }
+    #define SMALLM_GRAPH_CB(M) \
+        switch (cb) { \
+            case 0: SMALLM_GRAPH_BITS(M, 0); break; \
+            case 2: SMALLM_GRAPH_BITS(M, 2); break; \
         }
     switch (m)
     {
-        case 2: SMALLM_GRAPH_BITS(2); break;
-        case 3: SMALLM_GRAPH_BITS(3); break;
-        case 4: SMALLM_GRAPH_BITS(4); break;
-        case 5: SMALLM_GRAPH_BITS(5); break;
-        case 6: SMALLM_GRAPH_BITS(6); break;
-        case 7: SMALLM_GRAPH_BITS(7); break;
-        case 8: SMALLM_GRAPH_BITS(8); break;
-        case 9: SMALLM_GRAPH_BITS(9); break;
+        case 2: SMALLM_GRAPH_CB(2); break;
+        case 3: SMALLM_GRAPH_CB(3); break;
+        case 4: SMALLM_GRAPH_CB(4); break;
+        case 5: SMALLM_GRAPH_CB(5); break;
+        case 6: SMALLM_GRAPH_CB(6); break;
+        case 7: SMALLM_GRAPH_CB(7); break;
+        case 8: SMALLM_GRAPH_CB(8); break;
+        case 9: SMALLM_GRAPH_CB(9); break;
     }
+    #undef SMALLM_GRAPH_CB
     #undef SMALLM_GRAPH_BITS
     #undef SMALLM_GRAPH_TYPED
     return true;

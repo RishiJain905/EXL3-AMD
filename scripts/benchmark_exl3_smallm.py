@@ -301,7 +301,7 @@ def main():
         spec.loader.exec_module(ext)
         from quantlab.methods.exl3.optimizations import configure_native
         status['native_optimizations'] = configure_native(binary,
-            smallm_kernel=args.smallm_kernel, head_warps=args.head_warps)
+            smallm_kernel=args.smallm_kernel, head_warps=args.head_warps, native_smallm=True)
         sys.path.insert(0, str(args.source_dir))
         from exllamav3.modules.quant.exl3 import LinearEXL3
 
@@ -341,8 +341,11 @@ def main():
             if actual_sha != expected_sha:
                 raise RuntimeError(f"packed input hash changed in {layer_dir}")
             packed = load_file(str(artifact), device="cpu")
-            if "mcg" in packed or "mul1" in packed:
-                raise ValueError("small-M candidate supports only default codebook 0")
+            if "mcg" in packed:
+                raise ValueError("small-M candidate does not support the mcg codebook")
+            codebook = 2 if "mul1" in packed else 0
+            if codebook not in status['native_optimizations']['smallm_codebooks']:
+                raise ValueError("Verified binary does not support this small-M codebook")
             for required in ("trellis", "suh", "svh"):
                 if required not in packed:
                     raise ValueError(f"packed layer missing {required} in {layer_dir}")
@@ -353,7 +356,7 @@ def main():
             linear = LinearEXL3(None, in_features, out_features, **gpu,
                                out_dtype=torch.float32 if args.fp32_output else torch.float16)
             layer_record = {"index": layer_index, "input": str(layer_dir),
-                            "artifact_sha256": actual_sha, "key": key, "bits": bits,
+                            "artifact_sha256": actual_sha, "key": key, "bits": bits, "codebook": codebook,
                             "in_features": in_features, "out_features": out_features,
                             "file_bytes": artifact.stat().st_size,
                             "tensor_bytes": sum(v.numel() * v.element_size() for v in packed.values())}

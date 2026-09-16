@@ -35,6 +35,50 @@ def cosine_error(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8):
     return 1.0 - cos_sim.mean().item()
 
 
+_DEFAULT_STATE_ERROR_CHUNK_ELEMENTS = 4_000_000
+
+
+def state_error(x: torch.Tensor, ref: torch.Tensor, max_elements: int = _DEFAULT_STATE_ERROR_CHUNK_ELEMENTS, eps: float = 1e-8):
+    """
+    Bounded-memory equivalent of the converter's get_state_error.
+
+    Flattens leading dims to (-1, last), then accumulates whole rows in chunks of at most
+    max_elements (at least one full row). Only the current chunk is cast to float32, so peak
+    float copies, differences, and normalization temporaries scale with the chunk, not the
+    full tensor. Returns (relative Frobenius norm, cosine error, SQNR dB) as Python floats
+    in the legacy order. NaN/Inf semantics match the full-tensor formula; chunked reduction
+    order can change final rounding. Inputs must have matching flattened shapes.
+    """
+    if type(max_elements) is not int or max_elements <= 0:
+        raise ValueError("max_elements must be a positive integer")
+    # Match the converter's view semantics without an implicit full-tensor copy.
+    x_flat = x.view(-1, x.shape[-1])
+    ref_flat = ref.view(-1, ref.shape[-1])
+    if x_flat.shape != ref_flat.shape:
+        raise ValueError("state and reference must have matching flattened shapes")
+    n_rows, n_cols = x_flat.shape
+    if n_rows == 0:
+        return float("nan"), float("nan"), float("nan")
+    rows_per_chunk = max(1, max_elements // n_cols)
+    diff_sum = 0.0
+    ref_sum = 0.0
+    cos_sum = 0.0
+    sq_sum = 0.0
+    for start in range(0, n_rows, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_rows)
+        x_c = x_flat[start:stop].to(torch.float32)
+        r_c = ref_flat[start:stop].to(torch.float32)
+        diff = x_c - r_c
+        ref_row_sq = torch.sum(r_c ** 2, dim = 1)
+        diff_row_sq = torch.sum(diff ** 2, dim = 1)
+        ref_sum += ref_row_sq.sum().item()
+        diff_sum += diff_row_sq.sum().item()
+        sq_sum += (10.0 * torch.log10(ref_row_sq / (diff_row_sq + eps))).sum().item()
+        cos_sum += F.cosine_similarity(x_c, r_c, dim = 1, eps = eps).sum().item()
+    err = (torch.tensor(diff_sum, dtype = torch.float64).sqrt() / torch.tensor(ref_sum, dtype = torch.float64).sqrt()).item()
+    return float(err), float(1.0 - cos_sum / n_rows), float(sq_sum / n_rows)
+
+
 @triton.jit
 def _target_logprob_partial_kernel(
     logits,

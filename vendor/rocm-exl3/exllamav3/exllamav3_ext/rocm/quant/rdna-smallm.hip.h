@@ -24,7 +24,7 @@ void exl3_smallm_had(const void* input, void* output, const half* scales, int si
             (half*) output + row_offset, scales + offset, 0.088388347648f);
 }
 
-template <int M, int BITS, bool FP32, int WARPS, bool GRAPH = false>
+template <int M, int BITS, int CB, bool FP32, int WARPS, bool GRAPH = false>
 static __global__ __launch_bounds__(WARPS * 32)
 __attribute__((amdgpu_flat_work_group_size(WARPS * 32, WARPS * 32)))
 void exl3_smallm_dot(const half* __restrict__ A, const uint16_t* __restrict__ B,
@@ -49,7 +49,7 @@ void exl3_smallm_dot(const half* __restrict__ A, const uint16_t* __restrict__ B,
         const uint32_t* packed = (const uint32_t*)
             (B + (tile_k * n_tiles + tile_n) * (16 * BITS));
         FragB frag0, frag1;
-        dq_dispatch<BITS, 0>(packed, lane << 3, frag0, frag1);
+        dq_dispatch<BITS, CB>(packed, lane << 3, frag0, frag1);
         // Decode once, then use the same fragments for every input row.
         #pragma unroll
         for (int row = 0; row < M; ++row)
@@ -98,6 +98,9 @@ void exl3_smallm_dot(const half* __restrict__ A, const uint16_t* __restrict__ B,
 extern "C" __attribute__((visibility("default")))
 int quantlab_exl3_optimization_abi() { return 2; }
 
+extern "C" __attribute__((visibility("default")))
+int quantlab_exl3_smallm_codebooks() { return 5; }
+
 static bool exl3_smallm_use_wmma()
 {
     const char* value = std::getenv("EXL3_SMALLM_WMMA");
@@ -118,7 +121,7 @@ static int exl3_smallm_warps(int k, int n)
         ? exl3_gemv_splitk_warps(k / 16, n / 16, 1) : 1;
 }
 
-template <int M, int BITS, bool FP32>
+template <int M, int BITS, int CB, bool FP32>
 static void exl3_smallm_launch_typed(const half* a, const uint16_t* b, void* c,
     int k, int n, const half* suh, half* ah, const half* svh, cudaStream_t stream)
 {
@@ -127,12 +130,12 @@ static void exl3_smallm_launch_typed(const half* a, const uint16_t* b, void* c,
     int warps = exl3_smallm_warps(k, n);
     #define SMALLM_DOT(W) do { \
         if (exl3_smallm_use_register_b()) \
-            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, FP32, W, false, true>), \
+            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W, false, true>), \
                 dim3(n / 16), dim3(W * 32), 0, stream, ah, b, c, k, n, nullptr); \
         else if (exl3_smallm_use_wmma()) \
-            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, FP32, W>), \
+            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W>), \
                 dim3(n / 16), dim3(W * 32), 0, stream, ah, b, c, k, n, nullptr); \
-        else hipLaunchKernelGGL((exl3_smallm_dot<M, BITS, FP32, W>), \
+        else hipLaunchKernelGGL((exl3_smallm_dot<M, BITS, CB, FP32, W>), \
             dim3(n / 16), dim3(W * 32), 0, stream, ah, b, c, k, n, nullptr); \
     } while (0)
     switch (warps)
@@ -152,29 +155,35 @@ static bool exl3_smallm_try_launch(const half* a, const uint16_t* b, void* c,
     const half* suh, half* ah, const half* svh, cudaStream_t stream)
 {
     const char* flag = std::getenv("EXL3_SMALLM");
-    if (!flag || atoi(flag) != 1 || (m < 2 || m > 9) || cb != 0 ||
+    if (!flag || atoi(flag) != 1 || (m < 2 || m > 9) || (cb != 0 && cb != 2) ||
         bits < 2 || bits > 4 || k % 128 || n % 128 || !suh || !ah || !svh)
         return false;
-    #define SMALLM_TYPED(M, K) \
-        if (fp32) exl3_smallm_launch_typed<M, K, true>(a,b,c,k,n,suh,ah,svh,stream); \
-        else exl3_smallm_launch_typed<M, K, false>(a,b,c,k,n,suh,ah,svh,stream)
-    #define SMALLM_BITS(M) \
+    #define SMALLM_TYPED(M, K, C) \
+        if (fp32) exl3_smallm_launch_typed<M, K, C, true>(a,b,c,k,n,suh,ah,svh,stream); \
+        else exl3_smallm_launch_typed<M, K, C, false>(a,b,c,k,n,suh,ah,svh,stream)
+    #define SMALLM_BITS(M, C) \
         switch (bits) { \
-            case 2: SMALLM_TYPED(M, 2); break; \
-            case 3: SMALLM_TYPED(M, 3); break; \
-            case 4: SMALLM_TYPED(M, 4); break; \
+            case 2: SMALLM_TYPED(M, 2, C); break; \
+            case 3: SMALLM_TYPED(M, 3, C); break; \
+            case 4: SMALLM_TYPED(M, 4, C); break; \
+        }
+    #define SMALLM_CB(M) \
+        switch (cb) { \
+            case 0: SMALLM_BITS(M, 0); break; \
+            case 2: SMALLM_BITS(M, 2); break; \
         }
     switch (m)
     {
-        case 2: SMALLM_BITS(2); break;
-        case 3: SMALLM_BITS(3); break;
-        case 4: SMALLM_BITS(4); break;
-        case 5: SMALLM_BITS(5); break;
-        case 6: SMALLM_BITS(6); break;
-        case 7: SMALLM_BITS(7); break;
-        case 8: SMALLM_BITS(8); break;
-        case 9: SMALLM_BITS(9); break;
+        case 2: SMALLM_CB(2); break;
+        case 3: SMALLM_CB(3); break;
+        case 4: SMALLM_CB(4); break;
+        case 5: SMALLM_CB(5); break;
+        case 6: SMALLM_CB(6); break;
+        case 7: SMALLM_CB(7); break;
+        case 8: SMALLM_CB(8); break;
+        case 9: SMALLM_CB(9); break;
     }
+    #undef SMALLM_CB
     #undef SMALLM_BITS
     #undef SMALLM_TYPED
     return true;

@@ -11,16 +11,20 @@ from functools import wraps
 
 
 def smallm_supported(layer):
-    """Match the separately built native K2/3/4 default-codebook envelope."""
+    """Match the verified binary's K2/3/4 codebook and shape envelope."""
+    mul1 = getattr(layer, "mul1", None)
+    codebook = 2 if mul1 is True else 0
     return (getattr(layer, "K", None) in (2, 3, 4)
             and getattr(layer, "mcg", True) is False
-            and getattr(layer, "mul1", True) is False
+            and (mul1 is True or mul1 is False)
+            and codebook in getattr(layer, "_quantlab_smallm_codebooks", (0,))
             and getattr(layer, "in_features", 0) > 0
             and getattr(layer, "out_features", 0) > 0
             and layer.in_features % 128 == 0 and layer.out_features % 128 == 0)
 
 
-def install(config, *, native_smallm=False, native_smallm_max_rows=3, native_attention=False):
+def install(config, *, native_smallm=False, native_smallm_max_rows=3, native_attention=False,
+            native_smallm_codebooks=(0,)):
     """Use safe fallback, optionally with the separately built small-M binary.
 
     The caller must verify the experimental binary hash before enabling this.
@@ -28,6 +32,9 @@ def install(config, *, native_smallm=False, native_smallm_max_rows=3, native_att
     """
     if native_smallm_max_rows not in (3, 5, 9):
         raise ValueError('Native small-M maximum must be 3, 5 or 9, matching the verified binary')
+    codebooks = tuple(native_smallm_codebooks)
+    if codebooks not in ((0,), (0, 2)) or any(type(cb) is not int for cb in codebooks):
+        raise ValueError('Native small-M codebooks must be (0,) or (0, 2), matching the verified binary')
     if native_attention and (not native_smallm or native_smallm_max_rows < 5):
         raise ValueError('Native attention experiment requires the verified small-M graph build')
     if native_attention and os.environ.get("EXL3_BC_ATTN") != "1":
@@ -39,6 +46,9 @@ def install(config, *, native_smallm=False, native_smallm_max_rows=3, native_att
         raise RuntimeError("ExLlamaV3 attention was imported before EXL3_BC_ATTN=0")
 
     from exllamav3.modules.quant.exl3 import LinearEXL3
+    # Like the existing dispatch switches, capabilities are process-local and
+    # refreshed on every install, including after the wrapper already exists.
+    LinearEXL3._quantlab_smallm_codebooks = codebooks
 
     # Mode 2 accepts every eligible GEMV shape instead of declining to GEMM
     # based on profitability. This is re-read by the pinned native dispatcher.

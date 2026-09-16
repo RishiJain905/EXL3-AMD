@@ -17,6 +17,10 @@ Use a compatible ROCm PyTorch distribution, AMD-compatible Triton and [the inher
 
 Existing-environment evidence uses Python 3.12, PyTorch 2.13.0+rocm7.2, ROCm SDK 7.2.4, Triton 3.7.1, FLA 0.5.2 and Transformers 5.16.1. These are recorded versions, not a verified clean-install recipe. GPU validation is scoped to gfx1101.
 
+RDNA4 needs a Torch/ROCm/driver stack supporting the actual gfx1200/gfx1201
+device and an extension compiled for it. See [GPU compatibility](GPU-COMPATIBILITY.md)
+for the experimental RDNA4 port, mul1 support and reproducible acceptance checks.
+
 HTTP pins are in [requirements-server.txt](../requirements-server.txt); they are not a complete inference environment. See [SERVING.md](SERVING.md).
 
 ## Installation fields

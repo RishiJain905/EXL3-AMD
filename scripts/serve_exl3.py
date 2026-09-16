@@ -105,9 +105,10 @@ class Engine:
         self.extension = extension
         _say('stage=extension ok=1')
         from quantlab.methods.exl3.optimizations import configure_native
-        self.record('native_optimizations', **configure_native(binary,
+        native_options = configure_native(binary,
             smallm_kernel=args.smallm_kernel, head_warps=args.head_warps,
-            prefill_gemm=getattr(args, 'prefill_gemm', 'blas')))
+            prefill_gemm=getattr(args, 'prefill_gemm', 'blas'), native_smallm=args.native_smallm)
+        self.record('native_optimizations', **native_options)
         sys.path.insert(0, str(args.source_dir))
         from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer, Generator, Job, ArgmaxSampler
         from exllamav3.generator.sampler.presets import ComboSampler
@@ -145,7 +146,8 @@ class Engine:
         if max_context is None or args.context > max_context:
             raise ValueError('Requested context exceeds or lacks model metadata limit')
         install(cfg, native_smallm=args.native_smallm, native_smallm_max_rows=args.native_smallm_max_rows,
-                native_attention=args.native_attention)
+                native_attention=args.native_attention,
+                native_smallm_codebooks=native_options['smallm_codebooks'])
         _say('stage=load model=1')
         self.model = Model.from_config(cfg)
         self.draft = Model.from_config(cfg, component='mtp') if args.mtp else None
