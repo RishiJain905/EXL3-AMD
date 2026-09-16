@@ -1,7 +1,8 @@
 """Explicit, independently selectable inference experiments; defaults stay unchanged."""
 
 
-def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_gemm='blas'):
+def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_gemm='blas',
+                     native_smallm=False):
     """Reject optional kernels on older binaries instead of silently ignoring them."""
     import ctypes
     import os
@@ -31,6 +32,20 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
         hgemm_abi = version()
         if hgemm_abi != 1:
             raise ValueError('Unsupported prefill GEMM ABI')
+    codebooks = [0]
+    if native_smallm:
+        library = ctypes.CDLL(str(binary))
+        try:
+            capability = library.quantlab_exl3_smallm_codebooks
+        except AttributeError:
+            pass  # Older verified binaries implement only the default codebook.
+        else:
+            capability.argtypes = []
+            capability.restype = ctypes.c_int
+            mask = capability()
+            if mask not in (1, 5):
+                raise ValueError('Unsupported native small-M codebook capability')
+            codebooks = [cb for cb in (0, 2) if mask & (1 << cb)]
     os.environ['EXL3_HGEMM_IMPL'] = prefill_gemm
     os.environ['EXL3_SMALLM_WMMA'] = {'dot':'0', 'wmma':'1', 'wmma-register':'2'}[smallm_kernel]
     if head_warps is None:
@@ -38,7 +53,8 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
     else:
         os.environ['EXL3_SMALLM_HEAD_WARPS'] = str(head_warps)
     return dict(smallm_kernel=smallm_kernel, head_warps=head_warps, optimization_abi=abi,
-                prefill_gemm=prefill_gemm, prefill_gemm_abi=hgemm_abi)
+                prefill_gemm=prefill_gemm, prefill_gemm_abi=hgemm_abi,
+                smallm_codebooks=codebooks)
 
 
 def install_optimizations(model, draft, *, gpu_embedding=False, batch_greedy=False,

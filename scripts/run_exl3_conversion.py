@@ -66,6 +66,9 @@ def main():
     if args.noncoop_compat:
         os.environ["EXL3_BC_ATTN"] = "0"
         os.environ["EXL3_GEMV"] = "2"
+    # The external supervisor owns timeouts. Background traceback dumps have
+    # crashed in _Py_DumpTracebackThreads on WSL/Python 3.12; retain fatal traces.
+    faulthandler.enable()
     import torch
     import torch.utils.cpp_extension as cpp
 
@@ -74,7 +77,6 @@ def main():
 
     cpp.load = cpp.load_inline = no_build
     torch.set_num_threads(2)
-    faulthandler.dump_traceback_later(120, repeat=True)
     spec = importlib.util.spec_from_file_location("exllamav3_ext", binary)
     extension = importlib.util.module_from_spec(spec)
     sys.modules["exllamav3_ext"] = extension
@@ -181,7 +183,6 @@ def main():
             raise ValueError(error)
         convert_model.main(prepared, state)
     finally:
-        faulthandler.cancel_dump_traceback_later()
         Config.from_directory = staticmethod(original)
         Model.from_config = staticmethod(original_model)
         convert_model.make_quant_args = original_quant_args

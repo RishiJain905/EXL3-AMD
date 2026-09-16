@@ -30,7 +30,9 @@ def prepare_decode_fusions(module, mode, *, native_smallm_graph=False, native_sm
     """Preserve existing load-created handles before applying the safe fallback.
 
     Single sequence and synchronous Python dispatch only. This does not enable
-    cooperative multirow GEMM or change any model/extension bytes.
+    cooperative multirow GEMM or change any model/extension bytes. With
+    native_smallm_graph, each module keeps single-row fusion and only admits
+    multirow graph replay when all its packed projections pass smallm_supported.
     """
     from exllamav3.modules.gated_delta_net import GatedDeltaNet
     from exllamav3.modules.mlp import GatedMLP, MLP
@@ -52,9 +54,8 @@ def prepare_decode_fusions(module, mode, *, native_smallm_graph=False, native_sm
                 raise ValueError('Small-M MultiLinear graph dispatch is unsupported')
             packed = [desc.inner for desc in child
                       if isinstance(getattr(desc, 'inner', None), LinearEXL3)]
-            if not packed or not all(smallm_supported(inner) for inner in packed):
-                raise ValueError('Native graph contains unsupported packed projections')
-            rows = tuple(range(1, native_smallm_max_rows + 1))
+            if packed and all(smallm_supported(inner) for inner in packed):
+                rows = tuple(range(1, native_smallm_max_rows + 1))
         captures.append((child, saved, rows))
     prepare_loaded_module(module)
     records = []

@@ -6,6 +6,10 @@ Use a compatible Linux/WSL ROCm environment. Binaries depend on Python, Torch, R
 
 Choose a new build directory and substitute actual installation paths. Set `GPU_TARGET` to your GPU (gfx1101 is the validated RDNA3 path).
 
+RDNA4 targets are `gfx1200` and `gfx1201`, with experimental hardware status.
+See [GPU/codebook compatibility](GPU-COMPATIBILITY.md) for multi-target builds
+and model-free acceptance checks. Header or target changes require a fresh build.
+
 ```bash
 EXL3_REPO=/path/to/EXL3-AMD
 EXL3_PYTHON=/path/to/rocm-venv/bin/python
@@ -36,6 +40,11 @@ Copy `configs/local.example.toml` to ignored `configs/local.toml` if it does not
 
 Use `native_smallm_max_rows = 9` with the current full build; never declare a larger envelope than the binary implements.
 
+Current builds expose both cb0 and mul1 small-M capabilities. The runtime probes
+the verified extension for that capability; older binaries retain their
+cb0-only fused eligibility. Rebuilding and registering the new hash is required
+to enable fused mul1 on an existing installation.
+
 The current ROCm build also includes prefill GEMM ABI 1 for the optional
 `--prefill-gemm wmma` path. Older registered binaries continue to support the
 default `blas` setting; selecting WMMA requires rebuilding and registering
@@ -50,5 +59,12 @@ python run.py -m "MODEL_DIRECTORY" -c 4096 -n 32 -p "Say hello."
 Use `python3` on Linux. Registration writes ignored `.runtime/installation.toml`, selects no model and refuses overwrite. The launcher verifies the extension hash and permission gates before execution.
 
 Conversion utilities need original high-precision weights and explicit calibration inputs. Bundled upstream calibration/reference corpora are excluded. Pass `--cal_data` a Safetensors file containing `input_ids` of shape `(rows, columns)`, produced with the same tokenizer; use `--cal_rows` and `--cal_cols` within that file's dimensions. Check the vendored converter's `--help` for other options. Cloning supplies neither a model nor calibration data.
+
+Conversion error reporting processes complete token rows in bounded chunks,
+avoiding full-size FP32 copies of large vocabulary outputs. This changes only
+diagnostic reduction order, not calibration or quantized weights. The guarded
+conversion wrapper retains fatal Python traces; its external supervisor owns
+timeouts. Periodic background traceback dumps are disabled after a crash in
+CPython's thread-dump routine was observed on WSL/Python 3.12.
 
 An existing-environment smoke test does not establish a clean build or package installation on another machine. See [VALIDATION.md](VALIDATION.md).

@@ -8,7 +8,13 @@ import numpy as np
 from quantlab.methods.exl3.oracle import decode_trellis, reconstruct
 
 
-def scalar_codebook(state):
+def scalar_codebook(state, codebook=0):
+    if codebook == 2:
+        # Integer byte sum plus exact dyadic constants from the format. The
+        # product and addition are exact in Python double; round only at store.
+        product = (int(state) * 0x83DCD12D) & 0xFFFFFFFF
+        value = 1024 + sum(product.to_bytes(4, 'little'))
+        return struct.unpack('<e', struct.pack('<e', value * (887 / 131072) - 10.3828125))[0]
     mixed = ((int(state) * 89226354 + 64248484) & 0x8FFF8FFF) ^ 0x3B603B60
     a = struct.unpack("<e", struct.pack("<H", mixed & 65535))[0]
     b = struct.unpack("<e", struct.pack("<H", mixed >> 16))[0]
@@ -22,7 +28,7 @@ def fixture(symbols, bits):
     return np.frombuffer(data, dtype="<i2")
 
 
-def expected_tile(symbols, bits):
+def expected_tile(symbols, bits, codebook=0):
     # Settle the rolling state over one full circuit before collecting outputs.
     state = 0
     for symbol in symbols:
@@ -30,7 +36,7 @@ def expected_tile(symbols, bits):
     decoded = []
     for symbol in symbols:
         state = ((state << bits) | int(symbol)) & 65535
-        decoded.append(scalar_codebook(state))
+        decoded.append(scalar_codebook(state, codebook))
     result = np.empty((16, 16), dtype=np.float32)
     for row in range(16):
         for col in range(16):
@@ -41,6 +47,33 @@ def expected_tile(symbols, bits):
 
 
 class Exl3OracleTests(unittest.TestCase):
+    def test_mul1_circular_tiles_match_scalar_reference(self):
+        rng = np.random.default_rng(917)
+        for bits in (2, 3, 4):
+            symbols = rng.integers(0, 1 << bits, 256)
+            symbols[0], symbols[-1] = 0, (1 << bits) - 1
+            packed = fixture(symbols, bits).reshape(1, 1, 16 * bits)
+            actual = decode_trellis(packed, bits, codebook=2)
+            np.testing.assert_array_equal(actual, expected_tile(symbols, bits, 2))
+            self.assertFalse(np.array_equal(actual, decode_trellis(packed, bits)))
+        zeros = np.zeros((1, 1, 32), dtype=np.int16)
+        np.testing.assert_array_equal(decode_trellis(zeros, 2, codebook=2),
+                                      np.full((16, 16), scalar_codebook(0, 2), dtype=np.float32))
+
+    def test_mul1_reconstruction_matches_explicit_hadamard(self):
+        rng = np.random.default_rng(719)
+        packed = rng.integers(-32768, 32768, (8, 8, 48), dtype=np.int16)
+        h = np.array([[(-1) ** ((r & c).bit_count()) for c in range(128)] for r in range(128)]) / np.sqrt(128)
+        su = np.linspace(-1, 1, 128).astype(np.float32)
+        sv = np.linspace(1, -2, 128).astype(np.float32)
+        expected = (h @ decode_trellis(packed, 3, codebook=2) @ h) * su[:, None] * sv[None, :]
+        np.testing.assert_allclose(reconstruct(packed, 3, su, sv, codebook=2), expected, atol=2e-6, rtol=1e-5)
+
+    def test_invalid_codebooks(self):
+        for codebook in (True, False, 2.0, 1, 3, None, 'mul1'):
+            with self.assertRaises(ValueError):
+                decode_trellis(np.zeros((1, 1, 32), dtype=np.int16), 2, codebook=codebook)
+
     def test_chunk_boundary_with_independent_tiles(self):
         # 289 tiles cross the 256-tile batch boundary in the middle of a row,
         # and exercise a partial final batch. Every tile has its own stream.

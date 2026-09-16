@@ -1,8 +1,14 @@
 // =============================================================================
-// RDNA 3.5 primitives for EXL3 -- the ptx.cuh replacement
+// RDNA primitives for EXL3 -- the ptx.cuh replacement
 // =============================================================================
 //
-// Target: gfx1150/gfx1151 (RDNA 3.5), wave32.
+// Targets: RDNA3/3.5 and RDNA4, wave32. See docs/VALIDATION.md for the
+// hardware-tested scope; a listed build target is not a validation claim.
+// RDNA4 gfx1200/gfx1201 compatibility: external legacy fragments and all
+// load/store helpers unchanged; gfx12 mma paths narrow A/B lane-locally and
+// convert C in/out with wave32 shuffles, then call _gfx12 intrinsics.
+// gfx12 paths are compile-only, not hardware-proven. Layout authority is the
+// runnable AMD GPUOpen RDNA4 examples (see rdna_wmma namespace note).
 //
 // Upstream `exllamav3_ext/ptx.cuh` is 22 blocks of NVIDIA inline PTX. None of it
 // parses under hipcc -- the constraint letters `f` and `l` are not valid on
@@ -82,6 +88,16 @@ typedef int      int32x8_t __attribute__((ext_vector_type(8)));
 // distinct spelling but measured identical at 2 bytes / align 2, so the loaders
 // below can take the HIP type and reinterpret without a conversion.
 typedef __bf16   bf16x16_t __attribute__((ext_vector_type(16)));
+//
+// RDNA4 (gfx12) native operand widths. Each lane holds 8 K-contiguous
+// elements (lanes 0-15 the first eight, lanes 16-31 the second eight);
+// legacy external fragments hold all 16 duplicated. float8_t and int32x8_t
+// above are reused for the native f32/i32 C vectors (same width, different
+// lane layout). __bf16 vectors match this ROCm 7.2.4 toolchain; the obsolete
+// short-vector spelling is deliberately avoided.
+typedef _Float16 half8_t   __attribute__((ext_vector_type(8)));
+typedef __bf16   bf16x8_t  __attribute__((ext_vector_type(8)));
+typedef int      int32x2_t __attribute__((ext_vector_type(2)));
 
 struct WmmaFragA {
     half16_t data;
@@ -260,6 +276,176 @@ __device__ __forceinline__ void load_matrix_b(
         ((_Float16*)&frag.data)[k] = src[k * stride + col];
     }
 }
+// =============================================================================
+// RDNA4 (gfx1200/gfx1201) compatibility adapters -- compile-only, not hardware
+// proven. External legacy fragments and all load/store helpers above/below are
+// unchanged: smallm-register, hgemm, attention, cooperative GEMM and MoE
+// directly manipulate legacy fragments. Only the four mma_sync wrappers gain a
+// gfx12 path that narrows A/B lane-locally, converts C in/out with wave32
+// shuffles, and calls the _gfx12 builtin with the existing swapped (B, A, C)
+// order. gfx11 codegen is untouched (see #else branches).
+// Layout authority: the runnable AMD GPUOpen RDNA4 examples, not the matrix
+// calculator (which currently disagrees about FP16 input packing):
+//   https://gpuopen.com/learn/using_matrix_core_amd_rdna4/
+//   https://gpuopen.com/learn/wmma-guide-amd-rdna-4-gpus-part-1/ (8 contiguous
+//   K values/lane, swapped operands for the transposed accumulator; hipBLAS
+//   verified). Builtin shapes from clang AMDGPUBuiltinReference; independent
+//   small adapter, no substantial copied snippets.
+// Native gfx12 layout (with swapped order): A/B hold 8 K-contiguous elements,
+// lanes 0-15 the first eight, lanes 16-31 the second eight, row/col = lane%16;
+// native C holds row=lane%16, col=i+8*(lane/16). Legacy C holds
+// row=lane%16, col=2*i+(lane/16). Helpers are defined for both architectures
+// so a standalone validator can roundtrip C conversions on gfx1101 without
+// emitting gfx12 opcodes. All shuffles preserve exact bits (int32 shuffled as
+// int, halves as ushort bits widened to int, never through float).
+// CRITICAL: gather BOTH candidate source registers BEFORE selecting by the
+// destination lane group. An index varying by lane group before __shfl would
+// evaluate on the SOURCE lane, corrupting the conversion.
+// =============================================================================
+__device__ __forceinline__ half8_t rdna4_narrow_f16(half16_t v)
+{
+    int lane = threadIdx.x & 31;
+    int off = (lane >= 16) ? 8 : 0;
+    half8_t o;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        ((_Float16*)&o)[i] = ((_Float16*)&v)[off + i];
+    return o;
+}
+__device__ __forceinline__ bf16x8_t rdna4_narrow_bf16(bf16x16_t v)
+{
+    int lane = threadIdx.x & 31;
+    int off = (lane >= 16) ? 8 : 0;
+    bf16x8_t o;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        ((__bf16*)&o)[i] = ((__bf16*)&v)[off + i];
+    return o;
+}
+__device__ __forceinline__ int32x2_t rdna4_narrow_i8(int32x4_t v)
+{
+    int lane = threadIdx.x & 31;
+    int off = (lane >= 16) ? 2 : 0;
+    int32x2_t o;
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        ((int*)&o)[i] = ((int*)&v)[off + i];
+    return o;
+}
+// Legacy-interleaved WmmaFragC -> native-contiguous float8_t.
+__device__ __forceinline__ float8_t rdna4_c_to_native_f32(const WmmaFragC& ext)
+{
+    int lane = threadIdx.x & 31;
+    int row = lane & 15;
+    int dst_hi = (lane >= 16) ? 1 : 0;
+    float8_t o;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int src = row + 16 * (i & 1);
+        int j0 = i >> 1;
+        int j1 = (i >> 1) + 4;
+        float v0 = __shfl(ext[j0], src, 32);
+        float v1 = __shfl(ext[j1], src, 32);
+        ((float*)&o)[i] = dst_hi ? v1 : v0;
+    }
+    return o;
+}
+// Native-contiguous float8_t -> legacy-interleaved WmmaFragC.
+__device__ __forceinline__ WmmaFragC rdna4_c_from_native_f32(float8_t nat)
+{
+    int lane = threadIdx.x & 31;
+    int row = lane & 15;
+    int dst_hi = (lane >= 16) ? 1 : 0;
+    WmmaFragC o;
+    const float* n = (const float*)&nat;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int src = row + 16 * (i >> 2);
+        int j0 = 2 * (i & 3);
+        int j1 = 2 * (i & 3) + 1;
+        float v0 = __shfl(n[j0], src, 32);
+        float v1 = __shfl(n[j1], src, 32);
+        o[i] = dst_hi ? v1 : v0;
+    }
+    return o;
+}
+// Legacy-interleaved WmmaFragC_i32 -> native-contiguous int32x8_t.
+__device__ __forceinline__ int32x8_t rdna4_c_to_native_i32(const WmmaFragC_i32& ext)
+{
+    int lane = threadIdx.x & 31;
+    int row = lane & 15;
+    int dst_hi = (lane >= 16) ? 1 : 0;
+    int32x8_t o;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int src = row + 16 * (i & 1);
+        int j0 = i >> 1;
+        int j1 = (i >> 1) + 4;
+        int v0 = __shfl(ext[j0], src, 32);
+        int v1 = __shfl(ext[j1], src, 32);
+        ((int*)&o)[i] = dst_hi ? v1 : v0;
+    }
+    return o;
+}
+// Native-contiguous int32x8_t -> legacy-interleaved WmmaFragC_i32.
+__device__ __forceinline__ WmmaFragC_i32 rdna4_c_from_native_i32(int32x8_t nat)
+{
+    int lane = threadIdx.x & 31;
+    int row = lane & 15;
+    int dst_hi = (lane >= 16) ? 1 : 0;
+    WmmaFragC_i32 o;
+    const int* n = (const int*)&nat;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int src = row + 16 * (i >> 2);
+        int j0 = 2 * (i & 3);
+        int j1 = 2 * (i & 3) + 1;
+        int v0 = __shfl(n[j0], src, 32);
+        int v1 = __shfl(n[j1], src, 32);
+        o[i] = dst_hi ? v1 : v0;
+    }
+    return o;
+}
+// Legacy-interleaved 8 halves -> native-contiguous 8 halves (bit-exact).
+__device__ __forceinline__ half8_t rdna4_c_to_native_f16(half8_t ext8)
+{
+    int lane = threadIdx.x & 31;
+    int row = lane & 15;
+    int dst_hi = (lane >= 16) ? 1 : 0;
+    const unsigned short* e = (const unsigned short*)&ext8;
+    half8_t o;
+    unsigned short* p = (unsigned short*)&o;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int src = row + 16 * (i & 1);
+        int j0 = i >> 1;
+        int j1 = (i >> 1) + 4;
+        int v0 = __shfl((int)e[j0], src, 32);
+        int v1 = __shfl((int)e[j1], src, 32);
+        p[i] = (unsigned short)(dst_hi ? v1 : v0);
+    }
+    return o;
+}
+// Native-contiguous 8 halves -> legacy-interleaved 8 halves (bit-exact).
+__device__ __forceinline__ half8_t rdna4_c_from_native_f16(half8_t nat8)
+{
+    int lane = threadIdx.x & 31;
+    int row = lane & 15;
+    int dst_hi = (lane >= 16) ? 1 : 0;
+    const unsigned short* n = (const unsigned short*)&nat8;
+    half8_t o;
+    unsigned short* p = (unsigned short*)&o;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int src = row + 16 * (i >> 2);
+        int j0 = 2 * (i & 3);
+        int j1 = 2 * (i & 3) + 1;
+        int v0 = __shfl((int)n[j0], src, 32);
+        int v1 = __shfl((int)n[j1], src, 32);
+        p[i] = (unsigned short)(dst_hi ? v1 : v0);
+    }
+    return o;
+}
 
 // Matrix multiply-accumulate. Operand order is (B, A, C) -- see the note above.
 __device__ __forceinline__ void mma_sync(
@@ -267,7 +453,15 @@ __device__ __forceinline__ void mma_sync(
     const WmmaFragA& a,
     const WmmaFragB& b)
 {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    half8_t na = rdna4_narrow_f16(a.data);
+    half8_t nb = rdna4_narrow_f16(b.data);
+    float8_t nc = rdna4_c_to_native_f32(c);
+    nc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(nb, na, nc);
+    c = rdna4_c_from_native_f32(nc);
+#else
     c.data = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b.data, a.data, c.data);
+#endif
 }
 
 // Load and accumulate C (FP32) -- no bounds checking
@@ -475,7 +669,15 @@ __device__ __forceinline__ void mma_sync_bf16(
     const WmmaFragA_bf16& a,
     const WmmaFragB_bf16& b)
 {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    bf16x8_t na = rdna4_narrow_bf16(a.data);
+    bf16x8_t nb = rdna4_narrow_bf16(b.data);
+    float8_t nc = rdna4_c_to_native_f32(c);
+    nc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(nb, na, nc);
+    c = rdna4_c_from_native_f32(nc);
+#else
     c.data = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b.data, a.data, c.data);
+#endif
 }
 
 // =============================================================================
@@ -497,7 +699,22 @@ __device__ __forceinline__ void mma_sync_f16(
     const WmmaFragA& a,
     const WmmaFragB& b)
 {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    half8_t na = rdna4_narrow_f16(a.data);
+    half8_t nb = rdna4_narrow_f16(b.data);
+    half8_t ext8;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        ((unsigned short*)&ext8)[i] = ((const unsigned short*)&c.data)[i * 2 + (opsel ? 1 : 0)];
+    half8_t nc = rdna4_c_to_native_f16(ext8);
+    nc = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(nb, na, nc);
+    half8_t res = rdna4_c_from_native_f16(nc);
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        ((unsigned short*)&c.data)[i * 2 + (opsel ? 1 : 0)] = ((const unsigned short*)&res)[i];
+#else
     c.data = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(b.data, a.data, c.data, opsel);
+#endif
 }
 
 template <bool opsel = false>
@@ -597,10 +814,21 @@ __device__ __forceinline__ void mma_sync_i8(
     const WmmaFragA_i8& a,
     const WmmaFragB_i8& b)
 {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    int32x2_t na = rdna4_narrow_i8(a.data);
+    int32x2_t nb = rdna4_narrow_i8(b.data);
+    int32x8_t nc = rdna4_c_to_native_i32(c);
+    nc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+        signed_b, nb,
+        signed_a, na,
+        nc, clamp);
+    c = rdna4_c_from_native_i32(nc);
+#else
     c.data = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
         signed_b, b.data,     // first flag/vector pair is B
         signed_a, a.data,
         c.data, clamp);
+#endif
 }
 
 __device__ __forceinline__ void store_matrix_c_i32(
