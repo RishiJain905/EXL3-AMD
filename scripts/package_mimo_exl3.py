@@ -112,7 +112,8 @@ def within_or_equal(path, other):
     return path == other or other in path.parents
 
 
-def check_paths(source, text_dir, vision_dir, audit_path, mapping_path, output, report):
+def check_paths(source, text_dir, vision_dir, audit_path, mapping_path, output, report,
+                allocation_path=None):
     inputs = {"--source": source, "--text-dir": text_dir, "--vision-dir": vision_dir}
     for name, path in inputs.items():
         if not path.is_dir():
@@ -122,6 +123,8 @@ def check_paths(source, text_dir, vision_dir, audit_path, mapping_path, output, 
             raise PackagingError(f"{name} is not a file: {path}")
     if mapping_path is not None and not mapping_path.is_file():
         raise PackagingError(f"--mapping is not a file: {mapping_path}")
+    if allocation_path is not None and not allocation_path.is_file():
+        raise PackagingError(f"--allocation is not a file: {allocation_path}")
     for first, second in (("--source", "--text-dir"), ("--source", "--vision-dir"),
                           ("--text-dir", "--vision-dir")):
         first_path, second_path = inputs[first], inputs[second]
@@ -138,6 +141,8 @@ def check_paths(source, text_dir, vision_dir, audit_path, mapping_path, output, 
         raise PackagingError("--source-audit must be outside --output")
     if mapping_path is not None and within_or_equal(mapping_path, output):
         raise PackagingError("--mapping must be outside --output")
+    if allocation_path is not None and within_or_equal(allocation_path, output):
+        raise PackagingError("--allocation must be outside --output")
     if report.exists() or output.exists():
         which = "--report" if report.exists() else "--output"
         raise PackagingError(f"{which} already exists; refusing to overwrite")
@@ -235,7 +240,31 @@ def check_source_config(config):
         raise PackagingError("Source config has no vision_config object")
 
 
-def build_expected_text(source_audit, mapping):
+def apply_allocation(quantized, allocation):
+    if not isinstance(allocation, dict):
+        raise PackagingError("Allocation is not a JSON object")
+    expected = set(quantized)
+    got = set(allocation)
+    missing = sorted(expected - got)
+    extra = sorted(got - expected)
+    if missing:
+        raise PackagingError(f"Allocation is missing {len(missing)} projections: {missing[:8]}")
+    if extra:
+        raise PackagingError(f"Allocation has {len(extra)} unexpected projections: {extra[:8]}")
+    for base in sorted(allocation):
+        bits = allocation[base]
+        if type(bits) is not int:
+            raise PackagingError(f"Allocation bitrate for {base} is not an integer: {bits!r}")
+        if not 1 <= bits <= 8:
+            raise PackagingError(f"Allocation bitrate for {base} is outside 1..8: {bits}")
+    if allocation.get(HEAD_BASE) != HEAD_BITS:
+        raise PackagingError(
+            f"Allocation head rate must be K{HEAD_BITS}: {HEAD_BASE}={allocation.get(HEAD_BASE)!r}")
+    for base, bits in allocation.items():
+        quantized[base]["bits"] = bits
+
+
+def build_expected_text(source_audit, mapping, allocation=None):
     tensors = source_audit.get("tensors")
     if not isinstance(tensors, dict) or not tensors:
         raise PackagingError("Source audit has no tensors inventory")
@@ -292,6 +321,8 @@ def build_expected_text(source_audit, mapping):
             raise PackagingError("Fallback projection scan found no lm_head projection")
     if len(quantized) != EXPECTED_QUANTIZED:
         raise PackagingError(f"Expected {EXPECTED_QUANTIZED} quantized projections, found {len(quantized)}")
+    if allocation is not None:
+        apply_allocation(quantized, allocation)
     quantized_weight_keys = {"lm_head.weight" if base == HEAD_BASE else base + ".weight"
                              for base in quantized}
     passthrough = {}
@@ -554,16 +585,20 @@ def build_report(status, context):
     return report
 
 
-def run(source, text_dir, vision_dir, audit_path, mapping_path, output, report):
+def run(source, text_dir, vision_dir, audit_path, mapping_path, output, report,
+        allocation_path=None):
     base_context = {"inputs": {"source": str(source), "text_dir": str(text_dir),
                                "vision_dir": str(vision_dir), "source_audit": str(audit_path),
                                "mapping": str(mapping_path) if mapping_path else None,
+                               "allocation": str(allocation_path) if allocation_path else None,
                                "output": str(output), "report": str(report)},
-                    "mapping_used": mapping_path is not None, "error": None}
+                    "mapping_used": mapping_path is not None,
+                    "allocation_used": allocation_path is not None, "error": None}
     made_output = False
     try:
         stage = "check paths"
-        check_paths(source, text_dir, vision_dir, audit_path, mapping_path, output, report)
+        check_paths(source, text_dir, vision_dir, audit_path, mapping_path, output, report,
+                    allocation_path)
         stage = "load inputs"
         source_audit = read_json(audit_path)
         if not isinstance(source_audit, dict):
@@ -571,13 +606,20 @@ def run(source, text_dir, vision_dir, audit_path, mapping_path, output, report):
         mapping = read_json(mapping_path) if mapping_path else None
         if mapping is not None and not isinstance(mapping, dict):
             raise PackagingError("Mapping is not a JSON object")
+        allocation_map = None
+        allocation_sha256 = None
+        if allocation_path is not None:
+            allocation_map = read_json(allocation_path)
+            if not isinstance(allocation_map, dict):
+                raise PackagingError("Allocation is not a JSON object")
+            allocation_sha256 = file_sha256(allocation_path)
         source_config = read_json(source / "config.json")
         text_config = read_json(text_dir / "config.json")
         if not (source / "model.safetensors.index.json").is_file():
             raise PackagingError("Source weight index is missing")
         check_source_config(source_config)
         stage = "audit text candidate"
-        expected = build_expected_text(source_audit, mapping)
+        expected = build_expected_text(source_audit, mapping, allocation_map)
         text_audit = audit_text_candidate(text_dir, expected, source, source_audit)
         stage = "audit vision pilot"
         vision_audit = audit_vision_pilot(vision_dir, source_audit)
@@ -625,8 +667,20 @@ def run(source, text_dir, vision_dir, audit_path, mapping_path, output, report):
             total_params = None
         body_bpw = (text_audit["body_trellis_bytes"] * 8 / text_audit["body_params"]
                     if text_audit["body_params"] else None)
+        if allocation_path is not None:
+            rate_assumption = (
+                "Quantized rates follow the frozen --allocation map (per-projection K1..K8, "
+                "lm_head K6) with native mul1 marker 0x83DCD12D; packed geometry/rate checks "
+                "and accounting use the frozen map, never inferred candidate bytes."
+            )
+        else:
+            rate_assumption = "Body projections are K4 and lm_head is K6 with native mul1 marker 0x83DCD12D."
         context = dict(base_context)
         context.update({
+            "allocation": {
+                "file_sha256": allocation_sha256,
+                "expected_bits": allocation_map,
+            } if allocation_path is not None else None,
             "text": {
                 "shards": [{"file": shard["file"], "bytes": shard["file_bytes"],
                             "sha256": shard["sha256"], "tensors": len(shard["tensors"])}
@@ -679,7 +733,7 @@ def run(source, text_dir, vision_dir, audit_path, mapping_path, output, report):
             "metadata_skipped_from_text": text_skipped,
             "assumptions": [
                 "Text candidate stores one .trellis/.suh/.svh/.mul1 group per mapping qmap!=None linear.",
-                "Body projections are K4 and lm_head is K6 with native mul1 marker 0x83DCD12D.",
+                rate_assumption,
                 "Unquantized text tensors keep source names with F16 or BF16 dtype; only embedding must be BF16.",
                 "No MTP tensors exist; any mtp.* tensor fails packaging.",
                 "Vision weights are byte-preserved; no image runtime support is claimed.",
@@ -712,6 +766,8 @@ def parse_args(argv):
     parser.add_argument("--vision-dir", type=Path, required=True, help="Step1 vision preservation pilot")
     parser.add_argument("--source-audit", type=Path, required=True, help="Step1 source-audit.json")
     parser.add_argument("--mapping", type=Path, default=None, help="Optional step1 mapping.json")
+    parser.add_argument("--allocation", type=Path, default=None,
+                        help="Optional frozen projection bitrate map (JSON base->K1..K8, lm_head K6)")
     parser.add_argument("--output", type=Path, required=True, help="New final candidate directory")
     parser.add_argument("--report", type=Path, required=True, help="New external report file")
     return parser.parse_args(argv)
@@ -723,11 +779,13 @@ def main(argv=None):
         resolved = {name: getattr(args, name).resolve() for name in
                     ("source", "text_dir", "vision_dir", "source_audit", "output", "report")}
         mapping = args.mapping.resolve() if args.mapping else None
+        allocation_path = args.allocation.resolve() if args.allocation else None
     except OSError as error:
         print(f"Cannot resolve paths: {error}", file=sys.stderr)
         return 1
     return run(resolved["source"], resolved["text_dir"], resolved["vision_dir"],
-               resolved["source_audit"], mapping, resolved["output"], resolved["report"])
+               resolved["source_audit"], mapping, resolved["output"], resolved["report"],
+               allocation_path)
 
 
 if __name__ == "__main__":

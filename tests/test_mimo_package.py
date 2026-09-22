@@ -81,6 +81,33 @@ def dims_for(base):
     return IN, BODY_OUT, 4
 
 
+def uniform_allocation(bases, body_bits):
+    return {base: (6 if base == "lm_head" else body_bits) for base in bases}
+
+
+def mixed_allocation(bases):
+    body = [base for base in bases if base != "lm_head"]
+    alloc = {}
+    for index, base in enumerate(body):
+        alloc[base] = 4 if index < len(body) // 2 else 5
+    alloc["lm_head"] = 6
+    return alloc
+
+
+def rebuild_text_with_rates(fix, rate_map):
+    original = dims_for
+
+    def patched(base):
+        in_features, out_features, _ = original(base)
+        return in_features, out_features, rate_map[base]
+
+    globals()["dims_for"] = patched
+    try:
+        fix.write_text_candidate()
+    finally:
+        globals()["dims_for"] = original
+
+
 class Fixture:
     def __init__(self, root):
         self.root = Path(root)
@@ -240,12 +267,12 @@ class Fixture:
     def args(self, **overrides):
         params = {"source": str(self.source), "text_dir": str(self.text),
                   "vision_dir": str(self.vision), "source_audit": str(self.audit_path),
-                  "mapping": str(self.mapping_path), "output": str(self.output),
-                  "report": str(self.report)}
+                  "mapping": str(self.mapping_path), "allocation": None,
+                  "output": str(self.output), "report": str(self.report)}
         params.update(overrides)
         argv = []
         for name in ("source", "text_dir", "vision_dir", "source_audit", "mapping",
-                     "output", "report"):
+                     "allocation", "output", "report"):
             if params.get(name) is None:
                 continue
             argv += [f"--{name.replace('_', '-')}", params[name]]
@@ -269,6 +296,11 @@ class PackageMimoTests(unittest.TestCase):
                     hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
         hashes[str(self.fix.audit_path)] = hashlib.sha256(self.fix.audit_path.read_bytes()).hexdigest()
         return hashes
+
+    def write_allocation(self, name, payload):
+        path = Path(self.tmp.name) / name
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        return path
 
     def test_valid_package_end_to_end(self):
         before = self.input_hashes()
@@ -489,6 +521,103 @@ class PackageMimoTests(unittest.TestCase):
         self.assertTrue((self.fix.output / "model-00001-of-00002.safetensors").is_file())
         report = json.loads(self.fix.report.read_text())
         self.assertEqual(report["status"], "incomplete")
+
+    def test_allocation_valid_k5_body(self):
+        rate = uniform_allocation(self.fix.bases, 5)
+        alloc = self.write_allocation("alloc-k5.json", rate)
+        rebuild_text_with_rates(self.fix, rate)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 0)
+        report = json.loads(self.fix.report.read_text())
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(report["allocation_used"])
+        self.assertEqual(report["text"]["bit_map"]["lm_head"], 6)
+        self.assertTrue(all(v == 5 for k, v in report["text"]["bit_map"].items() if k != "lm_head"))
+        self.assertEqual(report["text"]["body_trellis_stored_bits_per_weight"], 5.0)
+        self.assertEqual(report["allocation"]["file_sha256"],
+                         hashlib.sha256(alloc.read_bytes()).hexdigest())
+        self.assertEqual(report["allocation"]["expected_bits"], rate)
+        self.assertNotIn("Body projections are K4", " ".join(report["assumptions"]))
+        self.assertIn("allocation", " ".join(report["assumptions"]).lower())
+
+    def test_allocation_valid_mixed_k4_k5(self):
+        rate = mixed_allocation(self.fix.bases)
+        alloc = self.write_allocation("alloc-mixed.json", rate)
+        rebuild_text_with_rates(self.fix, rate)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 0)
+        report = json.loads(self.fix.report.read_text())
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["text"]["bit_map"], rate)
+        self.assertEqual(report["text"]["body_trellis_stored_bits_per_weight"], 4.5)
+        self.assertEqual(report["allocation"]["expected_bits"], rate)
+
+    def test_allocation_missing_name_fails(self):
+        rate = uniform_allocation(self.fix.bases, 5)
+        rate.pop(self.fix.bases[0])
+        alloc = self.write_allocation("alloc-missing.json", rate)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        self.assertFalse(self.fix.output.exists())
+        self.assertIn("missing", json.loads(self.fix.report.read_text())["error"].lower())
+
+    def test_allocation_extra_name_fails(self):
+        rate = uniform_allocation(self.fix.bases, 4)
+        rate["surprise.proj"] = 4
+        alloc = self.write_allocation("alloc-extra.json", rate)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        self.assertFalse(self.fix.output.exists())
+        self.assertIn("unexpected", json.loads(self.fix.report.read_text())["error"].lower())
+
+    def test_allocation_invalid_bitrate_fails(self):
+        rate = uniform_allocation(self.fix.bases, 4)
+        rate[self.fix.bases[0]] = 9
+        alloc = self.write_allocation("alloc-invalid.json", rate)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        self.assertIn("outside 1..8", json.loads(self.fix.report.read_text())["error"])
+
+    def test_allocation_bool_bitrate_fails(self):
+        rate = uniform_allocation(self.fix.bases, 4)
+        rate[self.fix.bases[1]] = True
+        alloc = self.write_allocation("alloc-bool.json", rate)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        self.assertIn("not an integer", json.loads(self.fix.report.read_text())["error"])
+
+    def test_allocation_head_rate_fails(self):
+        rate = uniform_allocation(self.fix.bases, 4)
+        rate["lm_head"] = 4
+        alloc = self.write_allocation("alloc-head.json", rate)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        error = json.loads(self.fix.report.read_text())["error"]
+        self.assertIn("head", error.lower())
+        self.assertIn("K6", error)
+
+    def test_allocation_duplicate_key_fails(self):
+        rate = uniform_allocation(self.fix.bases, 4)
+        text = json.dumps(rate)
+        dup = self.fix.bases[0]
+        payload = text[:-1] + f', "{dup}": 5}}'
+        alloc = self.write_allocation("alloc-dup.json", payload)
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        self.assertIn("Duplicate", json.loads(self.fix.report.read_text())["error"])
+
+    def test_allocation_stored_rate_mismatch_fails(self):
+        rate = uniform_allocation(self.fix.bases, 5)
+        alloc = self.write_allocation("alloc-mismatch.json", rate)
+        # Candidate remains default K4; frozen K5 map must fail, never infer.
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        error = json.loads(self.fix.report.read_text())["error"]
+        self.assertTrue("geometry" in error.lower() or "stored rate" in error.lower())
+        self.assertFalse(self.fix.output.exists())
+
+    def test_allocation_missing_file_fails(self):
+        missing = str(Path(self.tmp.name) / "no-allocation.json")
+        self.assertEqual(self.fix.run(allocation=missing), 1)
+        self.assertIn("allocation", json.loads(self.fix.report.read_text())["error"].lower())
+
+    def test_allocation_inside_output_refused(self):
+        self.fix.output.mkdir()
+        alloc = self.fix.output / "alloc.json"
+        alloc.write_text(json.dumps(uniform_allocation(self.fix.bases, 4)))
+        self.assertEqual(self.fix.run(allocation=str(alloc)), 1)
+        self.assertIn("outside", json.loads(self.fix.report.read_text())["error"].lower())
 
     def test_help_needs_no_torch(self):
         self.assertNotIn("torch", sys.modules)

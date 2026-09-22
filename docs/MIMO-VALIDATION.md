@@ -77,3 +77,36 @@ Final selection testing belongs to step 3 and is intentionally untouched
 here. Do not generate or run it from this package. Its families differ, for
 example code synthesis with unit tests, graph search, multi-turn tool
 recovery, and long-context grounded tasks.
+# Step 3 extension
+
+`mimo_step3_evaluation.py` adds a prospective final-answer contract and separate
+correctness/format scoring. After optional native thinking, it accepts one
+terminal `<final>JSON_VALUE</final>` block; without markers it can recover strict
+whole-answer JSON, one terminal JSON fence, or a strict JSON last line. Extraction
+never uses the gold answer. Malformed/repeated markers and ambiguous fences fail.
+Only a valid terminal final block counts toward format compliance. An extracted
+wrong value is formatted correctly but incorrect; an exact bare JSON answer is
+correct but not compliant with the final-block format.
+
+The generator creates 32 authored final tasks from eight families distinct from
+the step-2 selection-validation templates. Different templates do not establish
+general statistical independence or absence from pretraining. Freeze the suite,
+scorer and exact tokenizer prefixes before evaluation; lock candidate selection
+before using final tasks. No model-generated code or tool call is executed.
+
+```text
+python scripts/mimo_step3_evaluation.py create-final --output <NEW_FINAL_SUITE>
+python scripts/mimo_step3_evaluation.py score --suite <SUITE> --results <RESULTS> --output <NEW_REPORT>
+```
+
+These CPU utilities do not launch inference. The recorded lab preregistration
+defines 2048-token, native-thinking quality controls and separately retains the
+previous thinking-off probability/timing probes. Token caps come from actual
+generation metadata, never inferred from malformed text.
+
+`package_mimo_exl3.py --allocation <FROZEN_JSON_MAP>` audits mixed-rate candidates
+against a complete expected map of all 201 projections. The original default
+remains K4 body / K6 head. An explicit map must cover every projection exactly,
+contain integer rates 1–8, and retain K6 for `lm_head`. The package report records
+the map/hash and measured weighted body rate. Packed bytes cannot choose their
+own expected rate. Source embedding/vision payload and no-overwrite checks remain.
