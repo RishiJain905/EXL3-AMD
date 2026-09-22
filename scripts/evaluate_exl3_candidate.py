@@ -411,6 +411,13 @@ def main():
             # and retain live recurrent state. Fresh generators prevent reuse
             # across requests; retain the verified 1-GiB in-request budget.
             sampler = ArgmaxSampler()
+            if fixed and validation is not None:
+                # llama.cpp ignore_eos suppresses EOG logits. Match it for the
+                # frozen fixed-length protocol. Install this inner hook first:
+                # probability/finite-check hooks below must see original logits.
+                def suppress_stop_logits(logits):
+                    logits[..., validation['stop_ids']] = -float('inf')
+                observe_sampler_input(sampler, suppress_stop_logits)
             probability = {}
             if target_id is not None:
                 if not 0 <= target_id < tokenizer.actual_vocab_size:
@@ -512,6 +519,7 @@ def main():
             decode_tokens = timing.decode_tokens(len(tokens))
             result = dict(name=name, warmup=warmup, input_tokens=ids.numel(), output_tokens=len(tokens),
                           output_limit=limit, fixed_length=fixed, eos_reason=eos_reason,
+                          fixed_eos_policy='suppress_stop_logits' if fixed and validation is not None else None,
                           input_sha256=hashlib.sha256(ids.numpy().tobytes()).hexdigest(),
                           output_token_ids=tokens, output_text=job.full_completion,
                           prefill_call_seconds=prefill_seconds, prefill_calls=prefill_calls,

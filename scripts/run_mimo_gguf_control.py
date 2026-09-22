@@ -99,6 +99,7 @@ def main():
         if fixed and len(tokens)!=limit:raise RuntimeError('Fixed output count mismatch')
         result=dict(name=name,warmup=warmup,input_tokens=len(ids),input_ids=ids,
                     output_tokens=len(tokens),output_token_ids=tokens,output_text=response.get('content',''),
+                    fixed_eos_policy='suppress_stop_logits' if fixed else None,
                     end_to_end_seconds=elapsed,timings=response.get('timings'),response_sha256=response_hash,
                     stop_type=response.get('stop_type'),truncated=response.get('truncated'))
         if target is not None:

@@ -93,6 +93,21 @@ class StreamedLogitBoundaryTests(unittest.TestCase):
             draft.sample_from_state(logits, {})
         self.assertIs(head.forward, original)
 
+    def test_raw_probability_observer_precedes_fixed_length_eos_suppression(self):
+        raw = torch.tensor([[[1.0, 10.0, 2.0, 9.0]]])
+        logits = raw.clone()
+        sampler = SimpleNamespace(forward=lambda value: value.argmax(-1))
+        def suppress(value):
+            value[..., [1, 3]] = -float('inf')
+        seen = []
+        observe_sampler_input(sampler, suppress)
+        observe_sampler_input(sampler, lambda value: seen.append(value.clone()))
+        self.assertEqual(sampler.forward(logits).item(), 2)
+        self.assertTrue(torch.equal(seen[0], raw))
+        self.assertEqual(seen[0].argmax(-1).item(), 1)
+        self.assertTrue(torch.isfinite(seen[0]).all())
+        self.assertTrue(torch.isneginf(logits[..., [1, 3]]).all())
+
     def test_nan_and_infinity_rejected(self):
         for value in (float("nan"), float("inf"), -float("inf")):
             logits = torch.zeros((1, 1, 4))
