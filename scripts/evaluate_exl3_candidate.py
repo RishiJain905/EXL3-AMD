@@ -69,6 +69,8 @@ def parser():
     p.add_argument('--mode', choices=('speed', 'quality', 'context', 'context-speed', 'profile', 'generate', 'logprobs'), required=True)
     p.add_argument('--teacher-forced-protocol', type=Path,
                    help='Frozen explicit input_ids/target_id probes; required for logprobs mode')
+    p.add_argument('--validation-protocol', type=Path,
+                   help='Enforce frozen suite, tokenizer, prompt tokens, stops and runtime controls')
     p.add_argument('--context-speed-task', choices=('docstring', 'canonical'), default='docstring',
                    help='Occupied-coding question: 192-token docstring protocol or exact suite first_index task with 128 tokens; canonical requires context-speed mode')
     p.add_argument('--decode-fusions', choices=('off', 'gdn', 'gdn-mlp', 'gdn-mlp-mgemv'), default='off')
@@ -118,6 +120,8 @@ def main():
         p.error('logprobs requires --teacher-forced-protocol and MTP off')
     if args.teacher_forced_protocol and args.mode != 'logprobs':
         p.error('--teacher-forced-protocol requires logprobs mode')
+    if args.validation_protocol and args.mode not in ('quality', 'speed', 'logprobs'):
+        p.error('--validation-protocol requires quality, speed or logprobs mode')
     try:
         _resources().validate_fraction(args.gpu_memory_fraction, '--gpu-memory-fraction')
     except ValueError as exc:
@@ -165,6 +169,16 @@ def main():
         p.error('--cpu-moe all conflicts with --n-cpu-moe')
     if args.moe_cpu_threads is not None and not 1 <= args.moe_cpu_threads <= 256:
         p.error('--moe-cpu-threads must be in [1,256]')
+    validation = None
+    if args.validation_protocol:
+        validation = json.loads(args.validation_protocol.read_text(encoding='utf-8'))
+        if digest(args.suite) != validation['suite_file_sha256']:
+            p.error('Validation suite hash differs from frozen protocol')
+        if (args.context != validation['context'] or cache_k != validation['cache']
+                or cache_v != validation['cache'] or args.mtp != validation['mtp']):
+            p.error('Runtime controls differ from frozen validation protocol')
+        if args.mode == 'logprobs' and digest(args.teacher_forced_protocol) != digest(args.validation_protocol):
+            p.error('Teacher-forced and validation protocols differ')
     candidate = args.candidate.resolve()
     output = args.output.resolve()
     if candidate == output or candidate in output.parents or output in candidate.parents:
@@ -173,6 +187,13 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     (output / 'harness.py').write_bytes(Path(__file__).read_bytes())
     suite = json.loads(args.suite.read_text())
+    validation_by_prompt = None
+    if validation is not None:
+        if [x['id'] for x in suite['tasks']] != [x['id'] for x in validation['cases']]:
+            p.error('Validation case inventory differs from suite')
+        validation_by_prompt = {task['prompt']: case for task, case in zip(suite['tasks'], validation['cases'])}
+        if len(validation_by_prompt) != len(suite['tasks']):
+            p.error('Validation prompts must be unique')
     expected = None
     if args.expected_results:
         reference = json.loads(args.expected_results.read_text())
@@ -351,6 +372,14 @@ def main():
         record('tokenizer', tokenizer_sha256=digest(candidate / 'tokenizer.json'),
                template_sha256=hashlib.sha256(tokenizer.hf_tokenizer.chat_template.encode()).hexdigest(),
                eos_ids=cfg.eos_token_id_list, actual_vocab_size=tokenizer.actual_vocab_size)
+        if validation is not None:
+            if (digest(candidate / 'tokenizer.json') != validation['tokenizer_sha256']
+                    or digest(candidate / 'chat_template.jinja') != validation['template_sha256']
+                    or set(cfg.eos_token_id_list) != set(validation['stop_ids'])
+                    or tokenizer.actual_vocab_size != validation['valid_vocabulary_size']):
+                raise ValueError('Tokenizer, template, stops or vocabulary differ from frozen protocol')
+            record('validation_protocol', sha256=digest(args.validation_protocol),
+                   suite_sha256=validation['suite_file_sha256'], stop_ids=cfg.eos_token_id_list)
 
         def encode_chat(prompt):
             messages = [dict(role='system', content=suite['system']), dict(role='user', content=prompt)]
@@ -364,6 +393,10 @@ def main():
             if ids_override is not None:
                 ids = ids_override
                 rendered = tokenizer.hf_tokenizer.decode(ids.flatten().tolist(), skip_special_tokens=False)
+            elif validation_by_prompt is not None:
+                frozen = validation_by_prompt[prompt]
+                if rendered != frozen['rendered'] or ids.flatten().tolist() != frozen['input_ids']:
+                    raise ValueError('Rendered prompt or token prefix differs from frozen protocol: ' + name)
             if ids.numel() + limit + 4 > args.context:
                 raise ValueError('Prompt/output exceeds context')
             (output / (name + '-input.json')).write_text(json.dumps(dict(

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -47,6 +48,8 @@ def main():
     if digest(args.suite)!=protocol['suite_file_sha256']:p.error('Suite/protocol hash mismatch')
     if protocol['context']!=4096 or protocol['cache']!='f16' or protocol['mtp']:
         p.error('Unexpected frozen protocol')
+    if protocol['valid_vocabulary_size']!=248077 or protocol['stored_vocabulary_size']!=248320:
+        p.error('Unexpected frozen vocabulary')
     args.output.mkdir(parents=True)
     (args.output/'harness.py').write_bytes(Path(__file__).read_bytes())
     cases={row['id']:row for row in protocol['cases']}
@@ -107,10 +110,13 @@ def main():
             top=row.get('top_logprobs')
             if top is None:raise RuntimeError('Backend did not return presampling top_logprobs')
             values={x['id']:x['logprob'] for x in top}
-            if len(values)!=248320:raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
+            if len(top)!=248320 or set(values)!=set(range(248320)):
+                raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
             valid={k:v for k,v in values.items() if k<248077}
             mass=math.fsum(math.exp(v) for v in valid.values())
             if not mass>0 or target not in valid or not math.isfinite(valid[target]):raise RuntimeError('Invalid target probability')
+            if valid[target] < -1e30:
+                raise RuntimeError('Target probability underflowed; exact NLL is unavailable')
             result['teacher_forced']=dict(target_id=target,target_nll=-valid[target]+math.log(mass),
                 top1_id=max(valid,key=valid.get),valid_vocabulary_size=248077,
                 excluded_probability_mass=max(0,1-mass),returned_vocabulary_size=len(values))
@@ -139,6 +145,16 @@ def main():
                     if time.monotonic()-start>240:raise RuntimeError('Readiness timeout')
                     time.sleep(1)
                 checks=[]
+                stop_checks=[]
+                for marker in ('<|im_end|>','<|endoftext|>'):
+                    tokenized,_=api('/tokenize',dict(content=marker,add_special=False,parse_special=True))
+                    if len(tokenized['tokens'])!=1:raise RuntimeError('Stop marker is not a single token')
+                    stop_checks.extend(tokenized['tokens'])
+                server_log=(args.output/'server.log').read_text(encoding='utf-8',errors='replace')
+                eog_ids=set(map(int,re.findall(r'EOG token\s*=\s*(\d+)',server_log)))
+                if set(stop_checks)!=set(protocol['stop_ids']) or eog_ids!=set(protocol['stop_ids']):
+                    raise RuntimeError('Backend stop IDs differ from frozen protocol: '+repr((stop_checks,sorted(eog_ids))))
+                write(args.output/'stop-checks.json',dict(marker_ids=stop_checks,backend_eog_ids=sorted(eog_ids)))
                 for case in protocol['cases']:
                     tokenized,_=api('/tokenize',dict(content=case['rendered'],add_special=False,parse_special=True))
                     matched=tokenized['tokens']==case['input_ids']
@@ -159,6 +175,8 @@ def main():
                 else:
                     for probe in protocol['teacher_forced_probes']:
                         complete(probe['id'],probe['input_ids'],1,fixed=True,target=probe['target_id'])
+                if state['reason'] is not None:
+                    raise RuntimeError('Resource monitor stopped run: '+state['reason'])
                 state['status']='completed'
         except BaseException as error:
             state.update(status='failed',error=type(error).__name__+': '+str(error))

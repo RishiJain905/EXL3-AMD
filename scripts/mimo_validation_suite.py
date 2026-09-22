@@ -410,7 +410,7 @@ def _multi_spec(rng, k):
                 "parameters": {"title": "string", "questions": "array of string",
                                "anonymous": "boolean"}}
         args = {"title": title, "questions": qs, "anonymous": anon}
-        mode = "anonymous" if anon else "named"
+        mode = "anonymous" if anon else "non-anonymous"
         req = (f"Create {mode} survey {title!r} with questions {qs[0]!r} and {qs[1]!r}.")
         return tool, args, req
     field = rng.choice(["stock", "score", "level"])
