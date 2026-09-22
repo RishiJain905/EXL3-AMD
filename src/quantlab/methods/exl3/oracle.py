@@ -1,4 +1,4 @@
-"""Independent CPU reader for native EXL3 cb=0/2, K=2/3/4 packed weights.
+"""Independent CPU reader for native EXL3 cb=0/2, K=2/3/4/5/6 packed weights.
 
 Format reference: https://github.com/CarouselAether/rocm_exl3 at
 550dcfed786ad7bffa08b7a6b2a216fc474cbbb5, quant/pack.cu,
@@ -30,8 +30,8 @@ def decode_trellis(trellis, K, *, codebook=0):
     Intermediate arrays cover at most DECODE_TILE_BATCH tiles; only the
     returned float32 matrix scales with the full decoded weight size.
     """
-    if isinstance(K, (bool, np.bool_)) or not isinstance(K, (int, np.integer)) or K not in (2, 3, 4):
-        raise ValueError("K must be integer 2, 3 or 4")
+    if isinstance(K, (bool, np.bool_)) or not isinstance(K, (int, np.integer)) or K not in (2, 3, 4, 5, 6):
+        raise ValueError("K must be integer 2, 3, 4, 5 or 6")
     if isinstance(codebook, (bool, np.bool_)) or not isinstance(codebook, (int, np.integer)) or codebook not in (0, 2):
         raise ValueError("codebook must be integer 0 or 2")
     packed = np.asarray(trellis)

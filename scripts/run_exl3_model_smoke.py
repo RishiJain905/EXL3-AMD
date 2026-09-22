@@ -213,11 +213,13 @@ def main():
         cfg, _ = mapped_text_config(candidate)
         install(cfg)
         model = Model.from_config(cfg)
-        draft = Model.from_config(cfg, component="mtp")
+        if args.mtp and "mtp" not in cfg.model_classes:
+            raise ValueError("MTP requested but candidate has no MTP weights")
+        draft = Model.from_config(cfg, component="mtp") if "mtp" in cfg.model_classes else None
         # Verify MTP completeness even in target-only mode: a partial target
         # export must not accidentally count as the requested complete artifact.
-        check_required_tensors(cfg, (model, draft))
-        record("candidate_checked", text_modules=len(model.modules), mtp_modules=len(draft.modules))
+        check_required_tensors(cfg, (model, draft) if draft is not None else (model,))
+        record("candidate_checked", text_modules=len(model.modules), mtp_modules=len(draft.modules) if draft else 0)
         cache = Cache(model, max_num_tokens=512, max_batch_size=1, max_history=2 if args.mtp else 0)
         draft_cache = Cache(draft, max_num_tokens=512, max_batch_size=1) if args.mtp else None
         torch.cuda.synchronize()

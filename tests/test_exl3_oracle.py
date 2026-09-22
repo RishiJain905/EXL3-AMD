@@ -132,6 +132,66 @@ class Exl3OracleTests(unittest.TestCase):
         self.assertEqual(actual[15, 15], scalar_codebook(0xCDEF))
         np.testing.assert_array_equal(actual, expected_tile(symbols, 4))
 
+    def test_k5_k6_circular_tiles_match_scalar_reference(self):
+        rng = np.random.default_rng(41027)
+        for bits in (5, 6):
+            for codebook in (0, 2):
+                symbols = rng.integers(0, 1 << bits, 256)
+                symbols[0], symbols[-1] = 1, (1 << bits) - 1
+                packed = fixture(symbols, bits).reshape(1, 1, 16 * bits)
+                np.testing.assert_array_equal(
+                    decode_trellis(packed, bits, codebook=codebook),
+                    expected_tile(symbols, bits, codebook))
+            self.assertFalse(np.array_equal(
+                decode_trellis(packed, bits, codebook=2),
+                decode_trellis(packed, bits)))
+        for bits in (5, 6):
+            zeros = np.zeros((1, 1, 16 * bits), dtype=np.int16)
+            np.testing.assert_array_equal(
+                decode_trellis(zeros, bits, codebook=2),
+                np.full((16, 16), scalar_codebook(0, 2), dtype=np.float32))
+
+    def test_k5_k6_fixed_boundary_fixtures(self):
+        # All-zero stream with a maximal final symbol: the first state is the
+        # final symbol shifted above the current K bits, as in the K2 fixture.
+        for bits, final, first, second in ((5, 31, 992, 31744), (6, 63, 4032, 61440)):
+            symbols = np.zeros(256, dtype=int)
+            symbols[-1] = final
+            packed = fixture(symbols, bits).reshape(1, 1, 16 * bits)
+            self.assertEqual(int(packed[0, 0, -2]), final)
+            self.assertEqual(int(packed[0, 0, -1]), 0)
+            for codebook in (0, 2):
+                actual = decode_trellis(packed, bits, codebook=codebook)
+                self.assertEqual(actual[0, 0], scalar_codebook(first, codebook))
+                self.assertEqual(actual[1, 0], scalar_codebook(second, codebook))
+                self.assertEqual(actual[15, 15], scalar_codebook(final, codebook))
+
+    def test_k5_k6_fixed_native_word_layout(self):
+        symbols = np.tile(np.arange(32), 8)
+        packed = fixture(symbols, 5).reshape(1, 1, 80)
+        # First 64 stream bits 00000...00101 00 | 110 00111...0110, little-endian.
+        np.testing.assert_array_equal(packed.view(np.uint16)[0, 0, :4], [0x3214, 0x0044, 0x54B6, 0xC742])
+        np.testing.assert_array_equal(decode_trellis(packed, 5), expected_tile(symbols, 5))
+        symbols = np.tile(np.arange(64), 4)
+        packed = fixture(symbols, 6).reshape(1, 1, 96)
+        np.testing.assert_array_equal(packed.view(np.uint16)[0, 0, :4], [0x8310, 0x0010, 0x2092, 0x5187])
+        np.testing.assert_array_equal(decode_trellis(packed, 6, codebook=2), expected_tile(symbols, 6, 2))
+
+    def test_k5_k6_reconstruction_matches_explicit_hadamard_and_scales(self):
+        rng = np.random.default_rng(90517)
+        # Sylvester entry is (-1)**parity(row & column), independently of butterflies.
+        h = np.array([[(-1) ** ((r & c).bit_count()) for c in range(128)] for r in range(128)], dtype=np.float64) / np.sqrt(128)
+        for bits in (5, 6):
+            for codebook in (0, 2):
+                packed = rng.integers(-32768, 32768, (8, 8, 16 * bits), dtype=np.int16)
+                decoded = decode_trellis(packed, bits, codebook=codebook)
+                su = np.linspace(-1, 2, 128, dtype=np.float32)
+                sv = np.linspace(3, -1, 128, dtype=np.float32)
+                expected = (h @ decoded @ h) * su[:, None] * sv[None, :]
+                actual = reconstruct(packed, bits, su, sv, codebook=codebook)
+                np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
+                self.assertEqual(actual.dtype, np.float32)
+
     def test_reconstruction_matches_explicit_hadamard_and_scales(self):
         rng = np.random.default_rng(71)
         packed = rng.integers(-32768, 32768, (8, 16, 48), dtype=np.int16)
@@ -148,7 +208,7 @@ class Exl3OracleTests(unittest.TestCase):
 
     def test_malformed_inputs(self):
         valid = np.zeros((8, 8, 32), dtype=np.int16)
-        for bits in (True, 2.0, 1, 5, None):
+        for bits in (True, 2.0, 1, 7, None):
             with self.assertRaises(ValueError):
                 decode_trellis(valid, bits)
         for packed in (valid.astype(np.uint16), valid.astype(np.float32), valid[0], valid[..., :-1], valid[:0]):
