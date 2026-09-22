@@ -28,6 +28,63 @@ def digest(path):
 def write(path,value):
     with path.open('x',encoding='utf-8') as f:json.dump(value,f,indent=2,allow_nan=False)
 
+def summarize_teacher_forced(top,target,valid_size=248077,stored_size=248320):
+    """Deterministic summary of one full-vocabulary presampling logprob row.
+
+    Pure: validates the returned row and derives target NLL normalized over
+    valid IDs only, deterministic top-1 (smallest ID on exact ties, matching
+    argmax over ascending vocabulary) and excluded mass from the explicitly
+    returned invalid IDs normalized by the returned valid+excluded mass.
+    Raises RuntimeError on any malformed, incomplete or nonfinite input.
+    """
+    if valid_size<=0 or stored_size<=0 or valid_size>stored_size:
+        raise ValueError('Invalid vocabulary sizes')
+    if not isinstance(top,list) or len(top)!=stored_size:
+        raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
+    if not isinstance(target,int) or isinstance(target,bool) or not 0<=target<valid_size:
+        raise RuntimeError('Invalid target probability')
+    values={}
+    for entry in top:
+        if not isinstance(entry,dict) or 'id' not in entry or 'logprob' not in entry:
+            raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
+        tid=entry['id']
+        logprob=entry['logprob']
+        if not isinstance(tid,int) or isinstance(tid,bool):
+            raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
+        if not isinstance(logprob,(int,float)) or isinstance(logprob,bool) or not math.isfinite(logprob):
+            raise RuntimeError('Invalid target probability')
+        if tid in values:
+            raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
+        values[tid]=float(logprob)
+    if len(values)!=stored_size or set(values)!=set(range(stored_size)):
+        raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
+    target_logprob=values[target]
+    if target_logprob<-1e30:
+        raise RuntimeError('Target probability underflowed; exact NLL is unavailable')
+    try:
+        valid_mass=math.fsum(math.exp(values[k]) for k in range(valid_size))
+        excluded_mass=math.fsum(math.exp(values[k]) for k in range(valid_size,stored_size))
+    except OverflowError:
+        raise RuntimeError('Invalid target probability')
+    if not math.isfinite(valid_mass) or not valid_mass>0:
+        raise RuntimeError('Invalid target probability')
+    if not math.isfinite(excluded_mass) or excluded_mass<0:
+        raise RuntimeError('Invalid target probability')
+    total=valid_mass+excluded_mass
+    if not math.isfinite(total) or not total>0:
+        raise RuntimeError('Invalid target probability')
+    excluded_fraction=excluded_mass/total
+    if not math.isfinite(excluded_fraction):
+        raise RuntimeError('Invalid target probability')
+    target_nll=-target_logprob+math.log(valid_mass)
+    if not math.isfinite(target_nll):
+        raise RuntimeError('Invalid target probability')
+    best=max(values[k] for k in range(valid_size))
+    top1=min(k for k in range(valid_size) if values[k]==best)
+    return dict(target_id=target,target_nll=target_nll,top1_id=top1,
+        valid_vocabulary_size=valid_size,excluded_probability_mass=excluded_fraction,
+        returned_vocabulary_size=len(values))
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('config','executable','model','protocol','suite','output'):
@@ -110,17 +167,7 @@ def main():
             row=probabilities[0]
             top=row.get('top_logprobs')
             if top is None:raise RuntimeError('Backend did not return presampling top_logprobs')
-            values={x['id']:x['logprob'] for x in top}
-            if len(top)!=248320 or set(values)!=set(range(248320)):
-                raise RuntimeError('Full-vocabulary probabilities unavailable; NLL not inferred from top-k')
-            valid={k:v for k,v in values.items() if k<248077}
-            mass=math.fsum(math.exp(v) for v in valid.values())
-            if not mass>0 or target not in valid or not math.isfinite(valid[target]):raise RuntimeError('Invalid target probability')
-            if valid[target] < -1e30:
-                raise RuntimeError('Target probability underflowed; exact NLL is unavailable')
-            result['teacher_forced']=dict(target_id=target,target_nll=-valid[target]+math.log(mass),
-                top1_id=max(valid,key=valid.get),valid_vocabulary_size=248077,
-                excluded_probability_mass=max(0,1-mass),returned_vocabulary_size=len(values))
+            result['teacher_forced']=summarize_teacher_forced(top,target)
         write(args.output/(name+'-result.json'),result)
         results.append(result)
         print(json.dumps(dict(case=name,tokens=len(tokens),seconds=elapsed)),flush=True)
