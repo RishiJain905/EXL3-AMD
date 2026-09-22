@@ -196,7 +196,10 @@ def main():
             raise RuntimeError("C++ JIT build forbidden")
         cpp.load = cpp.load_inline = no_build
         torch.set_num_threads(2)
-        faulthandler.dump_traceback_later(120, repeat=True)
+        # Match the evaluation harness: repeated asynchronous stack dumps
+        # crashed this Python/Triton combination in an earlier runtime run.
+        # The external supervisor enforces the timeout and resource limits.
+        faulthandler.enable()
         spec = importlib.util.spec_from_file_location("exllamav3_ext", binary)
         extension = importlib.util.module_from_spec(spec)
         sys.modules["exllamav3_ext"] = extension
