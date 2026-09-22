@@ -66,7 +66,9 @@ def parser():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--candidate-manifest', type=Path)
     p.add_argument('--expected-extension-sha256', required=True)
-    p.add_argument('--mode', choices=('speed', 'quality', 'context', 'context-speed', 'profile', 'generate'), required=True)
+    p.add_argument('--mode', choices=('speed', 'quality', 'context', 'context-speed', 'profile', 'generate', 'logprobs'), required=True)
+    p.add_argument('--teacher-forced-protocol', type=Path,
+                   help='Frozen explicit input_ids/target_id probes; required for logprobs mode')
     p.add_argument('--context-speed-task', choices=('docstring', 'canonical'), default='docstring',
                    help='Occupied-coding question: 192-token docstring protocol or exact suite first_index task with 128 tokens; canonical requires context-speed mode')
     p.add_argument('--decode-fusions', choices=('off', 'gdn', 'gdn-mlp', 'gdn-mlp-mgemv'), default='off')
@@ -112,6 +114,10 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    if args.mode == 'logprobs' and (not args.teacher_forced_protocol or args.mtp):
+        p.error('logprobs requires --teacher-forced-protocol and MTP off')
+    if args.teacher_forced_protocol and args.mode != 'logprobs':
+        p.error('--teacher-forced-protocol requires logprobs mode')
     try:
         _resources().validate_fraction(args.gpu_memory_fraction, '--gpu-memory-fraction')
     except ValueError as exc:
@@ -353,7 +359,7 @@ def main():
             ids = tokenizer.encode(rendered, add_bos=False, add_eos=False, encode_special_tokens=True)
             return rendered, ids
 
-        def run_case(name, prompt, limit, *, fixed=False, warmup=False, ids_override=None, metadata=None, profiling=None):
+        def run_case(name, prompt, limit, *, fixed=False, warmup=False, ids_override=None, metadata=None, profiling=None, target_id=None):
             rendered, ids = encode_chat(prompt)
             if ids_override is not None:
                 ids = ids_override
@@ -372,6 +378,24 @@ def main():
             # and retain live recurrent state. Fresh generators prevent reuse
             # across requests; retain the verified 1-GiB in-request budget.
             sampler = ArgmaxSampler()
+            probability = {}
+            if target_id is not None:
+                if not 0 <= target_id < tokenizer.actual_vocab_size:
+                    raise ValueError('Teacher-forced target outside valid vocabulary')
+                def capture_probability(logits):
+                    if probability:
+                        return
+                    row = logits[0, -1].float()
+                    valid = row[:tokenizer.actual_vocab_size]
+                    if not torch.isfinite(valid).all():
+                        raise RuntimeError('Nonfinite teacher-forced logits')
+                    normalizer = torch.logsumexp(valid, dim=0)
+                    probability.update(target_id=target_id,
+                        target_nll=float((normalizer-valid[target_id]).item()),
+                        top1_id=int(valid.argmax().item()),
+                        valid_vocabulary_size=tokenizer.actual_vocab_size,
+                        excluded_probability_mass=float((1-torch.exp(normalizer-torch.logsumexp(row,dim=0))).clamp(0,1).item()))
+                observe_sampler_input(sampler, capture_probability)
             original_draft_sample = draft.sample_from_state if args.mtp else None
             if warmup:
                 checked = []
@@ -473,6 +497,10 @@ def main():
                           rejected_draft_tokens=job.rejected_draft_tokens if args.mtp else None,
                           draft_windows=list(job.draft_stats),
                           calibrated_labels=gen.draft_calibrator.total if gen.draft_calibrator is not None else None)
+            if target_id is not None:
+                if not probability:
+                    raise RuntimeError('Teacher-forced probe produced no logits')
+                result['teacher_forced'] = probability
             status['results'].append(result)
             (output / (name + '-result.json')).write_text(json.dumps(result, indent=2, allow_nan=False))
             record('case_completed', **result)
@@ -490,7 +518,17 @@ def main():
 
         if args.mode in ('speed', 'quality', 'profile', 'generate'):
             run_case('warmup', suite['tasks'][0]['prompt'], 32, fixed=True, warmup=True)
-        if args.mode == 'generate':
+        if args.mode == 'logprobs':
+            protocol = json.loads(args.teacher_forced_protocol.read_text())
+            record('teacher_forced_protocol', sha256=digest(args.teacher_forced_protocol))
+            for probe in protocol['teacher_forced_probes']:
+                ids = torch.tensor([probe['input_ids']], dtype=torch.long)
+                if ids.numel() == 0 or ids.min() < 0 or ids.max() >= tokenizer.actual_vocab_size:
+                    raise ValueError('Invalid frozen teacher-forced input IDs')
+                run_case(probe['id'], 'Explicit frozen teacher-forced prefix', 1,
+                         fixed=True, ids_override=ids, target_id=probe['target_id'],
+                         metadata=dict(task_id=probe['task_id'], position=probe['position']))
+        elif args.mode == 'generate':
             run_case('answer', args.prompt_file.read_text(encoding='utf-8'), args.max_tokens)
         elif args.mode == 'profile':
             task = suite['tasks'][4]

@@ -24,17 +24,17 @@ from run_exl3_layer import digest, local_path
 SHAPE = (248320, 5120)
 
 
-def tensor_provenance(shard, key):
+def tensor_provenance(shard, key, shape=SHAPE):
     with shard.open("rb") as stream:
         size = struct.unpack("<Q", stream.read(8))[0]
         if size > 16 * 2**20:
             raise ValueError("unexpected safetensors header size")
         header = stream.read(size)
         entry = json.loads(header)[key]
-        if tuple(entry["shape"]) != SHAPE or entry["dtype"] != "BF16":
+        if tuple(entry["shape"]) != tuple(shape) or entry["dtype"] != "BF16":
             raise ValueError("head shape/dtype differs from preregistered source")
         begin, end = entry["data_offsets"]
-        if end - begin != SHAPE[0] * SHAPE[1] * 2:
+        if end - begin != shape[0] * shape[1] * 2:
             raise ValueError("head tensor byte range is inconsistent")
         stream.seek(8 + size + begin)
         remaining = end - begin
@@ -60,7 +60,17 @@ def main():
     parser.add_argument("--mode", choices=("encode", "reload"), required=True)
     parser.add_argument("--input", type=Path)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--shape", type=int, nargs=2, default=SHAPE, metavar=("OUTPUTS", "INPUTS"))
+    parser.add_argument("--bits", type=int, choices=(2, 3, 4, 5, 6), default=4)
+    parser.add_argument("--codebook", choices=("3inst", "mul1"), default="3inst")
+    parser.add_argument("--out-scales", choices=("auto", "always", "never"), default="auto")
+    parser.add_argument("--seed", type=int, default=20260909)
     args = parser.parse_args()
+    shape, bits = tuple(args.shape), args.bits
+    mul1 = args.codebook == "mul1"
+    codebook = 2 if mul1 else 0
+    if min(shape) <= 0 or any(size % 128 for size in shape):
+        parser.error("head dimensions must be positive multiples of 128")
     config = tomllib.loads(args.config.read_text())
     if not args.execute or not all(config["execution"].get(k) is True for k in
                                   ("allow_local_inference", "allow_backend_probes")):
@@ -117,23 +127,25 @@ def main():
             index = json.loads(index_file.read_text())["weight_map"]
             key = "lm_head.weight"
             shard = model / index[key]
-            provenance = tensor_provenance(shard, key)
-            record("source", key=key, shape=SHAPE, index_sha256=digest(index_file), **provenance)
+            provenance = tensor_provenance(shard, key, shape)
+            record("source", key=key, shape=shape, index_sha256=digest(index_file), **provenance)
             with safe_open(shard, framework="pt", device="cpu") as file:
                 original = file.get_tensor(key)
-                if original.dtype != torch.bfloat16 or tuple(original.shape) != SHAPE:
+                if original.dtype != torch.bfloat16 or tuple(original.shape) != shape:
                     raise ValueError("expected full BF16 head")
                 # Match upstream's FP16 checkpoint loading without retaining a
                 # full FP32 original. No source-weight copy is written to disk.
                 weight_holder = [original.half().T.contiguous()]
                 del original
             del file
-            cal = torch.randn(512, SHAPE[1], generator=torch.Generator().manual_seed(100))
+            cal = torch.randn(512, shape[1], generator=torch.Generator().manual_seed(100))
             h = {"H": (cal.T @ cal).to(device), "count": 512, "finalized": False,
                  "device": device, "first_key": key}
             del cal
-            qa = {"K": 4, "seed": 20260909, "apply_out_scales": None,
-                  "devices": [device], "compact_cpu_buffers": True, "memory_diagnostics": True}
+            qa = {"K": bits, "seed": args.seed,
+                  "apply_out_scales": {"auto": None, "always": True, "never": False}[args.out_scales],
+                  "devices": [device], "compact_cpu_buffers": True, "memory_diagnostics": True,
+                  "mul1": mul1, "sigma_reg": 0.025}
             begin = time.monotonic()
             # Transfer sole ownership: the encoder can release the CPU source
             # once its synchronous upload has completed, before CPU LDLQ buffers.
@@ -150,9 +162,9 @@ def main():
             artifact = args.output / "head.safetensors"
             if artifact.stat().st_size > 2**30:
                 raise RuntimeError("packed artifact exceeds 1 GiB pilot bound")
-            result = dict(bits=4, codebook="3inst", shape=SHAPE, key=key,
+            result = dict(bits=bits, codebook=args.codebook, shape=shape, key=key,
                           source_provenance=provenance, source_index_sha256=digest(index_file),
-                          quant_args=qa, calibration=dict(rows=512, columns=5120, seed=100, kind="synthetic Gaussian"),
+                          quant_args=qa, calibration=dict(rows=512, columns=shape[1], seed=100, kind="synthetic Gaussian"),
                           source_conversion="BF16 source -> FP16 host -> FP32 GPU arithmetic",
                           artifact_sha256=digest(artifact), file_bytes=artifact.stat().st_size,
                           tensor_bytes=sum(v.numel()*v.element_size() for v in packed.values()),
@@ -163,22 +175,22 @@ def main():
             from quantlab.methods.exl3.oracle import decode_trellis, reconstruct
             artifact = args.input / "head.safetensors"
             metadata = json.loads((args.input / "encoding.json").read_text())
-            if metadata["bits"] != 4 or tuple(metadata["shape"]) != SHAPE or digest(artifact) != metadata["artifact_sha256"]:
+            if metadata["bits"] != bits or metadata["codebook"] != args.codebook or tuple(metadata["shape"]) != shape or digest(artifact) != metadata["artifact_sha256"]:
                 raise ValueError("packed head provenance mismatch")
             packed = load_file(str(artifact), device="cpu")
             gpu = {name: value.to(device) for name, value in packed.items()}
-            native = torch.empty((SHAPE[1], SHAPE[0]), dtype=torch.half, device=device)
-            ext.reconstruct(native, gpu["trellis"], 4, False, False)
+            native = torch.empty((shape[1], shape[0]), dtype=torch.half, device=device)
+            ext.reconstruct(native, gpu["trellis"], bits, False, mul1)
             torch.cuda.synchronize()
-            for start in (0, (SHAPE[0] // 2 // 128) * 128, SHAPE[0] - 128):
+            for start in (0, (shape[0] // 2 // 128) * 128, shape[0] - 128):
                 end = start + 128
                 trellis = packed["trellis"][:, start // 16:end // 16, :].numpy()
-                decoded = torch.from_numpy(decode_trellis(trellis, 4))
+                decoded = torch.from_numpy(decode_trellis(trellis, bits, codebook=codebook))
                 actual = native[:, start:end].float().cpu()
                 mismatches = int((decoded != actual).sum().item())
-                intended = torch.from_numpy(reconstruct(trellis, 4, packed["suh"].numpy(), packed["svh"][start:end].numpy()))
-                transformed = torch.empty((SHAPE[1], 128), dtype=torch.half, device=device)
-                ext.reconstruct_had_slice(transformed, gpu["trellis"], gpu["suh"], gpu["svh"][start:end], 4, False, False, start)
+                intended = torch.from_numpy(reconstruct(trellis, bits, packed["suh"].numpy(), packed["svh"][start:end].numpy(), codebook=codebook))
+                transformed = torch.empty((shape[1], 128), dtype=torch.half, device=device)
+                ext.reconstruct_had_slice(transformed, gpu["trellis"], gpu["suh"], gpu["svh"][start:end], bits, False, mul1, start)
                 actual_transformed = transformed.float().cpu()
                 relative_rms = (((actual_transformed-intended).square().sum() / intended.square().sum().clamp_min(1e-20)).sqrt().item())
                 record("sample_reload", output_columns=[start, end], values=decoded.numel(),
