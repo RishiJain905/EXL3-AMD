@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -90,9 +91,14 @@ def main():
     for name in ('config','executable','model','protocol','suite','output'):
         p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--mode',choices=('quality','speed','logprobs'),required=True)
+    p.add_argument('--device',required=True,help='Exact --list-devices identifier for the target GPU')
+    p.add_argument('--hip-visible-devices',help='Optional process-local HIP device filter; device IDs must match its inventory')
     p.add_argument('--port',type=int,default=8094)
     p.add_argument('--execute',action='store_true')
     args=p.parse_args()
+    environment=dict(os.environ)
+    if args.hip_visible_devices is not None:
+        environment['HIP_VISIBLE_DEVICES']=args.hip_visible_devices
     config=tomllib.loads(args.config.read_text(encoding='utf-8'))
     if not args.execute or not all(config['execution'].get(k) is True for k in ('allow_backend_probes','allow_local_inference')):
         p.error('Requires --execute and both local permissions')
@@ -103,6 +109,12 @@ def main():
     protocol=json.loads(args.protocol.read_text(encoding='utf-8'))
     suite=json.loads(args.suite.read_text(encoding='utf-8'))
     if digest(args.suite)!=protocol['suite_file_sha256']:p.error('Suite/protocol hash mismatch')
+    quality_limit=protocol['max_new_tokens']
+    if (type(quality_limit) is not int or not 1<=quality_limit<=2048
+            or suite['quality_max_tokens']!=quality_limit):
+        p.error('Suite output budget differs from supported frozen protocol')
+    if protocol['thinking'] and args.mode!='quality':
+        p.error('Thinking-enabled supplement is quality-only')
     if protocol['context']!=4096 or protocol['cache']!='f16' or protocol['mtp']:
         p.error('Unexpected frozen protocol')
     if protocol['valid_vocabulary_size']!=248077 or protocol['stored_vocabulary_size']!=248320:
@@ -110,12 +122,22 @@ def main():
     args.output.mkdir(parents=True)
     (args.output/'harness.py').write_bytes(Path(__file__).read_bytes())
     cases={row['id']:row for row in protocol['cases']}
-    command=[str(args.executable),'-m',str(args.model),'-c','4096','-ngl','99','-fa','on',
+    command=[str(args.executable),'-m',str(args.model),'--device',args.device,'--split-mode','none',
+             '-c','4096','-ngl','99','-fa','on',
              '-ctk','f16','-ctv','f16','-b','256','-ub','256','-np','1',
-             '--spec-type','none','--no-mmproj','--host','127.0.0.1','--port',str(args.port)]
+             '--spec-type','none','--no-mmproj','-lv','5','--host','127.0.0.1','--port',str(args.port)]
+    # llama.cpp auto-classifies three FIM markers as EOG, unlike this source's
+    # two-token generation config. These completion-only controls do not use
+    # the FIM API: alias those metadata slots to the existing EOS so the actual
+    # logged EOG set and ignore_eos mask match the frozen source protocol.
+    if set(protocol['stop_ids'])!={248044,248046}:p.error('Unexpected source stop IDs')
+    for field in ('fim_pad_token_id','fim_rep_token_id','fim_sep_token_id'):
+        command+=['--override-kv','tokenizer.ggml.'+field+'=int:248046']
     write(args.output/'request.json',dict(argv=command,mode=args.mode,protocol_sha256=digest(args.protocol),
         suite_sha256=digest(args.suite),executable_sha256=digest(args.executable),
         model_path=str(args.model),model_bytes=args.model.stat().st_size,timeout=900,
+        server_cwd=str(args.executable.parent),hip_visible_devices=environment.get('HIP_VISIBLE_DEVICES'),
+        thinking=protocol['thinking'],quality_max_tokens=quality_limit,
         limits=dict(min_host_available_bytes=4*2**30,max_dedicated_fraction=.95,min_artifact_free_gib=120)))
     # Full model hash occurs before inference and is retained separately from timing.
     write(args.output/'model-identity.json',dict(file=args.model.name,bytes=args.model.stat().st_size,sha256=digest(args.model)))
@@ -179,7 +201,8 @@ def main():
             with socket.socket() as probe:
                 if probe.connect_ex(('127.0.0.1',args.port))==0:raise RuntimeError('Requested port already occupied')
             with (args.output/'server.log').open('wb') as log:
-                child=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW)
+                child=subprocess.Popen(command,cwd=args.executable.parent,env=environment,
+                    stdout=log,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW)
                 collector.set_pid(child.pid)
                 collector.set_stage('load', 'Loading fixed MiMo GGUF control')
                 write(args.output/'process.json',dict(pid=child.pid,argv=command))
@@ -189,7 +212,7 @@ def main():
                     try:
                         health,_=api('/health')
                         if health.get('status')=='ok':break
-                    except (urllib.error.URLError,TimeoutError):pass
+                    except (urllib.error.URLError,TimeoutError,ConnectionError):pass
                     if time.monotonic()-start>240:raise RuntimeError('Readiness timeout')
                     time.sleep(1)
                 checks=[]
@@ -214,7 +237,7 @@ def main():
                 complete('warmup',first['input_ids'],32,fixed=True,warmup=True)
                 if args.mode=='quality':
                     for task in suite['tasks']:
-                        complete(task['id'],cases[task['id']]['input_ids'],128)
+                        complete(task['id'],cases[task['id']]['input_ids'],quality_limit)
                 elif args.mode=='speed':
                     for task in (suite['tasks'][0],suite['tasks'][4]):
                         ids=cases[task['id']]['input_ids']

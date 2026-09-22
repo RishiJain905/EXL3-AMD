@@ -71,6 +71,8 @@ def parser():
                    help='Frozen explicit input_ids/target_id probes; required for logprobs mode')
     p.add_argument('--validation-protocol', type=Path,
                    help='Enforce frozen suite, tokenizer, prompt tokens, stops and runtime controls')
+    p.add_argument('--enable-thinking', action='store_true',
+                   help='Render the native thinking-enabled template for a frozen quality protocol')
     p.add_argument('--context-speed-task', choices=('docstring', 'canonical'), default='docstring',
                    help='Occupied-coding question: 192-token docstring protocol or exact suite first_index task with 128 tokens; canonical requires context-speed mode')
     p.add_argument('--decode-fusions', choices=('off', 'gdn', 'gdn-mlp', 'gdn-mlp-mgemv'), default='off')
@@ -116,6 +118,8 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    if args.enable_thinking and (args.mode != 'quality' or not args.validation_protocol):
+        p.error('--enable-thinking requires quality mode and a frozen validation protocol')
     if args.mode == 'logprobs' and (not args.teacher_forced_protocol or args.mtp):
         p.error('logprobs requires --teacher-forced-protocol and MTP off')
     if args.teacher_forced_protocol and args.mode != 'logprobs':
@@ -175,7 +179,8 @@ def main():
         if digest(args.suite) != validation['suite_file_sha256']:
             p.error('Validation suite hash differs from frozen protocol')
         if (args.context != validation['context'] or cache_k != validation['cache']
-                or cache_v != validation['cache'] or args.mtp != validation['mtp']):
+                or cache_v != validation['cache'] or args.mtp != validation['mtp']
+                or args.enable_thinking != validation['thinking']):
             p.error('Runtime controls differ from frozen validation protocol')
         if args.mode == 'logprobs' and digest(args.teacher_forced_protocol) != digest(args.validation_protocol):
             p.error('Teacher-forced and validation protocols differ')
@@ -189,6 +194,8 @@ def main():
     suite = json.loads(args.suite.read_text())
     validation_by_prompt = None
     if validation is not None:
+        if suite['quality_max_tokens'] != validation['max_new_tokens']:
+            p.error('Suite output budget differs from frozen validation protocol')
         if [x['id'] for x in suite['tasks']] != [x['id'] for x in validation['cases']]:
             p.error('Validation case inventory differs from suite')
         validation_by_prompt = {task['prompt']: case for task, case in zip(suite['tasks'], validation['cases'])}
@@ -201,6 +208,7 @@ def main():
     (output / 'suite.json').write_text(json.dumps(suite, indent=2))
     started = time.monotonic()
     status = dict(status='running', mode=args.mode, mtp=args.mtp, cache_tokens=args.context,
+                  thinking=args.enable_thinking,
                   cache_k=cache_k, cache_v=cache_v,
                   draft_tokens=args.draft_tokens if args.mtp else 0,
                   dynamic_draft_tokens=args.draft_confidence is not None,
@@ -383,7 +391,7 @@ def main():
 
         def encode_chat(prompt):
             messages = [dict(role='system', content=suite['system']), dict(role='user', content=prompt)]
-            rendered = tokenizer.hf_render_chat_template(messages, enable_thinking=False)
+            rendered = tokenizer.hf_render_chat_template(messages, enable_thinking=args.enable_thinking)
             # The same runtime tokenizer is used for all modes; preserve rendered text and actual IDs.
             ids = tokenizer.encode(rendered, add_bos=False, add_eos=False, encode_special_tokens=True)
             return rendered, ids
