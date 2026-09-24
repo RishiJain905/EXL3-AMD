@@ -1,5 +1,32 @@
 # Release validation
 
+## Checkpoint rename retry: 2026-09-24
+
+Two MiMo conversion launches on WSL's Windows-mounted model drive completed
+their module writes but failed with `PermissionError` at `ckpt_new -> ckpt`.
+Checkpoint saving now retries only permission failures, rechecking sibling
+paths and an absent destination before each attempt. Each rename is bounded
+to 11 attempts and 7.5 seconds of requested sleep; existing process deadlines
+remain in force. Persistent errors still stop conversion. The helper does not
+copy/delete payloads or change quantization calculations, calibration or seeds.
+The shared ownership contract remains necessary: path checks are not an
+OS-level atomic no-replace primitive against arbitrary external writers.
+
+- 16 targeted WSL unit tests passed; Windows passed 13 and skipped three
+  unavailable symlink cases. Tests cover retry exhaustion, unrelated errors,
+  changed paths during backoff, preserved bytes and preexisting destinations.
+- Eight CPU filesystem cases with 64-MiB synthetic payloads did not reproduce
+  the error. A 4,294,978,644-byte synthetic payload did: two permission failures
+  were followed by success after 0.1/0.2-second sleeps. Independent readback
+  matched SHA-256 `8818012e4c68c8ad2ea9bac4bdaea91c7fd6fb10a9afc7431b46aaf1b5fb9cc8`.
+- This demonstrates a recoverable permission failure on the tested filesystem;
+  it does not establish the underlying OS/handle cause or a universal size
+  threshold. Full-model conversion with this helper is still pending.
+
+Source: `vendor/rocm-exl3/exllamav3/conversion/checkpoint_io.py`;
+tests: `tests/test_checkpoint_io.py`. Detailed MiMo provenance and retained
+failed attempts are recorded in the research repository's step-3 report.
+
 ## mul1 and RDNA4 update: 2026-09-16
 
 Implementation proceeded in two stages with bounded OMP assistance: mul1

@@ -15,6 +15,7 @@ from ..util.measures import state_error
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
 from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy
+from .checkpoint_io import rename_checkpoint_dir
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
@@ -1342,8 +1343,8 @@ def main(args, job_state):
             save_tensor(original_input_ids, "ckpt_new/original_input_ids.safetensors", args)
             if os.path.exists(ckpt_dir_old):
                 shutil.rmtree(ckpt_dir_old)
-            os.rename(ckpt_dir, ckpt_dir_old)
-            os.rename(ckpt_dir_new, ckpt_dir)
+            rename_checkpoint_dir(ckpt_dir, ckpt_dir_old)
+            rename_checkpoint_dir(ckpt_dir_new, ckpt_dir)
             last_checkpoint_time = time.time()
 
     # Quantize additional modules (uncalibrated side models: MTP head, vision tower)
