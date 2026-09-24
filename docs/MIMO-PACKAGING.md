@@ -1,5 +1,9 @@
 # MiMo step 2: EXL3 candidate packaging and audit
 
+For a separately acquired donor MTP component, use the independent
+[derived-package builder](MIMO-MTP-PACKAGING.md). The original MTP rejection
+and source-preservation contract below remain in force.
+
 `scripts/package_mimo_exl3.py` is a stdlib-only CLI that joins a completed
 MiMo text EXL3 conversion with the step 1 vision preservation pilot into one
 final candidate directory, with an external JSON audit report. It never
