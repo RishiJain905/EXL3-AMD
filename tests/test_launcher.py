@@ -418,6 +418,25 @@ class _FakeTelemetry:
 
 
 class CachePrecisionForwardingTests(unittest.TestCase):
+    def test_vision_options_and_local_image_reach_the_image_consumer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'image with spaces.png'
+            path.write_bytes(b'header-only-launch-test')
+            argv = self._run_and_capture_argv('generate', ['--mmproj','on','--decode-fusions','off',
+                '--image',str(path),'--image-max-pixels','1048576','--prompt','Describe it'])
+        self.assertTrue(argv[1].endswith('generate_multimodal.py'))
+        self.assertEqual(argv[argv.index('--image')+1],launch.linux_path(path))
+        self.assertEqual(argv[argv.index('--mmproj')+1],'on')
+        self.assertEqual(argv[argv.index('--image-max-pixels')+1],'1048576')
+        self.assertNotIn('--suite',argv)
+        self.assertNotIn('--mode',argv)
+
+    def test_vision_startup_selection_reaches_server_and_defaults_off(self):
+        for flags,expected in [([], 'off'),(['--mmproj','on','--decode-fusions','off'],'on')]:
+            argv = self._run_and_capture_argv('serve',flags)
+            self.assertTrue(argv[1].endswith('serve_exl3.py'))
+            self.assertEqual(argv[argv.index('--mmproj')+1],expected)
+
     def test_bf16_and_rowwise_options_reach_both_consumers(self):
         for mode in ('serve', 'speed'):
             with self.subTest(mode=mode):

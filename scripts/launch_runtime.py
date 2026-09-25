@@ -17,6 +17,8 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 GIB = 2**30
+sys.path.insert(0, str(ROOT / 'src'))
+from quantlab.images import validate_vision_options
 
 
 def _cache_precision():
@@ -246,6 +248,9 @@ def parser():
     p.add_argument('--verify-attention', choices=('default','rowwise'), default='default',
                    help='Use one-query target attention during verification; requires F16 KV and off fusions')
     p.add_argument('-p', '--prompt', help='Prompt for generate mode')
+    p.add_argument('--mmproj', choices=('off', 'on'), default='off', help='Load the bundled vision component at startup; default off')
+    p.add_argument('--image', type=Path, action='append', help='Generate: local PNG/JPEG; repeat up to four times; requires --mmproj on')
+    p.add_argument('--image-max-pixels', type=int, default=262144, help='Maximum processed image pixels, up to 1048576')
     p.add_argument('-f', '--file', '--prompt-file', dest='prompt_file', type=Path, help='UTF-8 prompt file for generate mode')
     p.add_argument('-n', '--n-predict', '--max-tokens', dest='max_tokens', type=int, default=256,
                    help='Generation token limit; speed mode uses its fixed 128-token protocol')
@@ -311,6 +316,13 @@ def main():
         raise SystemExit(worker(sys.argv[2]))
     p = parser()
     args = p.parse_args()
+    try:
+        validate_vision_options(args)
+        for path in args.image or []:
+            if not path.is_file():
+                raise ValueError('--image must name a local PNG/JPEG file')
+    except ValueError as exc:
+        p.error(str(exc))
     if args.prefill_chunk is None:
         args.prefill_chunk = 1024 if args.mode == 'serve' else 256
     if args.mode != 'serve':
@@ -369,6 +381,8 @@ def main():
         p.error('Quantized KV cache cannot combine with --native-attention or --draft-step-graph in this integration')
     if args.verify_attention == 'rowwise' and (cache_k, cache_v) != ('f16','f16'):
         p.error('Rowwise verification attention currently requires F16 K/V cache')
+    if args.mmproj == 'on' and (cache_k, cache_v) != ('f16', 'f16'):
+        p.error('Vision currently requires F16 K/V cache')
     if args.config is not None:
         config_path = args.config
         if not config_path.is_file():
@@ -489,7 +503,9 @@ def main():
     if output_path == candidate_path or output_path.startswith(candidate_path+'/') or candidate_path.startswith(output_path+'/'):
         p.error('Output and model must be separate nonnested paths')
     run.mkdir(parents=True, exist_ok=False)
-    entry = 'serve_exl3.py' if args.mode == 'serve' else 'evaluate_exl3_candidate.py'
+    image_generate = args.mode == 'generate' and args.mmproj == 'on'
+    entry = ('serve_exl3.py' if args.mode == 'serve' else
+             'generate_multimodal.py' if image_generate else 'evaluate_exl3_candidate.py')
     argv = [runtime['python'], linux_path(ROOT/'scripts'/entry),
             '--config', linux_path(config_path.resolve()), '--candidate', runtime['candidate'],
             '--source-dir', runtime['source_dir'],
@@ -498,6 +514,10 @@ def main():
             '--decode-fusions', args.decode_fusions, '--native-smallm', '--native-smallm-max-rows',
             str(runtime.get('native_smallm_max_rows',3))]
     argv += ['--prefill-chunk', str(args.prefill_chunk)]
+    if args.mode == 'serve' or image_generate:
+        argv += ['--mmproj', args.mmproj, '--image-max-pixels', str(args.image_max_pixels)]
+    for path in args.image or []:
+        argv += ['--image', linux_path(path.resolve())]
     if args.n_cpu_moe: argv += ['--n-cpu-moe', str(args.n_cpu_moe)]
     if args.cpu_moe != 'off': argv += ['--cpu-moe', args.cpu_moe]
     if args.moe_cpu_threads is not None: argv += ['--moe-cpu-threads', str(args.moe_cpu_threads)]
@@ -516,7 +536,7 @@ def main():
                 '--presence-penalty', str(args.presence_penalty),
                 '--frequency-penalty', str(args.frequency_penalty)]
         if args.seed is not None: argv += ['--seed', str(args.seed)]
-    else:
+    elif not image_generate:
         argv += ['--suite', linux_path(ROOT/'configs/evaluation.json'), '--mode', args.mode]
     if args.decode_fusions != 'off': argv += ['--native-smallm-graph']
     if model_manifest: argv += ['--candidate-manifest',linux_path(model_manifest)]

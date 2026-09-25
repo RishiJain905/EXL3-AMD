@@ -20,6 +20,7 @@ A model-selectable EXL3 inference runtime for AMD GPUs, with a Python CLI and a 
 - FP16, integer Q8 and integer Q4 attention KV caches.
 - Integrated MTP drafting when the model includes compatible weights.
 - Opt-in [BF16 Qwen3.5 MTP projections and sequential verification attention](docs/MIMO-MTP.md), with explicit compatibility limits.
+- Optional [Qwen3.5 vision and image input](docs/VISION.md), with `--mmproj on|off` startup selection and measured image limits.
 - OpenAI Chat Completions tools for recognized Qwen XML and Hermes JSON templates.
 - Configurable resource limits, GPU lease, extension hash checks, offline loading and private artifacts.
 
@@ -35,7 +36,7 @@ EXL3-AMD uses a modified copy of CarouselAether's ROCm port, pinned at `550dcfed
 | KV cache and long context | Inherited packed Q8/Q4 storage, rotation and attention kernels | CLI/server cache selection for target and draft, plus an opt-in Q8 attention scheduling/reduction profile with explicit GPU, shape and context guards. |
 | Conversion and native builds | ExLlamaV3's converter and the ROCm build system | K2 encoder shared-memory repairs, memory-bounded conversion buffers, Qwen text/source adaptation, build compatibility fixes and guarded object reuse. |
 | CLI and installation | Upstream model loading, tokenization and generation | The `run.py` interface with familiar `-m`, `-c` and MTP flags; model-independent installation registration; extension verification, GPU ownership, configurable resource monitoring and private run artifacts. |
-| Serving and function tools | An [HTTP server already exists upstream](vendor/rocm-exl3/rocm_tools/exl3_server/README.md); its disconnect/stream-cleanup design informed this work | Our text-only HTTP adapter, serialized request lifecycle, Qwen XML/Hermes JSON tool parsing, structured responses, validation and recoverable malformed-tool errors. Persistent serving has no overall lifetime cap. |
+| Serving and function tools | An [HTTP server already exists upstream](vendor/rocm-exl3/rocm_tools/exl3_server/README.md); its disconnect/stream-cleanup design informed this work | Our HTTP adapter, optional Qwen3.5 image input, serialized request lifecycle, Qwen XML/Hermes JSON tool parsing, structured responses, validation and recoverable malformed-tool errors. Persistent serving has no overall lifetime cap. |
 | Measurements and verification | Upstream operators, model/runtime interfaces and evaluation utilities | Independent packed-weight/operator checks, model and HTTP regression fixtures, occupied-context checks, and corrected MTP throughput accounting that groups tokens by emitting GPU iteration. |
 
 The implementation is in [scripts](scripts/), [src/quantlab](src/quantlab/), [kernel work](kernels/exl3/README.md) and the modified [vendored backend](vendor/rocm-exl3/). [UPSTREAMS.md](docs/UPSTREAMS.md) gives component-level credit and source references.
@@ -97,6 +98,7 @@ The server has no overall lifetime timeout. Explicit shutdown and resource/error
 | `-c / --ctx-size` | Total context; default 4096, minimum 1024, multiple of 256 |
 | `-n / --n-predict` | Generate-mode output limit, 1–8192 |
 | `-p / --prompt`, `-f / --file` | Prompt text or UTF-8 file |
+| `--mmproj off\|on`, `--image`, `--image-max-pixels` | Optional bundled Qwen3.5 vision; [inputs, startup selection and limits](docs/VISION.md) |
 | `--cache-type f16\|q8\|q4` | Both KV precisions; default f16 |
 | `-ctk`, `-ctv` | Separate K/V precision; both quantized or both f16 |
 | `--spec-type draft-mtp` | Integrated MTP; drafting is off by default |

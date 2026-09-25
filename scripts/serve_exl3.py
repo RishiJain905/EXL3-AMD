@@ -34,6 +34,11 @@ class Engine:
 
     def __init__(self, args):
         self.args = args
+        from quantlab.images import validate_vision_options
+        validate_vision_options(args)
+        self.vision_enabled = getattr(args, 'mmproj', 'off') == 'on'
+        self.vision = None
+        self.vision_status = dict(enabled=False, loaded=False)
         self.model_name = args.alias or 'exl3'
         self.context = args.context
         self.draft_confidence = args.draft_confidence
@@ -52,6 +57,10 @@ class Engine:
             self.cache_k, self.cache_v = _cache_precision().resolve_cache_types(args)
         except ValueError as exc:
             raise ValueError('Invalid cache precision: ' + str(exc))
+        if self.vision_enabled and (self.cache_k, self.cache_v) != ('f16', 'f16'):
+            raise ValueError('Vision currently requires F16 K/V cache')
+        if getattr(args, 'mtp_dtype', 'fp16') == 'bf16' and not args.mtp:
+            raise ValueError('BF16 MTP requires an enabled MTP draft')
         self.ready = False
         self.active = False
         self.started = self.completed = self.cancelled = self.failed = 0
@@ -141,6 +150,9 @@ class Engine:
         else:
             cfg = Config.from_directory(str(args.candidate))
         self.cfg = cfg
+        if self.vision_enabled:
+            from quantlab.methods.exl3.vision import configure_vision
+            self.vision_status = configure_vision(cfg, args.candidate, args.image_max_pixels)
         self._apply_cpu_moe(args, raw)
         max_context = raw.get('text_config', raw).get('max_position_embeddings')
         if max_context is None or args.context > max_context:
@@ -209,6 +221,19 @@ class Engine:
                 from quantlab.methods.exl3.cached_projection import cache_mtp_projections
                 self.optimizations['mtp_projection_cache'] = cache_mtp_projections(self.draft, args.cache_mtp)
         self.record('optimizations', **self.optimizations)
+        if self.vision_enabled:
+            self.vision = Model.from_config(cfg, component='vision')
+            before = self.memory()['allocated_bytes']
+            read_before = cfg.stc.metrics.bytes_loaded
+            with torch.inference_mode():
+                self.vision.load(device='cuda:0')
+                for module in self.vision.modules:
+                    prepare_loaded_module(module)
+            torch.cuda.synchronize()
+            self.vision_status.update(loaded=True,
+                allocated_delta_bytes=self.memory()['allocated_bytes'] - before,
+                loader_bytes=cfg.stc.metrics.bytes_loaded - read_before)
+        self.record('vision', **self.vision_status, allocator=self.memory())
         self.tokenizer = Tokenizer.from_config(cfg)
         self.tokenizer.hf_tokenizer = AutoTokenizer.from_pretrained(
             args.candidate, local_files_only=True, trust_remote_code=False)
@@ -320,6 +345,7 @@ class Engine:
                     reasoning=self.reasoning, reasoning_format=self.reasoning_format,
                     prefix_cache=self._prefix_status(),
                     prefill_chunk=self.chunk_size,
+                    vision=getattr(self, 'vision_status', dict(enabled=False, loaded=False)),
                     prefill_gemm=getattr(self.args, 'prefill_gemm', 'blas'),
                     attention_profile=_cache_precision().attention_profile_status())
 
@@ -346,6 +372,18 @@ class Engine:
     def prepare(self, *, messages=None, prompt=None, max_tokens=256,
                 tools=None, tool_choice=None, parallel_tool_calls=True,
                 sampling=None, template_kwargs=None):
+        from quantlab.methods.exl3.vision import close_images
+        images = []
+        try:
+            return self._prepare(messages=messages, prompt=prompt, max_tokens=max_tokens,
+                tools=tools, tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls,
+                sampling=sampling, template_kwargs=template_kwargs, images=images)
+        except BaseException:
+            close_images(images)
+            raise
+
+    def _prepare(self, *, messages, prompt, max_tokens, tools, tool_choice,
+                 parallel_tool_calls, sampling, template_kwargs, images):
         if not self.ready:
             raise ValueError('Engine requires restart after a generation failure')
         policy = None
@@ -363,6 +401,11 @@ class Engine:
         if template_kwargs and template_kwargs.get('enable_thinking') is not None:
             thinking = bool(template_kwargs['enable_thinking'])
         render_kwargs = {} if thinking is None else dict(enable_thinking=thinking)
+        if messages is not None and any(isinstance(m.get('content'), list) for m in messages):
+            from quantlab.methods.exl3.vision import prepare_images
+            messages, decoded = prepare_images(messages, self.cfg,
+                                               enabled=getattr(self, 'vision_enabled', False))
+            images.extend(decoded)
         if messages is not None:
             if tools is not None or tool_choice is not None:
                 from quantlab.tool_calls import prepare_tools
@@ -384,12 +427,21 @@ class Engine:
             rendered = prompt
             recognize_reasoning = False
             split_reasoning, prefix_open = False, False  # raw completions stay raw
-        ids = self.tokenizer.encode(rendered, add_bos=False, add_eos=False, encode_special_tokens=True)
+        if images:
+            from quantlab.methods.exl3.vision import provisional_image_prompt
+            counted = provisional_image_prompt(rendered, images, self.tokenizer, self.cfg)
+        else:
+            counted = rendered
+        ids = self.tokenizer.encode(counted, add_bos=False, add_eos=False, encode_special_tokens=True)
         if ids.numel() < 1:
             raise ValueError('Prompt must encode at least one token')
         if ids.numel() + max_tokens + self.depth + 8 > self.context:
+            if images:
+                from quantlab.methods.exl3.vision import close_images
+                close_images(images)
             raise ValueError('Prompt plus output and draft reserve exceeds configured context')
         return dict(ids=ids, max_tokens=max_tokens, tool_policy=policy, sampling=params,
+                    images=images, rendered=rendered,
                     split_reasoning=split_reasoning, prefix_open=prefix_open,
                     recognize_reasoning=recognize_reasoning)
 
@@ -424,6 +476,29 @@ class Engine:
             from quantlab.reasoning import ReasoningSplitter
             splitter = ReasoningSplitter(prefix_open=prepared.get('prefix_open', False))
         try:
+            embeddings = []
+            if prepared.get('images'):
+                from quantlab.methods.exl3.vision import close_images
+                try:
+                    for item in prepared['images']:
+                        await asyncio.sleep(0)
+                        embedding = self.vision.get_image_embeddings(self.tokenizer,
+                            item['image'], text_alias=item['alias'])
+                        if embedding.mm_length != item['tokens'] or not self.torch.isfinite(embedding.embeddings).all():
+                            raise RuntimeError('Image embedding length or finite-value check failed')
+                        embeddings.append(embedding)
+                        self.record('image_encoded', serial=serial, sha256=item['sha256'],
+                            image_tokens=embedding.mm_length, grid_thw=embedding.grid_thw,
+                            original_size=item['image'].size, preprocessed_size=item['size'],
+                            allocator=self.memory())
+                    ids = self.tokenizer.encode(prepared['rendered'], add_bos=False, add_eos=False,
+                                                encode_special_tokens=True, embeddings=embeddings)
+                    if ids.numel() != prepared['ids'].numel():
+                        raise RuntimeError('Image token count differs from context preflight')
+                    prepared['ids'] = ids
+                finally:
+                    close_images(prepared['images'])
+                    prepared['images'] = []
             params = dict(DEFAULTS)
             params.update(prepared.get('sampling') or {})
             sampler = build_sampler(params, ArgmaxSampler=self.Sampler, ComboSampler=self.ComboSampler)
@@ -451,7 +526,8 @@ class Engine:
             # This upstream pin subtracts one in Job.__init__ and draft depth at EOS.
             job = self.Job(input_ids=prepared['ids'], max_new_tokens=prepared['max_tokens']+1+self.depth,
                            sampler=sampler, seed=params.get('seed'), stop_conditions=self.cfg.eos_token_id_list,
-                           token_healing=False, return_logits=False)
+                           token_healing=False, return_logits=False,
+                           **(dict(embeddings=embeddings) if embeddings else {}))
             original_prefill = job.prefill
             def checked_prefill(results):
                 nonlocal prefill_seconds, prefill_tokens, prefill_done_at, prefill_computed
@@ -635,6 +711,7 @@ class Engine:
                     # reusable state; the next request rebuilds from scratch.
                     self._release_generator(gen)
                 gen = job = batch = event = original_prefill = None
+                embeddings = []
                 gc.collect()  # Generator/job cycles must not retain per-request state.
                 self.active = False
                 decode_seconds = timing.decode_seconds()
@@ -703,6 +780,8 @@ def parser():
     p.add_argument('--expected-extension-sha256', required=True)
     p.add_argument('--context', type=int, default=4096)
     p.add_argument('--mtp', action='store_true')
+    p.add_argument('--mmproj', choices=('off', 'on'), default='off', help='Load the bundled vision component at startup')
+    p.add_argument('--image-max-pixels', type=int, default=262144, help='Maximum processed image pixels, up to 1048576')
     p.add_argument('--draft-tokens', type=int, choices=range(1, 9), default=4)
     p.add_argument('--mtp-dtype', choices=('fp16','bf16'), default='fp16')
     p.add_argument('--verify-attention', choices=('default','rowwise'), default='default')
@@ -780,6 +859,11 @@ def reserve_socket(host, port):
 def main():
     p = parser()
     args = p.parse_args()
+    from quantlab.images import validate_vision_options
+    try:
+        validate_vision_options(args)
+    except ValueError as exc:
+        p.error(str(exc))
     if args.mtp_dtype == 'bf16' and (not args.mtp or args.decode_fusions != 'off'
             or args.native_attention or args.draft_step_graph or args.cache_mtp != 'off'):
         p.error('BF16 MTP requires MTP, off decode fusions, and no native attention/draft graph/projection cache')

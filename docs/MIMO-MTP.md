@@ -3,7 +3,8 @@
 This experimental path targets the MiMo 5.0/H6 mul1 package with the separately
 packaged, one-layer Qwen3.5-9B MTP donor. Model files are unchanged. It does not
 establish compatibility with other MTP architectures or improve the target's
-quantization quality. Vision/mmproj work is separate.
+quantization quality. Optional [vision/mmproj support](VISION.md) has its own
+input, memory and validation limits.
 
 ## BF16 means weights and draft projections
 
