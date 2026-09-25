@@ -91,8 +91,14 @@ python -m unittest discover -s tests -p test_mimo_mtp_package.py -v
 
 After packaging, the experiment still needs an independent fresh runtime load,
 finite target/draft logits, MTP-off/on output parity, recurrent rollback/stopping
-coverage and matched speed/memory measurements. MiMo step-4 preparation does
-not yet provide that GPU evidence.
+coverage and matched speed/memory measurements. The packaging report alone
+does not provide that GPU evidence.
+
+The [MiMo step-4 execution report](https://github.com/RishiJain905/QuantizationResearch/blob/codex/mimo-step4-20260924/reports/QEXP-002/QEXP-002-20260924T202616Z-agent-mimo-step4-d31c6e63/execution-report.md)
+records the actual follow-up: preserved MTP-off outputs and a passing eight-token
+MTP smoke, followed by a reproduced longer depth-1 token mismatch at a target-score
+tie. MTP is not qualified for deployment from this result; speed/confirmation
+were not reached. The original package remains available with MTP off.
 
 `scripts/mimo_mtp_evaluation.py compare` independently checks complete evaluator
 records for identical inputs, generated token IDs, stopping reasons and protocol
