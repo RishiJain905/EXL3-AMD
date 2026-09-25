@@ -69,8 +69,13 @@ come from the loaded binary; a Python flag alone cannot add kernel support.
 The implementation reuses the inherited EXL3 decoder, Hadamard transforms and
 dot accumulation; it introduces no new quantized representation.
 
-Hardware qualification and measured speed are recorded in the MiMo research
-report. Do not infer a speedup from draft acceptance, kernel availability or
+On RX 7800 XT with this target and F16 context 4096, shared BF16 depth 2
+passes all 662 selection IDs/stops, 790 unused-family confirmation IDs/stops
+and 795 thinking-mode confirmation IDs/stops. Its confirmed warmed request
+speed ratio is 1.5043×; peak adapter allocation is 7.263 GiB versus 6.320 GiB
+for MTP off. Depth 4 tied on selection speed, so depth 2 was locked before
+confirmation. These are measured short-context, greedy CLI-evaluator results,
+not HTTP or broad model-quality qualification. [Research report and evidence](https://github.com/RishiJain905/QuantizationResearch/blob/codex/mimo-mtpopt-20260925/reports/QEXP-002/QEXP-002-20260925T004303Z-agent-mimo-mtpopt-b0627d23/execution-report.md). Do not infer a speedup from draft acceptance, kernel availability or
 the BF16 precision choice alone.
 
 ## Controls
@@ -81,8 +86,10 @@ The supported precision/verification combination is:
 --mtp 2 --mtp-dtype bf16 --verify-attention rowwise --decode-fusions off --cache-type f16
 ```
 
-These are public `run.py` arguments. Direct evaluator/server entry points use
-`--mtp --draft-tokens 2`. Native shared projections additionally require a
-qualified extension and `--native-smallm --native-smallm-max-rows 5` with dot
-mode. Use an explicitly selected local model and verified installation record.
+These are public `run.py` arguments. Its launch worksheet must select the
+qualified extension and set `runtime.native_smallm_max_rows = 5`; the public
+launcher enables native small-M dispatch automatically. The direct evaluator
+and server instead use `--mtp --draft-tokens 2` and
+`--native-smallm --native-smallm-max-rows 5`. Use dot mode, an explicitly selected
+local model and the verified launch worksheet.
 No global installation or default model was changed by the experiment.
