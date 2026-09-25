@@ -33,8 +33,19 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
         if hgemm_abi != 1:
             raise ValueError('Unsupported prefill GEMM ABI')
     codebooks = [0]
+    highbit_abi = None
     if native_smallm:
         library = ctypes.CDLL(str(binary))
+        try:
+            highbit = library.quantlab_exl3_smallm_highbit_abi
+        except AttributeError:
+            pass
+        else:
+            highbit.argtypes = []
+            highbit.restype = ctypes.c_int
+            highbit_abi = highbit()
+            if highbit_abi != 1:
+                raise ValueError('Unsupported native small-M high-bit ABI')
         try:
             capability = library.quantlab_exl3_smallm_codebooks
         except AttributeError:
@@ -54,7 +65,7 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
         os.environ['EXL3_SMALLM_HEAD_WARPS'] = str(head_warps)
     return dict(smallm_kernel=smallm_kernel, head_warps=head_warps, optimization_abi=abi,
                 prefill_gemm=prefill_gemm, prefill_gemm_abi=hgemm_abi,
-                smallm_codebooks=codebooks)
+                smallm_codebooks=codebooks, smallm_highbit_abi=highbit_abi)
 
 
 def install_optimizations(model, draft, *, gpu_embedding=False, batch_greedy=False,

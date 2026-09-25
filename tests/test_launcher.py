@@ -151,6 +151,22 @@ class LeaseTests(unittest.TestCase):
 
 
 class MainRejectionTests(unittest.TestCase):
+    def test_mtp_precision_and_attention_dependencies_reject_before_launch(self):
+        invalid = (
+            ['--mtp-dtype', 'bf16'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--decode-fusions', 'gdn'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--native-attention'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--cache-mtp', 'fc'],
+            ['--verify-attention', 'rowwise', '--native-attention'],
+            ['--verify-attention', 'rowwise', '--decode-fusions', 'gdn'],
+            ['--verify-attention', 'rowwise', '--cache-type', 'q8'],
+        )
+        for flags in invalid:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._assert_rejects(['launch', 'speed', '--config', str(root/'missing.toml'),
+                                      '--output', str(root/'out'), *flags], root/'out')
+
     def test_gpu_draft_dependencies_rejected_before_config_access(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)/'out'
@@ -402,6 +418,17 @@ class _FakeTelemetry:
 
 
 class CachePrecisionForwardingTests(unittest.TestCase):
+    def test_bf16_and_rowwise_options_reach_both_consumers(self):
+        for mode in ('serve', 'speed'):
+            with self.subTest(mode=mode):
+                argv = self._run_and_capture_argv(mode, ['--mtp', '2', '--mtp-dtype', 'bf16',
+                    '--verify-attention', 'rowwise', '--decode-fusions', 'off'])
+                self.assertEqual(argv[argv.index('--mtp-dtype') + 1], 'bf16')
+                self.assertEqual(argv[argv.index('--verify-attention') + 1], 'rowwise')
+                defaults = self._run_and_capture_argv(mode, [])
+                self.assertNotIn('--mtp-dtype', defaults)
+                self.assertNotIn('--verify-attention', defaults)
+
     def _write_full_config(self, path, lease_file):
         path.write_text("\n".join([
             "[execution]", "allow_local_inference = true", "allow_backend_probes = true",

@@ -241,6 +241,10 @@ def parser():
                    help='Draft tokens per verification; 0 disables MTP')
     p.add_argument('--spec-type', choices=('none','draft-mtp'), default=None,
                    help='Integrated MTP drafting; no separate draft model required')
+    p.add_argument('--mtp-dtype', choices=('fp16','bf16'), default='fp16',
+                   help='Dense MTP projections: BF16 preserves original weights; requires off decode fusions')
+    p.add_argument('--verify-attention', choices=('default','rowwise'), default='default',
+                   help='Use one-query target attention during verification; requires F16 KV and off fusions')
     p.add_argument('-p', '--prompt', help='Prompt for generate mode')
     p.add_argument('-f', '--file', '--prompt-file', dest='prompt_file', type=Path, help='UTF-8 prompt file for generate mode')
     p.add_argument('-n', '--n-predict', '--max-tokens', dest='max_tokens', type=int, default=256,
@@ -335,6 +339,11 @@ def main():
         p.error('--spec-type draft-mtp conflicts with zero draft tokens')
     if args.mtp is None:
         args.mtp = 2 if args.spec_type == 'draft-mtp' else 0
+    if args.mtp_dtype == 'bf16' and (not args.mtp or args.decode_fusions != 'off'
+            or args.native_attention or args.draft_step_graph or args.cache_mtp != 'off'):
+        p.error('BF16 MTP requires MTP, off decode fusions, and no native attention/draft graph/projection cache')
+    if args.verify_attention == 'rowwise' and (args.decode_fusions != 'off' or args.native_attention):
+        p.error('Rowwise verification attention requires off decode fusions and no native attention')
     if args.draft_step_graph and (not args.gpu_draft_metadata or args.shortlist_groups or args.draft_confidence is not None):
         p.error('Draft step graph requires GPU draft metadata, fixed MTP, and full draft head')
     if args.shortlist_groups and (not args.mtp or args.draft_confidence is not None):
@@ -358,6 +367,8 @@ def main():
         p.error(str(exc))
     if (cache_k, cache_v) != ('f16', 'f16') and (args.native_attention or args.draft_step_graph):
         p.error('Quantized KV cache cannot combine with --native-attention or --draft-step-graph in this integration')
+    if args.verify_attention == 'rowwise' and (cache_k, cache_v) != ('f16','f16'):
+        p.error('Rowwise verification attention currently requires F16 K/V cache')
     if args.config is not None:
         config_path = args.config
         if not config_path.is_file():
@@ -510,6 +521,8 @@ def main():
     if args.decode_fusions != 'off': argv += ['--native-smallm-graph']
     if model_manifest: argv += ['--candidate-manifest',linux_path(model_manifest)]
     if args.mtp: argv += ['--mtp','--draft-tokens',str(args.mtp)]
+    if args.mtp_dtype != 'fp16': argv += ['--mtp-dtype',args.mtp_dtype]
+    if args.verify_attention != 'default': argv += ['--verify-attention',args.verify_attention]
     if args.draft_confidence is not None: argv += ['--draft-confidence', str(args.draft_confidence)]
     if args.warps: argv += ['--gemv-splitk-warps',str(args.warps)]
     argv += ['--smallm-kernel',args.smallm_kernel]

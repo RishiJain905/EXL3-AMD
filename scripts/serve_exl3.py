@@ -147,7 +147,8 @@ class Engine:
             raise ValueError('Requested context exceeds or lacks model metadata limit')
         install(cfg, native_smallm=args.native_smallm, native_smallm_max_rows=args.native_smallm_max_rows,
                 native_attention=args.native_attention,
-                native_smallm_codebooks=native_options['smallm_codebooks'])
+                native_smallm_codebooks=native_options['smallm_codebooks'],
+                native_smallm_highbit=native_options['smallm_highbit_abi'] == 1)
         _say('stage=load model=1')
         self.model = Model.from_config(cfg)
         self.draft = Model.from_config(cfg, component='mtp') if args.mtp else None
@@ -188,6 +189,12 @@ class Engine:
             self.optimizations = install_optimizations(self.model, self.draft,
                 gpu_embedding=args.gpu_embedding, batch_greedy=args.batch_greedy,
                 gpu_draft=args.gpu_draft, gpu_draft_metadata=args.gpu_draft_metadata)
+            if getattr(args, 'mtp_dtype', 'fp16') == 'bf16':
+                from quantlab.methods.exl3.mtp_precision import preserve_mtp_bf16
+                self.optimizations['mtp_precision'] = preserve_mtp_bf16(self.draft)
+            if getattr(args, 'verify_attention', 'default') == 'rowwise':
+                from quantlab.methods.exl3.verifier_attention import install_rowwise_verifier_attention
+                self.optimizations['verifier_attention'] = install_rowwise_verifier_attention(self.model)
             if args.draft_step_graph:
                 from quantlab.methods.exl3.draft_graph import DraftStepGraph
                 self.model.quantlab_draft_step = DraftStepGraph(self.draft)
@@ -697,6 +704,8 @@ def parser():
     p.add_argument('--context', type=int, default=4096)
     p.add_argument('--mtp', action='store_true')
     p.add_argument('--draft-tokens', type=int, choices=range(1, 9), default=4)
+    p.add_argument('--mtp-dtype', choices=('fp16','bf16'), default='fp16')
+    p.add_argument('--verify-attention', choices=('default','rowwise'), default='default')
     p.add_argument('--draft-confidence', type=float, default=None,
                    help='Adaptive MTP truncation target acceptance in (0,1); requires MTP')
     p.add_argument('--decode-fusions', choices=('off', 'gdn', 'gdn-mlp'), default='gdn')
@@ -771,6 +780,11 @@ def reserve_socket(host, port):
 def main():
     p = parser()
     args = p.parse_args()
+    if args.mtp_dtype == 'bf16' and (not args.mtp or args.decode_fusions != 'off'
+            or args.native_attention or args.draft_step_graph or args.cache_mtp != 'off'):
+        p.error('BF16 MTP requires MTP, off decode fusions, and no native attention/draft graph/projection cache')
+    if args.verify_attention == 'rowwise' and (args.decode_fusions != 'off' or args.native_attention):
+        p.error('Rowwise verification attention requires off decode fusions and no native attention')
     try:
         _resources().validate_fraction(args.gpu_memory_fraction, '--gpu-memory-fraction')
     except ValueError as exc:
@@ -798,6 +812,8 @@ def main():
         p.error(str(exc))
     if (cache_k, cache_v) != ('f16', 'f16') and (args.native_attention or args.draft_step_graph):
         p.error('Quantized KV cache cannot combine with --native-attention or --draft-step-graph in this integration')
+    if args.verify_attention == 'rowwise' and (cache_k, cache_v) != ('f16', 'f16'):
+        p.error('--verify-attention rowwise requires F16 KV cache')
     config = tomllib.loads(args.config.read_text())
     if not all(config['execution'].get(k) is True for k in
                ('allow_local_inference', 'allow_backend_probes')):

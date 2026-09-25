@@ -138,9 +138,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tokens", type=int, choices=(8, 32), default=8)
     parser.add_argument("--mtp", action="store_true")
+    parser.add_argument("--mtp-dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--gpu-budget-gib", type=float, default=12)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
+    if args.mtp_dtype == 'bf16' and not args.mtp:
+        parser.error('--mtp-dtype bf16 requires --mtp')
     if not 0 < args.gpu_budget_gib <= 14:
         parser.error("--gpu-budget-gib must be positive and at most 14")
     config_file = tomllib.loads(args.config.read_text())
@@ -240,6 +243,9 @@ def main():
         model.load(device="cuda:0")
         for module in model.modules:
             prepare_loaded_module(module)
+        if args.mtp_dtype == 'bf16':
+            from quantlab.methods.exl3.mtp_precision import preserve_mtp_bf16
+            status['mtp_precision'] = preserve_mtp_bf16(draft)
         torch.cuda.synchronize()
         status["load_seconds"] = time.monotonic() - load_started
         status["embedding_device"] = str(model.modules[0].embedding.weight.device)

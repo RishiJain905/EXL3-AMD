@@ -37,6 +37,24 @@ class Tensor:
 
 
 class CompatTests(unittest.TestCase):
+    def test_highbit_requires_capability_mul1_dot_and_supported_rows(self):
+        from quantlab.methods.exl3.compat import smallm_supported
+        layer = SimpleNamespace(K=5, mcg=False, mul1=True, in_features=128, out_features=256,
+                                _quantlab_smallm_codebooks=(0,2), _quantlab_smallm_highbit=True)
+        with patch.dict(os.environ, {'EXL3_SMALLM_WMMA': '0'}):
+            for rows in (2,3,5):
+                self.assertTrue(smallm_supported(layer, rows))
+            for rows in (None,1,4,6,7,8,9):
+                self.assertFalse(smallm_supported(layer, rows))
+            layer._quantlab_smallm_highbit = False
+            self.assertFalse(smallm_supported(layer, 2))
+            layer._quantlab_smallm_highbit = True
+            layer.mul1 = False
+            self.assertFalse(smallm_supported(layer, 2))
+            layer.mul1 = True
+        with patch.dict(os.environ, {'EXL3_SMALLM_WMMA': '1'}):
+            self.assertFalse(smallm_supported(layer, 2))
+
     def setUp(self):
         class Module:
             def __init__(self, *children):

@@ -8,7 +8,8 @@ its actual SHA-256 to use these changes. Historical kernel copies and patches in
 
 `mul1` is an EXL3 codebook: a multiply-based mapping from packed codes to
 reconstructed weight values. Bits per weight are configured separately; this
-runtime's fused mul1 path handles 2-, 3- and 4-bit packed projections.
+runtime's general fused mul1 path handles 2-, 3- and 4-bit packed projections.
+The separately advertised K5/K6 dot extension is described below.
 See [real-model measurements](MUL1-VALIDATION.md) for the completed 9.402 GB
 conversion, repeated inference, occupied 120K tests and observed quality limits.
 
@@ -42,6 +43,22 @@ native graphs are admitted only when every packed projection in the module is
 supported by the verified binary. Optimization ABI 2 stays
 unchanged. `mcg` (`cb1`), other bit widths and unsupported shapes retain their
 existing fallback; this change does not expand their fused small-M envelope.
+
+### Bounded K5/K6 mul1 extension
+
+An extension exporting `quantlab_exl3_smallm_highbit_abi() == 1` additionally
+admits mul1 K5/K6 dot projections at exactly 2/3/5 rows. Input/output widths
+must be positive multiples of 128. FP16/FP32 output and the existing 1/4/8/16
+warp choices are supported. This does not add K5/K6 WMMA, multirow fusion-graph
+admission, other codebooks or arbitrary row widths. Python dispatch checks the
+verified binary's ABI and falls back for unsupported combinations.
+
+The gfx1101 build passed 96 RX 7800 XT packed-matrix checks: synthetic and real
+MiMo body/head slices, independently decoded CPU weights, FP64 matrix references,
+output guards, all supported rows/warps/dtypes. All 96 outputs also matched the
+existing one-row native kernel exactly. These are operator checks, not proof
+of full-model quality or a general speedup. See [MiMo MTP](MIMO-MTP.md) for the
+separate full-model qualification and precision constraints.
 
 ## RDNA4 implementation
 

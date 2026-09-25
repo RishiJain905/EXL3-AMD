@@ -150,10 +150,14 @@ static void exl3_smallm_launch_typed(const half* a, const uint16_t* b, void* c,
         dim3(256), 0, stream, c, c, svh, n, nullptr);
 }
 
+#include "rdna-smallm-highbit.hip.h"
+
 static bool exl3_smallm_try_launch(const half* a, const uint16_t* b, void* c,
     int m, int k, int n, int bits, int cb, bool fp32,
     const half* suh, half* ah, const half* svh, cudaStream_t stream)
 {
+    if (bits == 5 || bits == 6)
+        return exl3_smallm_highbit_try(a,b,c,m,k,n,bits,cb,fp32,suh,ah,svh,stream);
     const char* flag = std::getenv("EXL3_SMALLM");
     if (!flag || atoi(flag) != 1 || (m < 2 || m > 9) || (cb != 0 && cb != 2) ||
         bits < 2 || bits > 4 || k % 128 || n % 128 || !suh || !ah || !svh)

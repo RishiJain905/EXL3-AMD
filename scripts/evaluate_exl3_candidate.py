@@ -91,6 +91,10 @@ def parser():
     p.add_argument('--gpu-draft-metadata', action='store_true')
     p.add_argument('--context', type=int, default=4096)
     p.add_argument('--mtp', action='store_true')
+    p.add_argument('--mtp-dtype', choices=('fp16', 'bf16'), default='fp16',
+                   help='Dense MTP projection weight/compute dtype; BF16 keeps existing mixed-precision interfaces')
+    p.add_argument('--verify-attention', choices=('default', 'rowwise'), default='default',
+                   help='Experimental one-query attention during short target verification')
     p.add_argument('--draft-tokens', type=int, choices=range(1, 9), default=2)
     p.add_argument('--draft-confidence', type=float, default=None,
                    help='Adaptive MTP truncation target acceptance in (0,1); requires MTP')
@@ -118,6 +122,11 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    if args.mtp_dtype == 'bf16' and (not args.mtp or args.decode_fusions != 'off'
+            or args.native_attention or args.draft_step_graph or args.cache_mtp != 'off'):
+        p.error('BF16 MTP requires MTP, off decode fusions, and no native attention/draft graph/projection cache')
+    if args.verify_attention == 'rowwise' and (args.decode_fusions != 'off' or args.native_attention):
+        p.error('Rowwise verification attention requires off decode fusions and no native attention')
     if args.enable_thinking and (args.mode != 'quality' or not args.validation_protocol):
         p.error('--enable-thinking requires quality mode and a frozen validation protocol')
     if args.mode == 'logprobs' and (not args.teacher_forced_protocol or args.mtp):
@@ -155,6 +164,8 @@ def main():
         p.error(str(exc))
     if (cache_k, cache_v) != ('f16', 'f16') and (args.native_attention or args.draft_step_graph):
         p.error('Quantized KV cache cannot combine with --native-attention or --draft-step-graph in this integration')
+    if args.verify_attention == 'rowwise' and (cache_k, cache_v) != ('f16','f16'):
+        p.error('Rowwise verification attention currently requires F16 K/V cache')
     if args.mode == 'generate' and (args.prompt_file is None or not 1 <= args.max_tokens <= 8192):
         p.error('generate requires --prompt-file and --max-tokens in [1,8192]')
     if args.native_smallm_graph and (not args.native_smallm or args.decode_fusions not in ('gdn', 'gdn-mlp')):
@@ -320,7 +331,8 @@ def main():
             raise ValueError('Requested context exceeds or lacks model metadata limit')
         install(cfg, native_smallm=args.native_smallm, native_smallm_max_rows=args.native_smallm_max_rows,
                 native_attention=args.native_attention,
-                native_smallm_codebooks=status['native_optimizations']['smallm_codebooks'])
+                native_smallm_codebooks=status['native_optimizations']['smallm_codebooks'],
+                native_smallm_highbit=status['native_optimizations']['smallm_highbit_abi'] == 1)
         record('gemv_environment', values={k: os.environ.get(k) for k in (
             'EXL3_GEMV', 'EXL3_GEMV_SPLITK', 'EXL3_GEMV_SPLITK_WARPS',
             'EXL3_GEMV_LDS', 'EXL3_GEMV_GRAPH', 'EXL3_MGEMV',
@@ -352,6 +364,12 @@ def main():
         model.load(device='cuda:0')
         for module in model.modules:
             prepare(module)
+        if args.mtp_dtype == 'bf16':
+            from quantlab.methods.exl3.mtp_precision import preserve_mtp_bf16
+            status['mtp_precision'] = preserve_mtp_bf16(draft)
+        if args.verify_attention == 'rowwise':
+            from quantlab.methods.exl3.verifier_attention import install_rowwise_verifier_attention
+            status['verifier_attention'] = install_rowwise_verifier_attention(model)
         from quantlab.methods.exl3.optimizations import install_optimizations
         status['optimizations'] = install_optimizations(model, draft,
             gpu_embedding=args.gpu_embedding, batch_greedy=args.batch_greedy,

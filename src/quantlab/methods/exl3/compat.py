@@ -10,11 +10,16 @@ import sys
 from functools import wraps
 
 
-def smallm_supported(layer):
-    """Match the verified binary's K2/3/4 codebook and shape envelope."""
+def smallm_supported(layer, rows=None):
+    """Match the verified binary's codebook, bit width and row envelope."""
     mul1 = getattr(layer, "mul1", None)
     codebook = 2 if mul1 is True else 0
-    return (getattr(layer, "K", None) in (2, 3, 4)
+    bits = getattr(layer, "K", None)
+    bit_support = bits in (2, 3, 4) or (
+        bits in (5, 6) and mul1 is True and rows in (2, 3, 5)
+        and getattr(layer, '_quantlab_smallm_highbit', False)
+        and os.environ.get('EXL3_SMALLM_WMMA', '0') == '0')
+    return (bit_support
             and getattr(layer, "mcg", True) is False
             and (mul1 is True or mul1 is False)
             and codebook in getattr(layer, "_quantlab_smallm_codebooks", (0,))
@@ -24,7 +29,7 @@ def smallm_supported(layer):
 
 
 def install(config, *, native_smallm=False, native_smallm_max_rows=3, native_attention=False,
-            native_smallm_codebooks=(0,)):
+            native_smallm_codebooks=(0,), native_smallm_highbit=False):
     """Use safe fallback, optionally with the separately built small-M binary.
 
     The caller must verify the experimental binary hash before enabling this.
@@ -49,6 +54,7 @@ def install(config, *, native_smallm=False, native_smallm_max_rows=3, native_att
     # Like the existing dispatch switches, capabilities are process-local and
     # refreshed on every install, including after the wrapper already exists.
     LinearEXL3._quantlab_smallm_codebooks = codebooks
+    LinearEXL3._quantlab_smallm_highbit = native_smallm_highbit
 
     # Mode 2 accepts every eligible GEMV shape instead of declining to GEMM
     # based on profitability. This is re-read by the pinned native dispatcher.
@@ -81,7 +87,7 @@ def install(config, *, native_smallm=False, native_smallm_max_rows=3, native_att
         max_rows = int(os.environ.get('EXL3_SMALLM_MAX_ROWS', '3')) if os.environ.get('EXL3_SMALLM') == '1' else 3
         if rows > max_rows:
             return original(self, x, {**params, "reconstruct": True}, out_dtype)
-        if os.environ.get("EXL3_SMALLM") == "1" and smallm_supported(self):
+        if os.environ.get("EXL3_SMALLM") == "1" and smallm_supported(self, rows):
             self._quantlab_smallm_calls = getattr(self, "_quantlab_smallm_calls", 0) + 1
             return original(self, x, params, out_dtype)
 

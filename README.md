@@ -19,6 +19,7 @@ A model-selectable EXL3 inference runtime for AMD GPUs, with a Python CLI and a 
 - Generation, speed/quality checks, occupied-context measurements and persistent serving.
 - FP16, integer Q8 and integer Q4 attention KV caches.
 - Integrated MTP drafting when the model includes compatible weights.
+- Opt-in [BF16 Qwen3.5 MTP projections and sequential verification attention](docs/MIMO-MTP.md), with explicit compatibility limits.
 - OpenAI Chat Completions tools for recognized Qwen XML and Hermes JSON templates.
 - Configurable resource limits, GPU lease, extension hash checks, offline loading and private artifacts.
 

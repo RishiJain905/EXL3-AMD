@@ -5,6 +5,7 @@ import importlib.util
 import io
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -126,6 +127,25 @@ SERVE_BASE = ["--config", "c", "--candidate", "m", "--source-dir", "s", "--exten
 
 
 class DownstreamParserTests(unittest.TestCase):
+    def test_mtp_precision_guards_run_before_config_or_model_access(self):
+        invalid = (
+            ['--mtp-dtype', 'bf16'],
+            ['--mtp', '--mtp-dtype', 'bf16', '--decode-fusions', 'gdn'],
+            ['--mtp', '--mtp-dtype', 'bf16', '--native-attention'],
+            ['--mtp', '--mtp-dtype', 'bf16', '--cache-mtp', 'fc'],
+            ['--verify-attention', 'rowwise', '--native-attention'],
+            ['--verify-attention', 'rowwise', '--cache-type', 'q8'],
+        )
+        for module, base in ((evaluate, EVAL_BASE), (serve, SERVE_BASE)):
+            for flags in invalid:
+                with self.subTest(module=module.__name__, flags=flags):
+                    with patch.object(sys, 'argv', ['test', *base, '--decode-fusions', 'off', *flags]), \
+                            patch.object(Path, 'read_text', side_effect=AssertionError('config accessed')), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as caught:
+                            module.main()
+                    self.assertEqual(caught.exception.code, 2)
+
     def test_evaluator_parser(self):
         self.assertEqual(cache_precision.resolve_cache_types(evaluate.parser().parse_args(EVAL_BASE)), ("f16", "f16"))
         args = evaluate.parser().parse_args(EVAL_BASE + ["--cache-type", "q8"])
