@@ -34,6 +34,12 @@ HEADER_SIZE_CAP = 100 * 1024**2
 HASH_CHUNK = 8 * 1024**2
 SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 REV_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+MIMO_TOKENIZER_SHA256 = "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+QWEN_TOKENIZER_SHA256 = "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+MIMO_EXTRA_TOKENS = dict(enumerate((
+    "<|audio_start|>", "<|audio_end|>", "<tts_pad>", "<tts_text_bos>",
+    "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>",
+), start=248070))
 
 CANONICAL_MTP = (
     "mtp.fc.weight",
@@ -514,6 +520,36 @@ def compare_tokenizers(target_path, donor_path):
     donor_tok = read_json(donor_path)
     if not isinstance(target_tok, dict) or not isinstance(donor_tok, dict):
         raise PackagingError("Tokenizer files must be JSON objects")
+    # Most donors must match exactly. The one audited MiMo/Qwen pair differs
+    # in preprocessing and seven target-only special tokens, but MTP consumes
+    # target IDs through the shared target embedding/head, never a donor tokenizer.
+    # Pin both complete files: this is not a generic ignore-tokenizer switch.
+    if target_tok != donor_tok and (file_sha256(target_path), file_sha256(donor_path)) == (
+            MIMO_TOKENIZER_SHA256, QWEN_TOKENIZER_SHA256):
+        target_model, donor_model = target_tok['model'], donor_tok['model']
+        if target_model['vocab'] != donor_model['vocab']:
+            raise PackagingError("Tokenizer mismatch: shared vocabulary IDs differ")
+        def merge_pairs(rows):
+            pairs = [row.split(' ') if isinstance(row, str) else row for row in rows]
+            if any(not isinstance(row, list) or len(row) != 2
+                   or not all(isinstance(x, str) for x in row) for row in pairs):
+                raise PackagingError("Tokenizer mismatch: invalid BPE merge pair")
+            return pairs
+        if merge_pairs(target_model['merges']) != merge_pairs(donor_model['merges']):
+            raise PackagingError("Tokenizer mismatch: BPE merge order/content differs")
+        target_added = {row['id']: row for row in target_tok['added_tokens']}
+        donor_added = {row['id']: row for row in donor_tok['added_tokens']}
+        if any(target_added.get(key) != row for key, row in donor_added.items()):
+            raise PackagingError("Tokenizer mismatch: shared added-token definitions differ")
+        extra = {key: row['content'] for key, row in target_added.items() if key not in donor_added}
+        if extra != MIMO_EXTRA_TOKENS:
+            raise PackagingError("Tokenizer mismatch: unexpected target-only tokens")
+        return dict(mode="pinned_mimo_shared_target", json_semantically_equal=False,
+                    shared_vocabulary_size=len(target_model['vocab']), shared_added_tokens=len(donor_added),
+                    target_only_added_tokens=extra, normalized_merge_pairs_equal=True,
+                    tokenizer_used="target", target_sha256=MIMO_TOKENIZER_SHA256,
+                    donor_sha256=QWEN_TOKENIZER_SHA256,
+                    limit="Donor preprocessing differs and is never executed by this MTP path; audio behavior unvalidated.")
     if target_tok != donor_tok:
         target_keys, donor_keys = set(target_tok), set(donor_tok)
         parts = []
@@ -528,6 +564,7 @@ def compare_tokenizers(target_path, donor_path):
             parts.append(f"differing: {differing[:8]}")
         detail = "; ".join(parts) if parts else "content differs"
         raise PackagingError(f"Tokenizer mismatch between target and donor: {detail}")
+    return dict(mode="exact_json", json_semantically_equal=True, tokenizer_used="target")
 
 
 def expected_mtp_shapes(text, head_dim):
@@ -621,7 +658,8 @@ def build_output_index(target_index, expected_shapes, target_total, donor_total)
 
 
 def build_provenance(donor_manifest, donor_files, donor_hashes, expected_shapes,
-                     target_manifest, target_config_hash, target_index_hash, target_tokenizer_hash):
+                     target_manifest, target_config_hash, target_index_hash, target_tokenizer_hash,
+                     tokenizer_compatibility):
     files = {name: {"bytes": donor_files[name]["bytes"], "sha256": donor_files[name]["sha256"]}
              for name in DONOR_FILES}
     tensors = {name: {"dtype": "BF16", "shape": expected_shapes[name],
@@ -642,6 +680,7 @@ def build_provenance(donor_manifest, donor_files, donor_hashes, expected_shapes,
                              "baked into stored norms, no cast/quantize.")},
         "sharing": {"mtp_use_dedicated_embeddings": False,
                     "embedding_source": "target", "lm_head_source": "target"},
+        "tokenizer_compatibility": tokenizer_compatibility,
         "target_preservation": {"target_files": target_files, "config_sha256": target_config_hash,
                                 "index_sha256": target_index_hash,
                                 "tokenizer_sha256": target_tokenizer_hash},
@@ -649,7 +688,7 @@ def build_provenance(donor_manifest, donor_files, donor_hashes, expected_shapes,
             "CPU packaging/audit only; no runtime/GPU reload claimed.",
             "Target tensors and quantization metadata preserved byte-exact except recorded config/index deltas.",
             "Donor MTP payload stored as BF16; runtime precision (FP16 projections, constant_bias=1) recorded separately.",
-            "Tokenizer semantic equality verified; tokenizer_config/chat_template/generation_config preserved unchanged.",
+            "Tokenizer compatibility mode recorded explicitly; target tokenizer_config/chat_template/generation_config preserved unchanged.",
             "Text geometry equality verified for listed fields; MTP depth changed 0->1 by design.",
         ],
     }
@@ -765,7 +804,7 @@ def run(target, manifest_path, donor_dir, output, report):
         _, donor_text = load_donor_text(donor_dir)
         stage = "compare geometry and tokenizer"
         head_dim = compare_geometry(target_text, donor_text)
-        compare_tokenizers(target / TARGET_TOKENIZER, donor_dir / "tokenizer.json")
+        tokenizer_compatibility = compare_tokenizers(target / TARGET_TOKENIZER, donor_dir / "tokenizer.json")
         expected_shapes = expected_mtp_shapes(target_text, head_dim)
         if set(expected_shapes) != set(CANONICAL_MTP):
             raise PackagingError("Internal canonical MTP inventory mismatch")
@@ -779,7 +818,7 @@ def run(target, manifest_path, donor_dir, output, report):
         provenance = build_provenance(donor_manifest, donor_files, donor_hashes, expected_shapes,
                                       target_manifest, file_sha256(target / TARGET_CONFIG),
                                       file_sha256(target / TARGET_INDEX),
-                                      file_sha256(target / TARGET_TOKENIZER))
+                                      file_sha256(target / TARGET_TOKENIZER), tokenizer_compatibility)
         stage = "copy package files"
         output.mkdir(parents=False, exist_ok=False)
         for fname in sorted(target_manifest):
@@ -825,6 +864,7 @@ def run(target, manifest_path, donor_dir, output, report):
                        "index_total_size": verified_total,
                        "shard_count": len(output_shards)},
             "config_change": config_patch,
+            "tokenizer_compatibility": tokenizer_compatibility,
             "index_change": index_change,
             "precision": {"storage_dtype": "BF16", "runtime_projections_dtype": "FP16",
                           "norm_constant_bias": 1.0, "norms_adjusted_in_storage": False,

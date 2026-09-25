@@ -105,8 +105,14 @@ def check_required_tensors(config, models):
     for model in models:
         for module in model:
             if isinstance(module, Linear):
-                if module.qmap is not None:
-                    for suffix in ("trellis", "suh", "svh"):
+                packed_suffixes = ("trellis", "suh", "svh")
+                has_packed = any(config.stc.has_tensor(module.key + "." + suffix)
+                                 for suffix in packed_suffixes)
+                # qmap names a conversion group, not the stored format. An
+                # unquantized donor can retain qmap and load from .weight.
+                # Reject partial packed groups even if a dense fallback exists.
+                if module.qmap is not None and (has_packed or not config.stc.has_tensor(module.key + ".weight")):
+                    for suffix in packed_suffixes:
                         require(module.key + "." + suffix)
                 else:
                     require(module.key + ".weight")

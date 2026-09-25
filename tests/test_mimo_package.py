@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import subprocess
 import struct
 import sys
 import tempfile
@@ -620,11 +621,23 @@ class PackageMimoTests(unittest.TestCase):
         self.assertIn("outside", json.loads(self.fix.report.read_text())["error"].lower())
 
     def test_help_needs_no_torch(self):
-        self.assertNotIn("torch", sys.modules)
-        with self.assertRaises(SystemExit) as raised:
-            package.main(["--help"])
-        self.assertEqual(raised.exception.code, 0)
-        self.assertNotIn("torch", sys.modules)
+        # Other CPU tensor tests may already have imported Torch in this process.
+        # Exercise the actual CLI in an independent interpreter with an import guard.
+        bootstrap = """
+import importlib.abc, runpy, sys
+class RejectTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] == 'torch':
+            raise AssertionError('Packaging help attempted to import Torch')
+sys.meta_path.insert(0, RejectTorch())
+sys.argv = [sys.argv[1], '--help']
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+        result = subprocess.run([sys.executable, '-S', '-c', bootstrap,
+                                 str(SCRIPTS / 'package_mimo_exl3.py')],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--help', result.stdout)
 
 
 

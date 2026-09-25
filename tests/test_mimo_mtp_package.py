@@ -566,5 +566,60 @@ class TestMtpRejectionAndPreservation(unittest.TestCase):
         self.assertFalse(self.fix.output.exists())
 
 
+class TestPinnedTokenizerCompatibility(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.target = Path(self.temp.name) / 'target.json'
+        self.donor = Path(self.temp.name) / 'donor.json'
+        self.a = tokenizer_obj()
+        self.a['added_tokens'] = [dict(id=248044, content='<eos>', special=True)]
+        self.a['model']['merges'] = [['h', 'e']]
+        self.b = json.loads(json.dumps(self.a))
+        self.b['model']['merges'] = ['h e']
+        self.a['added_tokens'] += [dict(id=k, content=v, special=True)
+                                   for k, v in package.MIMO_EXTRA_TOKENS.items()]
+
+    def check(self, *, pinned=True):
+        write_json(self.target, self.a)
+        write_json(self.donor, self.b)
+        if not pinned:
+            return package.compare_tokenizers(self.target, self.donor)
+        with patch.object(package, 'MIMO_TOKENIZER_SHA256', file_sha256(self.target)), \
+                patch.object(package, 'QWEN_TOKENIZER_SHA256', file_sha256(self.donor)):
+            return package.compare_tokenizers(self.target, self.donor)
+
+    def test_reviewed_pair_records_differences_without_claiming_json_equality(self):
+        result = self.check()
+        self.assertEqual(result['mode'], 'pinned_mimo_shared_target')
+        self.assertFalse(result['json_semantically_equal'])
+        self.assertEqual(result['tokenizer_used'], 'target')
+        self.assertEqual(len(result['target_only_added_tokens']), 7)
+
+    def test_unreviewed_pair_is_rejected_even_with_matching_shared_ids(self):
+        with self.assertRaisesRegex(package.PackagingError, 'Tokenizer mismatch'):
+            self.check(pinned=False)
+
+    def test_changed_base_id_is_rejected(self):
+        self.b['model']['vocab']['hello'] = 20
+        with self.assertRaisesRegex(package.PackagingError, 'shared vocabulary IDs'):
+            self.check()
+
+    def test_changed_merges_are_rejected(self):
+        self.b['model']['merges'] = ['h x']
+        with self.assertRaisesRegex(package.PackagingError, 'BPE merge'):
+            self.check()
+
+    def test_changed_common_special_is_rejected(self):
+        self.b['added_tokens'][0]['content'] = 'different'
+        with self.assertRaisesRegex(package.PackagingError, 'shared added-token'):
+            self.check()
+
+    def test_unexpected_target_extra_is_rejected(self):
+        self.a['added_tokens'][-1]['content'] = 'different'
+        with self.assertRaisesRegex(package.PackagingError, 'unexpected target-only'):
+            self.check()
+
+
 if __name__ == "__main__":
     unittest.main()

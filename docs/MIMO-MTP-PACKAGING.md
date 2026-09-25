@@ -33,7 +33,7 @@ The donor directory contains `manifest.json` plus these four files:
 | --- | --- |
 | `mtp.safetensors` | Exactly the 15 canonical BF16 tensors for one MTP layer |
 | `config.json` | Original donor geometry; MTP depth one, shared embedding/head |
-| `tokenizer.json` | Must parse to the same JSON value as the target tokenizer |
+| `tokenizer.json` | Exact parsed-JSON match, or the explicitly pinned MiMo/official pair described below |
 | `LICENSE` | Donor license copied into the derived package |
 
 The manifest has `schema_version: 1`, `complete: true`,
@@ -44,9 +44,17 @@ Acquisition must separately establish the source/revision and preserve its
 evidence; matching a caller-supplied manifest does not authenticate a publisher.
 
 Architecture comparison includes attention/linear-attention geometry, layer
-types, RoPE, norm settings and embedding-sharing configuration. Tokenizer
-whitespace and JSON object ordering may differ; token-ID or semantic differences
-fail closed. The target chat template and generation configuration are retained.
+types, RoPE, norm settings and embedding-sharing configuration. The default
+tokenizer check allows only whitespace and JSON object ordering differences.
+One audited exception accepts the complete MiMo/official tokenizer hashes pinned
+in the script: 248044 shared vocabulary IDs, 247587 normalized ordered BPE merge
+pairs, 26 common added-token definitions, and exactly seven MiMo audio markers.
+The files are **not semantically equivalent**: Unicode-mark preprocessing and
+ByteLevel settings differ. Provenance records this explicitly. This exception
+is valid only because the integrated donor consumes target token IDs and shares
+the target embedding/head; inference uses the target tokenizer, template and
+generation configuration. No donor tokenizer is copied into the output, and no
+audio/vision correctness is claimed. Other mismatching hash pairs fail closed.
 
 ## Output and preservation
 
@@ -64,6 +72,10 @@ Donor tensors must have expected shapes, contiguous non-overlapping extents,
 complete hashes and finite BF16 values. The builder does not quantize, cast or
 add 1 to stored norms. Qwen's norm bias is applied at runtime; ordinary donor
 projections load as FP16. The target keeps its embedding and EXL3 output head.
+The shared runtime preflight accepts these dense donor projections alongside
+packed target projections. A conversion-group (`qmap`) label does not imply
+packed storage. Partial `.trellis/.suh/.svh` groups still fail the completeness
+check, including when a dense fallback is also present.
 Vision storage is preserved; this utility does not implement image inference
 or an mmproj control.
 
@@ -81,3 +93,13 @@ After packaging, the experiment still needs an independent fresh runtime load,
 finite target/draft logits, MTP-off/on output parity, recurrent rollback/stopping
 coverage and matched speed/memory measurements. MiMo step-4 preparation does
 not yet provide that GPU evidence.
+
+`scripts/mimo_mtp_evaluation.py compare` independently checks complete evaluator
+records for identical inputs, generated token IDs, stopping reasons and protocol
+controls. Its `speed` command compares an MTP run with bracketing MTP-off controls:
+two prefixes, three measured 128-token repetitions each, discarded warmups,
+median request times, geometric mean speed ratio and a 10% control-drift gate.
+It records truncated draft-window coverage without mislabeling unused draft
+tails as conditional prediction errors. Output files must be new. The experiment
+preregistration governs depth selection and confirmation; passing this analysis
+alone does not establish the entire experiment's acceptance criteria.
