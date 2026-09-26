@@ -38,3 +38,39 @@ void exl3_gemv
     bool mcg,
     bool mul1
 );
+
+// Paired gate/up projection plus SwiGLU (ROCm-only, defined in
+// rocm/quant/rdna-mlp-pair.hip.h). Returns None; writes input_scratch,
+// projection_scratch and output. Throws on unsupported requests.
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+void exl3_mlp_gate_up
+(
+    const at::Tensor& x,
+    const at::Tensor& gate_trellis,
+    const at::Tensor& up_trellis,
+    const at::Tensor& gate_suh,
+    const at::Tensor& up_suh,
+    const at::Tensor& gate_svh,
+    const at::Tensor& up_svh,
+    at::Tensor& input_scratch,
+    at::Tensor& projection_scratch,
+    at::Tensor& output,
+    int64_t bits,
+    bool mul1
+);
+// Repacked-layout head projection prototype (ROCm-only, defined in
+// rocm/quant/rdna-head-tiled.hip.h). Explicit entry; the only consumer of
+// [N/128,K/16,8,16*BITS] bytes. Output Half or Float. Throws on unsupported
+// requests.
+void exl3_head_repacked
+(
+    const at::Tensor& x,
+    const at::Tensor& packed,
+    const at::Tensor& suh,
+    at::Tensor& input_scratch,
+    const at::Tensor& svh,
+    at::Tensor& output,
+    int64_t bits,
+    int64_t codebook
+);
+#endif

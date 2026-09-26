@@ -40,15 +40,34 @@ Copy `configs/local.example.toml` to ignored `configs/local.toml` if it does not
 
 Use `native_smallm_max_rows = 9` with the current full build; never declare a larger envelope than the binary implements.
 
+Current builds automatically use packed kernels for eligible 10–64-row
+projections when the verified binary exposes packed-mid ABI 1. No enabling
+flag is needed. Older binaries keep reconstruction fallback; `--no-packed-mid`
+also selects that fallback for diagnosis. Keep the installation's
+small-M/native-graph limit at 3, 5 or 9.
+[Packed projection implementation and checks](PACKED-MLP-PERFORMANCE.md).
+
 Current builds expose both cb0 and mul1 small-M capabilities. The runtime probes
 the verified extension for that capability; older binaries retain their
 cb0-only fused eligibility. Rebuilding and registering the new hash is required
 to enable fused mul1 on an existing installation.
 
-The current ROCm build also includes prefill GEMM ABI 1 for the optional
-`--prefill-gemm wmma` path. Older registered binaries continue to support the
-default `blas` setting; selecting WMMA requires rebuilding and registering
-the resulting binary with its actual SHA-256.
+Current builds also expose packed-prefill and paired-MLP ABI 1. Eligible
+shapes use them automatically, with dense fallback beyond the measured
+crossover. `--no-packed-prefill` and `--no-mlp-pair` disable them for diagnosis.
+The default `--prefill-gemm auto` selects verified dense WMMA when available
+and BLAS otherwise. Explicit `wmma` requires prefill GEMM ABI 1. Rebuild and
+register the actual new SHA-256 to use capabilities absent from an older
+installation. [Shape policy and validation](PREFILL-MLP-FUSION.md).
+
+Repacked-head ABI 3 enables the compressed vocabulary-head view automatically
+on gfx1101. Older binaries and prototype ABIs 1/2 retain the inherited head.
+FP16 and FP32 outputs preserve their original arithmetic and output dtype.
+The adapter allocates at most 1 GiB of packed storage per distinct head and
+leaves a 1 GiB workspace reserve within available VRAM and the allocator
+fraction. Shared target/MTP heads reuse one view. If memory, shape or format
+checks fail, the original projection remains available. No model-file
+conversion or enabling flag is required. [Head policy and measurements](HEAD-ATTENTION-PERFORMANCE.md).
 
 ```powershell
 python scripts/register_runtime.py configs/local.toml

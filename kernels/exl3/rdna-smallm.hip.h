@@ -1,5 +1,5 @@
 #pragma once
-// Experimental noncooperative m=2/3 extension of the pinned RDNA GEMV core.
+// Experimental noncooperative m=2..9 extension of the pinned RDNA GEMV core.
 // Derived from ExLlamaV3 / its ROCm fork. MIT, Copyright (c) 2025 Turboderp.
 // The upstream license is retained in rdna-smallm-LICENSE.txt.
 // Included after the original GEMV helpers and host warp-selection functions.
@@ -24,7 +24,7 @@ void exl3_smallm_had(const void* input, void* output, const half* scales, int si
             (half*) output + row_offset, scales + offset, 0.088388347648f);
 }
 
-template <int M, int BITS, bool FP32, int WARPS, bool GRAPH = false>
+template <int M, int BITS, int CB, bool FP32, int WARPS, bool GRAPH = false>
 static __global__ __launch_bounds__(WARPS * 32)
 __attribute__((amdgpu_flat_work_group_size(WARPS * 32, WARPS * 32)))
 void exl3_smallm_dot(const half* __restrict__ A, const uint16_t* __restrict__ B,
@@ -49,7 +49,7 @@ void exl3_smallm_dot(const half* __restrict__ A, const uint16_t* __restrict__ B,
         const uint32_t* packed = (const uint32_t*)
             (B + (tile_k * n_tiles + tile_n) * (16 * BITS));
         FragB frag0, frag1;
-        dq_dispatch<BITS, 0>(packed, lane << 3, frag0, frag1);
+        dq_dispatch<BITS, CB>(packed, lane << 3, frag0, frag1);
         // Decode once, then use the same fragments for every input row.
         #pragma unroll
         for (int row = 0; row < M; ++row)
@@ -93,16 +93,75 @@ void exl3_smallm_dot(const half* __restrict__ A, const uint16_t* __restrict__ B,
     }
 }
 
-template <int M, int BITS, bool FP32>
+#include "rdna-smallm-wmma.hip.h"
+
+extern "C" __attribute__((visibility("default")))
+int quantlab_exl3_optimization_abi() { return 2; }
+
+extern "C" __attribute__((visibility("default")))
+int quantlab_exl3_smallm_codebooks() { return 5; }
+
+static bool exl3_smallm_use_wmma()
+{
+    const char* value = std::getenv("EXL3_SMALLM_WMMA");
+    return value && atoi(value) == 1;
+}
+
+static bool exl3_smallm_use_register_b()
+{
+    const char* value = std::getenv("EXL3_SMALLM_WMMA");
+    return value && atoi(value) == 2;
+}
+
+static int exl3_smallm_mlp_warps()
+{
+    const char* env = std::getenv("EXL3_SMALLM_MLP_WARPS");
+    if (!env) return 0;
+    int value = atoi(env);
+    return value == 4 || value == 8 || value == 16 ? value : 0;
+}
+
+static int exl3_smallm_warps(int k, int n, int m)
+{
+    int head = exl3_quantlab_head_warps();
+    if (n / 16 > EXL3_GEMV_SPLITK_MAX_TILES && head) return head;
+    if (!exl3_gemv_splitk_enabled() || n / 16 > EXL3_GEMV_SPLITK_MAX_TILES)
+        return 1;
+    // Existing explicit overrides keep precedence over the MLP selector below.
+    // Mirrors the EXL3_GEMV_SPLITK_WARPS check in exl3_gemv_splitk_warps; the
+    // head override returned above.
+    const char* splitk_env = std::getenv("EXL3_GEMV_SPLITK_WARPS");
+    if (splitk_env)
+    {
+        int forced = atoi(splitk_env);
+        if (forced == 4 || forced == 8 || forced == 16) return forced;
+    }
+    // Experimental gfx1101 MLP split-K selector (tuning only, not itself a
+    // claimed optimization): narrow non-head matrix envelope, unset or invalid
+    // keeps prior behavior.
+    int mlp = exl3_smallm_mlp_warps();
+    if (mlp && m > 1 && k >= 2048 && n >= 2048 && n <= 32768)
+        return mlp;
+    return exl3_gemv_splitk_warps(k / 16, n / 16, 1);
+}
+
+template <int M, int BITS, int CB, bool FP32>
 static void exl3_smallm_launch_typed(const half* a, const uint16_t* b, void* c,
     int k, int n, const half* suh, half* ah, const half* svh, cudaStream_t stream)
 {
     hipLaunchKernelGGL((exl3_smallm_had<false, false>), dim3((k / 128 + 7) / 8, 1, M),
         dim3(256), 0, stream, a, ah, suh, k, nullptr);
-    int warps = exl3_gemv_splitk_enabled() && n / 16 <= EXL3_GEMV_SPLITK_MAX_TILES
-        ? exl3_gemv_splitk_warps(k / 16, n / 16, 1) : 1;
-    #define SMALLM_DOT(W) hipLaunchKernelGGL((exl3_smallm_dot<M, BITS, FP32, W>), \
-        dim3(n / 16), dim3(W * 32), 0, stream, ah, b, c, k, n, nullptr)
+    int warps = exl3_smallm_warps(k, n, M);
+    #define SMALLM_DOT(W) do { \
+        if (exl3_smallm_use_register_b()) \
+            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W, false, true>), \
+                dim3(n / 16), dim3(W * 32), 0, stream, ah, b, c, k, n, nullptr); \
+        else if (exl3_smallm_use_wmma()) \
+            hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W>), \
+                dim3(n / 16), dim3(W * 32), 0, stream, ah, b, c, k, n, nullptr); \
+        else hipLaunchKernelGGL((exl3_smallm_dot<M, BITS, CB, FP32, W>), \
+            dim3(n / 16), dim3(W * 32), 0, stream, ah, b, c, k, n, nullptr); \
+    } while (0)
     switch (warps)
     {
         case 1: SMALLM_DOT(1); break;
@@ -115,25 +174,54 @@ static void exl3_smallm_launch_typed(const half* a, const uint16_t* b, void* c,
         dim3(256), 0, stream, c, c, svh, n, nullptr);
 }
 
+#include "rdna-packed-prefill.hip.h"
+#include "rdna-smallm-mid.hip.h"
+#include "rdna-smallm-highbit.hip.h"
+
 static bool exl3_smallm_try_launch(const half* a, const uint16_t* b, void* c,
     int m, int k, int n, int bits, int cb, bool fp32,
     const half* suh, half* ah, const half* svh, cudaStream_t stream)
 {
+    // Tiled prefill ahead of the small-M rejection: independent envelope
+    // (rows 65..4096). No flag set means no behavior change.
+    if (exl3_packed_prefill_try(a,b,c,m,k,n,bits,cb,fp32,suh,ah,svh,stream))
+        return true;
+    // Packed mid-M path: independent envelope (rows 10..64) ahead of the
+    // small-M m>9 rejection below. No flag set means no behavior change.
+    if (exl3_packed_mid_try(a,b,c,m,k,n,bits,cb,fp32,suh,ah,svh,stream))
+        return true;
+    if (bits == 5 || bits == 6)
+        return exl3_smallm_highbit_try(a,b,c,m,k,n,bits,cb,fp32,suh,ah,svh,stream);
     const char* flag = std::getenv("EXL3_SMALLM");
-    if (!flag || atoi(flag) != 1 || (m != 2 && m != 3) || cb != 0 ||
+    if (!flag || atoi(flag) != 1 || (m < 2 || m > 9) || (cb != 0 && cb != 2) ||
         bits < 2 || bits > 4 || k % 128 || n % 128 || !suh || !ah || !svh)
         return false;
-    #define SMALLM_TYPED(M, K) \
-        if (fp32) exl3_smallm_launch_typed<M, K, true>(a,b,c,k,n,suh,ah,svh,stream); \
-        else exl3_smallm_launch_typed<M, K, false>(a,b,c,k,n,suh,ah,svh,stream)
-    #define SMALLM_BITS(M) \
+    #define SMALLM_TYPED(M, K, C) \
+        if (fp32) exl3_smallm_launch_typed<M, K, C, true>(a,b,c,k,n,suh,ah,svh,stream); \
+        else exl3_smallm_launch_typed<M, K, C, false>(a,b,c,k,n,suh,ah,svh,stream)
+    #define SMALLM_BITS(M, C) \
         switch (bits) { \
-            case 2: SMALLM_TYPED(M, 2); break; \
-            case 3: SMALLM_TYPED(M, 3); break; \
-            case 4: SMALLM_TYPED(M, 4); break; \
+            case 2: SMALLM_TYPED(M, 2, C); break; \
+            case 3: SMALLM_TYPED(M, 3, C); break; \
+            case 4: SMALLM_TYPED(M, 4, C); break; \
         }
-    if (m == 2) { SMALLM_BITS(2); }
-    else { SMALLM_BITS(3); }
+    #define SMALLM_CB(M) \
+        switch (cb) { \
+            case 0: SMALLM_BITS(M, 0); break; \
+            case 2: SMALLM_BITS(M, 2); break; \
+        }
+    switch (m)
+    {
+        case 2: SMALLM_CB(2); break;
+        case 3: SMALLM_CB(3); break;
+        case 4: SMALLM_CB(4); break;
+        case 5: SMALLM_CB(5); break;
+        case 6: SMALLM_CB(6); break;
+        case 7: SMALLM_CB(7); break;
+        case 8: SMALLM_CB(8); break;
+        case 9: SMALLM_CB(9); break;
+    }
+    #undef SMALLM_CB
     #undef SMALLM_BITS
     #undef SMALLM_TYPED
     return true;

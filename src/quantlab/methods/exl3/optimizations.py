@@ -1,15 +1,24 @@
-"""Explicit, independently selectable inference experiments; defaults stay unchanged."""
+"""Verified native capabilities and independently selectable inference options."""
 
 
-def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_gemm='blas',
-                     native_smallm=False):
-    """Reject optional kernels on older binaries instead of silently ignoring them."""
+def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_gemm='auto',
+                     native_smallm=False, packed_mid=None, mlp_warps=None,
+                     packed_prefill=None, mlp_pair=None):
+    """Use supported packed kernels by default; verify explicit kernel requests."""
     import ctypes
     import os
     if smallm_kernel not in ('dot', 'wmma', 'wmma-register') or head_warps not in (None, 1, 4, 8, 16):
         raise ValueError('Unsupported native optimization setting')
-    if prefill_gemm not in ('blas', 'wmma'):
+    if prefill_gemm not in ('auto', 'blas', 'wmma'):
         raise ValueError('Unsupported prefill GEMM setting')
+    if (packed_mid is not None and type(packed_mid) is not bool) or mlp_warps not in (None, 4, 8, 16):
+        raise ValueError('Unsupported packed projection setting')
+    if any(value is not None and type(value) is not bool for value in (packed_prefill, mlp_pair)):
+        raise ValueError('Unsupported packed prefill/MLP setting')
+    if mlp_pair is True and smallm_kernel != 'dot':
+        raise ValueError('Paired MLP requires the dot small-M kernel')
+    if (packed_mid or packed_prefill or mlp_pair or mlp_warps is not None) and not native_smallm:
+        raise ValueError('Packed projection options require native small-M support')
     abi = None
     if smallm_kernel != 'dot' or head_warps is not None:
         try:
@@ -22,19 +31,75 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
         if abi not in (1, 2) or (smallm_kernel == 'wmma-register' and abi < 2):
             raise ValueError('Unsupported native optimization ABI')
     hgemm_abi = None
-    if prefill_gemm == 'wmma':
+    if prefill_gemm == 'wmma' or (prefill_gemm == 'auto' and native_smallm):
         try:
             version = ctypes.CDLL(str(binary)).quantlab_exl3_hgemm_abi
         except AttributeError as error:
-            raise ValueError('WMMA prefill needs a binary with the prefill GEMM extension') from error
-        version.argtypes = []
-        version.restype = ctypes.c_int
-        hgemm_abi = version()
-        if hgemm_abi != 1:
-            raise ValueError('Unsupported prefill GEMM ABI')
+            if prefill_gemm == 'wmma':
+                raise ValueError('WMMA prefill needs a binary with the prefill GEMM extension') from error
+        else:
+            version.argtypes = []
+            version.restype = ctypes.c_int
+            hgemm_abi = version()
+            if hgemm_abi != 1:
+                raise ValueError('Unsupported prefill GEMM ABI')
+    if prefill_gemm == 'auto':
+        prefill_gemm = 'wmma' if hgemm_abi == 1 else 'blas'
     codebooks = [0]
+    highbit_abi = None
+    packed_mid_abi = None
+    head_repacked_abi = None
+    additional = dict(packed_prefill=packed_prefill, mlp_pair=mlp_pair)
+    additional_abis = {name + '_abi': None for name in additional}
     if native_smallm:
         library = ctypes.CDLL(str(binary))
+        try:
+            capability = library.quantlab_exl3_head_repacked_abi
+        except AttributeError:
+            pass
+        else:
+            capability.argtypes = []
+            capability.restype = ctypes.c_int
+            head_repacked_abi = capability()
+            if head_repacked_abi not in (1, 2, 3):
+                raise ValueError('Unsupported packed head ABI')
+        try:
+            capability = library.quantlab_exl3_smallm_highbit_abi
+        except AttributeError:
+            pass
+        else:
+            capability.argtypes = []
+            capability.restype = ctypes.c_int
+            highbit_abi = capability()
+            if highbit_abi != 1:
+                raise ValueError('Unsupported native small-M high-bit ABI')
+        if packed_mid is not False or mlp_warps is not None:
+            try:
+                capability = library.quantlab_exl3_packed_mid_abi
+            except AttributeError as error:
+                if packed_mid is True or mlp_warps is not None:
+                    raise ValueError('Packed projection options need a binary with packed-mid ABI 1') from error
+            else:
+                capability.argtypes = []
+                capability.restype = ctypes.c_int
+                packed_mid_abi = capability()
+                if packed_mid_abi != 1:
+                    raise ValueError('Unsupported packed-mid ABI')
+        for name, requested in additional.items():
+            if requested is False:
+                continue
+            try:
+                capability = getattr(library, 'quantlab_exl3_' + name + '_abi')
+            except AttributeError as error:
+                if requested is True:
+                    raise ValueError(name + ' requires a verified binary with ABI 1') from error
+            else:
+                capability.argtypes = []
+                capability.restype = ctypes.c_int
+                version = capability()
+                if version != 1:
+                    raise ValueError('Unsupported ' + name + ' ABI')
+                additional_abis[name + '_abi'] = version
         try:
             capability = library.quantlab_exl3_smallm_codebooks
         except AttributeError:
@@ -46,15 +111,32 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
             if mask not in (1, 5):
                 raise ValueError('Unsupported native small-M codebook capability')
             codebooks = [cb for cb in (0, 2) if mask & (1 << cb)]
+    if packed_mid is None:
+        packed_mid = packed_mid_abi == 1
+    for name, requested in additional.items():
+        if requested is None:
+            additional[name] = additional_abis[name + '_abi'] == 1
+    if smallm_kernel != 'dot':
+        additional['mlp_pair'] = False
     os.environ['EXL3_HGEMM_IMPL'] = prefill_gemm
     os.environ['EXL3_SMALLM_WMMA'] = {'dot':'0', 'wmma':'1', 'wmma-register':'2'}[smallm_kernel]
+    os.environ['EXL3_PACKED_MID'] = '1' if packed_mid else '0'
+    os.environ['EXL3_PACKED_PREFILL'] = '1' if additional['packed_prefill'] else '0'
+    if mlp_warps is None:
+        os.environ.pop('EXL3_SMALLM_MLP_WARPS', None)
+    else:
+        os.environ['EXL3_SMALLM_MLP_WARPS'] = str(mlp_warps)
     if head_warps is None:
         os.environ.pop('EXL3_SMALLM_HEAD_WARPS', None)
     else:
         os.environ['EXL3_SMALLM_HEAD_WARPS'] = str(head_warps)
     return dict(smallm_kernel=smallm_kernel, head_warps=head_warps, optimization_abi=abi,
                 prefill_gemm=prefill_gemm, prefill_gemm_abi=hgemm_abi,
-                smallm_codebooks=codebooks)
+                smallm_codebooks=codebooks, smallm_highbit_abi=highbit_abi,
+                packed_mid=packed_mid, packed_mid_abi=packed_mid_abi, mlp_warps=mlp_warps,
+                head_repacked=head_repacked_abi == 3 and smallm_kernel == 'dot' and head_warps is None,
+                head_repacked_abi=head_repacked_abi,
+                **additional, **additional_abis)
 
 
 def install_optimizations(model, draft, *, gpu_embedding=False, batch_greedy=False,

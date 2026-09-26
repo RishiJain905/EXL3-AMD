@@ -38,6 +38,28 @@ def compact_quant_args(factory):
     return create
 
 
+def freeze_identity(work_dir, identity, *, resume):
+    """Reject content/config changes on resume, even at unchanged file paths."""
+    path = Path(work_dir) / "conversion_identity.json"
+    if resume:
+        if not path.is_file():
+            raise ValueError("Resume lacks conversion_identity.json; an audited fresh job is required")
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        changed = sorted(key for key in set(previous) | set(identity) if previous.get(key) != identity.get(key))
+        if changed:
+            raise ValueError("Resume identity changed: " + ", ".join(changed))
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as output:
+            json.dump(identity, output, indent=2, allow_nan=False)
+
+
+def source_identity(source):
+    """Pin payloads and loader/tokenizer metadata without retaining them in RAM."""
+    return {path.name: digest(path) for path in sorted(Path(source).iterdir())
+            if path.is_file() and path.suffix in (".safetensors", ".json", ".jinja", ".txt")}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -126,6 +148,27 @@ def main():
             or tokens.shape[1] < cols or tokens.min().item() < 0 or tokens.max().item() >= vocab):
         parser.error("calibration must contain valid int64 input_ids with enough rows/columns")
     del tokens
+    source_config = mapped_text_config(source)[0]
+    identity = dict(
+        source_files=source_identity(source), calibration_sha256=digest(calibration),
+        extension_sha256=digest(binary),
+        code_sha256={str(path.relative_to(args.source_dir)): digest(path)
+                     for path in sorted((args.source_dir / "exllamav3").rglob("*.py"))},
+        wrapper_sha256=digest(Path(__file__)),
+        source_adapter_sha256=digest(Path(__file__).with_name("inspect_exl3_source.py")),
+        compatibility_sha256=digest(Path(__file__).resolve().parents[1] / "src/quantlab/methods/exl3/compat.py"),
+        compact_cpu_buffers=args.compact_cpu_buffers, noncoop_compat=args.noncoop_compat,
+        out_scales=options.out_scales, calibration_rows=rows, calibration_columns=cols,
+        mtp_included="mtp" in source_config.model_classes,
+    )
+    # A recipe is content-addressed independently of its pathname. On resume,
+    # an omitted recipe uses the previously pinned digest, not mutable file data.
+    if options.recipe:
+        identity["recipe_sha256"] = digest(options.recipe)
+    elif options.resume and (work_dir / "conversion_identity.json").is_file():
+        old_identity = json.loads((work_dir / "conversion_identity.json").read_text())
+        if "recipe_sha256" in old_identity:
+            identity["recipe_sha256"] = old_identity["recipe_sha256"]
     torch.cuda.set_per_process_memory_fraction(10 * 2**30 / torch.cuda.get_device_properties(0).total_memory)
 
     original = Config.from_directory
@@ -175,12 +218,18 @@ def main():
         convert_model.make_quant_args = compact_quant_args(original_quant_args)
     try:
         print(json.dumps({"extension_sha256": digest(binary), "calibration_sha256": digest(calibration),
-                          "converter_argv": argv, "text_only": True, "mtp_included": True,
+                          "converter_argv": argv, "text_only": True,
+                          "mtp_included": "mtp" in source_config.model_classes,
+                          "mtp_declared_layers": source_config.mtp_num_hidden_layers,
+                          "mtp_source_tensors": source_config.mtp_source_tensors,
                           "experimental_noncoop_compat": args.noncoop_compat,
                           "compact_cpu_buffers": args.compact_cpu_buffers}), flush=True)
         prepared, state, ok, error = convert_model.prepare(options)
         if not ok:
             raise ValueError(error)
+        identity["quantization_settings"] = {key: prepared.get(key) for key in
+            ("bits", "head_bits", "mtp_bits", "vision_bits", "hq", "codebook", "recipe_strategy", "devices", "device_ratios")}
+        freeze_identity(work_dir, identity, resume=options.resume)
         convert_model.main(prepared, state)
     finally:
         Config.from_directory = staticmethod(original)

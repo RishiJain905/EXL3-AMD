@@ -37,6 +37,24 @@ class Tensor:
 
 
 class CompatTests(unittest.TestCase):
+    def test_highbit_requires_capability_mul1_dot_and_supported_rows(self):
+        from quantlab.methods.exl3.compat import smallm_supported
+        layer = SimpleNamespace(K=5, mcg=False, mul1=True, in_features=128, out_features=256,
+                                _quantlab_smallm_codebooks=(0,2), _quantlab_smallm_highbit=True)
+        with patch.dict(os.environ, {'EXL3_SMALLM_WMMA': '0'}):
+            for rows in (2,3,5):
+                self.assertTrue(smallm_supported(layer, rows))
+            for rows in (None,1,4,6,7,8,9):
+                self.assertFalse(smallm_supported(layer, rows))
+            layer._quantlab_smallm_highbit = False
+            self.assertFalse(smallm_supported(layer, 2))
+            layer._quantlab_smallm_highbit = True
+            layer.mul1 = False
+            self.assertFalse(smallm_supported(layer, 2))
+            layer.mul1 = True
+        with patch.dict(os.environ, {'EXL3_SMALLM_WMMA': '1'}):
+            self.assertFalse(smallm_supported(layer, 2))
+
     def setUp(self):
         class Module:
             def __init__(self, *children):
@@ -191,6 +209,89 @@ class CompatTests(unittest.TestCase):
         layer.K, layer.mcg, layer.mul1 = bits, False, False
         layer.in_features, layer.out_features = width, 256
         return layer
+
+    def test_packed_mid_boundaries_and_unsupported_formats_reconstruct(self):
+        install(self.config, native_smallm=True, native_smallm_max_rows=9,
+                native_smallm_codebooks=(0, 2), native_packed_mid=True)
+        for bits, mul1 in ((2, False), (3, False), (4, False), (2, True), (5, True), (6, True)):
+            for rows in (10, 16, 17, 32, 33, 63, 64):
+                layer = self.supported_layer(bits)
+                layer.mul1 = mul1
+                params = {'marker': object()}
+                result = layer.forward(Tensor((1, rows, 128)), params, 'float')
+                self.assertEqual(result.shape, (1, rows, 256))
+                self.assertEqual(len(layer.calls), 1)
+                self.assertIs(layer.calls[0][1], params)
+                self.assertEqual(layer._quantlab_packed_mid_calls, 1)
+        for rows, bits, mul1, mcg, width in (
+                (65, 2, False, False, 128), (10, 5, False, False, 128),
+                (10, 7, True, False, 128), (10, 2, False, True, 128),
+                (10, 2, False, False, 127)):
+            layer = self.supported_layer(bits, width)
+            layer.mul1, layer.mcg = mul1, mcg
+            layer.forward(Tensor((rows, width)), {})
+            self.assertEqual(len(layer.calls), 1)
+            self.assertTrue(layer.calls[0][1]['reconstruct'])
+        # Reinstallation must reset a previously enabled capability.
+        install(self.config, native_smallm=True, native_smallm_max_rows=9)
+        layer = self.supported_layer()
+        layer.forward(Tensor((10, 128)), {})
+        self.assertTrue(layer.calls[0][1]['reconstruct'])
+
+    def test_packed_prefill_bypasses_old_reconstruction_threshold(self):
+        fake_torch = ModuleType('torch')
+        fake_torch.float32 = 'float'
+        fake_torch.half = 'half'
+        with patch.dict(sys.modules, {'torch': fake_torch}):
+            install(self.config, native_smallm=True, native_smallm_codebooks=(0, 2), native_packed_prefill=True)
+            for rows in (65, 128, 144, 145, 256, 512):
+                for dtype in ('half', 'float'):
+                    if rows > 128 and dtype == 'half':
+                        continue
+                    layer = self.supported_layer(5)
+                    layer.mul1, layer.default_out_dtype = True, 'half'
+                    calls = []
+                    layer.bc = SimpleNamespace(run_alloc=lambda *args: calls.append(args) or 'native')
+                    x = Tensor((1, rows, 128))
+                    self.assertEqual(layer.forward(x, {}, dtype), 'native')
+                    self.assertEqual(calls, [(x, 256, dtype == 'float')])
+                    self.assertEqual(layer.calls, [])
+                    self.assertEqual(layer._quantlab_packed_prefill_calls, 1)
+                    layer.forward(x, {'reconstruct': True}, dtype)
+                    self.assertEqual(len(calls), 1)
+                    self.assertTrue(layer.calls[-1][1]['reconstruct'])
+            for rows, bits, mul1, width in ((64, 5, True, 128), (513, 5, True, 128),
+                                           (129, 5, True, 128),
+                                           (256, 5, False, 128), (256, 5, True, 127)):
+                layer = self.supported_layer(bits, width)
+                layer.mul1 = mul1
+                layer.default_out_dtype = 'half'
+                layer.forward(Tensor((rows, width)), {})
+                self.assertTrue(layer.calls[-1][1]['reconstruct'])
+            install(self.config, native_smallm=True)
+            self.assertEqual(os.environ['EXL3_PACKED_PREFILL'], '0')
+            layer = self.supported_layer()
+            layer.forward(Tensor((256, 128)), {})
+            self.assertTrue(layer.calls[-1][1]['reconstruct'])
+    def test_highbit_preserves_mimo_abi1_dot_row_envelope(self):
+        install(self.config, native_smallm=True, native_smallm_max_rows=9,
+                native_smallm_codebooks=(0, 2), native_smallm_highbit=True)
+        for bits in (5, 6):
+            for rows in (2, 3, 4, 5, 6, 9):
+                for kernel in ('0', '1', '2'):
+                    with patch.dict(os.environ, {'EXL3_SMALLM_WMMA': kernel}):
+                        layer = self.supported_layer(bits)
+                        layer.mul1 = True
+                        layer.forward(Tensor((rows, 128)), {})
+                        self.assertEqual(len(layer.calls), 1 if rows in (2, 3, 5) and kernel == '0' else rows)
+
+    def test_packed_mid_preserves_explicit_reconstruction(self):
+        install(self.config, native_smallm=True, native_packed_mid=True)
+        layer = self.supported_layer()
+        params = {'reconstruct': True}
+        layer.forward(Tensor((16, 128)), params)
+        self.assertIs(layer.calls[0][1], params)
+        self.assertFalse(hasattr(layer, '_quantlab_packed_mid_calls'))
 
     def test_mul1_requires_verified_capability_and_survives_reinstall(self):
         install(self.config, native_smallm=True, native_smallm_max_rows=9)

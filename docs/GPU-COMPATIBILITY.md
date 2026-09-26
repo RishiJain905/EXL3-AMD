@@ -8,7 +8,8 @@ its actual SHA-256 to use these changes. Historical kernel copies and patches in
 
 `mul1` is an EXL3 codebook: a multiply-based mapping from packed codes to
 reconstructed weight values. Bits per weight are configured separately; this
-runtime's fused mul1 path handles 2-, 3- and 4-bit packed projections.
+runtime's general fused mul1 path handles 2-, 3- and 4-bit packed projections.
+The separately advertised K5/K6 dot extension is described below.
 See [real-model measurements](MUL1-VALIDATION.md) for the completed 9.402 GB
 conversion, repeated inference, occupied 120K tests and observed quality limits.
 
@@ -41,7 +42,48 @@ single-row path for these layers and falls back for larger batches. Multirow
 native graphs are admitted only when every packed projection in the module is
 supported by the verified binary. Optimization ABI 2 stays
 unchanged. `mcg` (`cb1`), other bit widths and unsupported shapes retain their
-existing fallback; this change does not expand their fused small-M envelope.
+existing fallback in that original envelope.
+
+## MiMo high-bit and packed 10–64-row extensions
+
+High-bit ABI 1 adds mul1 K5/K6 dot projections at rows 2/3/5, carrying forward
+the MiMo-specific implementation. It does not enable high-bit native MLP graphs.
+Packed-mid ABI 1 automatically enables packed projections for rows 10–64: cb0 K2/K3/K4 and mul1
+K2–K6, positive widths divisible by 128, and FP16/FP32 output. Other combinations
+retain the Python reconstruction fallback. The verified-binary capability check
+is separate from the installation's unchanged 3/5/9 small-M limit. Older
+binaries without this ABI retain fallback. `--no-packed-mid` disables the new
+path for diagnosis; explicit `--packed-mid` still requires ABI 1.
+
+The new source uses the shared WMMA adapter, but its current build/validation
+target is gfx1101. Older RDNA4 cross-compilation results do not validate these
+new kernels. See [packed MLP measurements](PACKED-MLP-PERFORMANCE.md) for the
+exact acceptance status, tuning flags and model scope.
+
+Packed-prefill ABI 1 and paired-MLP ABI 1 are also selected automatically
+after verification. The native prefill envelope is 65–4096 rows, but the
+measured primary policy uses FP16 rows 65–128 and FP32 rows 65–512, with
+output width at most 32768; larger work retains dense dispatch. Paired MLP
+supports rows 1/2/3/5 with FP16 gate/up intermediates and the same eight packed
+formats. Other MLP semantics retain fallback. The new build passed 1,816 GPU
+checks and MiMo comparisons on gfx1101. No new RDNA4 hardware or cross-build
+claim is made. [Complete policy and evidence](PREFILL-MLP-FUSION.md).
+
+### Bounded K5/K6 mul1 extension
+
+An extension exporting `quantlab_exl3_smallm_highbit_abi() == 1` additionally
+admits mul1 K5/K6 dot projections at exactly 2/3/5 rows. Input/output widths
+must be positive multiples of 128. FP16/FP32 output and the existing 1/4/8/16
+warp choices are supported. This does not add K5/K6 WMMA, multirow fusion-graph
+admission, other codebooks or arbitrary row widths. Python dispatch checks the
+verified binary's ABI and falls back for unsupported combinations.
+
+The gfx1101 build passed 96 RX 7800 XT packed-matrix checks: synthetic and real
+MiMo body/head slices, independently decoded CPU weights, FP64 matrix references,
+output guards, all supported rows/warps/dtypes. All 96 outputs also matched the
+existing one-row native kernel exactly. These are operator checks, not proof
+of full-model quality or a general speedup. See [MiMo MTP](MIMO-MTP.md) for the
+separate full-model qualification and precision constraints.
 
 ## RDNA4 implementation
 
@@ -54,7 +96,7 @@ variants are covered. FP16 accumulation preserves the unselected half slots.
 This compatibility adapter adds shuffle overhead; it is not RDNA4 performance
 tuning and makes no throughput claim.
 
-The opt-in `--prefill-gemm wmma` dispatcher admits gfx1200/gfx1201 as well as
+The `--prefill-gemm auto`/`wmma` dispatcher admits gfx1200/gfx1201 as well as
 gfx1101. Its existing shape, storage and fallback checks still apply. The
 `--attention-profile long` tuning remains scoped to gfx1101; RDNA4 retains the
 default attention scheduling. GPU-specific compiler paths, Torch/Triton and

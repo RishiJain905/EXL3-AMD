@@ -1,4 +1,5 @@
 """CPU-only launcher boundary tests; no WSL, GPU, model files, or network."""
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -151,6 +152,22 @@ class LeaseTests(unittest.TestCase):
 
 
 class MainRejectionTests(unittest.TestCase):
+    def test_mtp_precision_and_attention_dependencies_reject_before_launch(self):
+        invalid = (
+            ['--mtp-dtype', 'bf16'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--decode-fusions', 'gdn'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--native-attention'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--cache-mtp', 'fc'],
+            ['--verify-attention', 'rowwise', '--native-attention'],
+            ['--verify-attention', 'rowwise', '--decode-fusions', 'gdn'],
+            ['--verify-attention', 'rowwise', '--cache-type', 'q8'],
+        )
+        for flags in invalid:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._assert_rejects(['launch', 'speed', '--config', str(root/'missing.toml'),
+                                      '--output', str(root/'out'), *flags], root/'out')
+
     def test_gpu_draft_dependencies_rejected_before_config_access(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)/'out'
@@ -329,6 +346,18 @@ class MainRejectionTests(unittest.TestCase):
                                   "--output", str(out),
                                   "--cache-type-k", "f16", "--cache-type-v", "q4"], out)
 
+    def test_explicit_f16_q6_q5_mix_rejects(self):
+        for k, v in (("f16", "q6"), ("q6", "f16"), ("f16", "q5"), ("q5", "f16")):
+            with self.subTest(k=k, v=v):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp = Path(tmp)
+                    cfg = tmp / "local.toml"
+                    self._write_config(cfg)
+                    out = tmp / "run-out"
+                    self._assert_rejects(["launch", "speed", "--config", str(cfg),
+                                          "--output", str(out),
+                                          "--cache-type-k", k, "--cache-type-v", v], out)
+
     def test_conflicting_shorthand_rejects(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -338,6 +367,16 @@ class MainRejectionTests(unittest.TestCase):
             self._assert_rejects(["launch", "speed", "--config", str(cfg),
                                   "--output", str(out),
                                   "--cache-type", "q8", "--cache-type-k", "q4"], out)
+
+    def test_conflicting_q6_q5_shorthand_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = tmp / "local.toml"
+            self._write_config(cfg)
+            out = tmp / "run-out"
+            self._assert_rejects(["launch", "speed", "--config", str(cfg),
+                                  "--output", str(out),
+                                  "--cache-type", "q6", "--cache-type-v", "q5"], out)
 
     def test_fp8_cache_type_rejects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,6 +441,36 @@ class _FakeTelemetry:
 
 
 class CachePrecisionForwardingTests(unittest.TestCase):
+    def test_vision_options_and_local_image_reach_the_image_consumer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'image with spaces.png'
+            path.write_bytes(b'header-only-launch-test')
+            argv = self._run_and_capture_argv('generate', ['--mmproj','on','--decode-fusions','off',
+                '--image',str(path),'--image-max-pixels','1048576','--prompt','Describe it'])
+        self.assertTrue(argv[1].endswith('generate_multimodal.py'))
+        self.assertEqual(argv[argv.index('--image')+1],launch.linux_path(path))
+        self.assertEqual(argv[argv.index('--mmproj')+1],'on')
+        self.assertEqual(argv[argv.index('--image-max-pixels')+1],'1048576')
+        self.assertNotIn('--suite',argv)
+        self.assertNotIn('--mode',argv)
+
+    def test_vision_startup_selection_reaches_server_and_defaults_off(self):
+        for flags,expected in [([], 'off'),(['--mmproj','on','--decode-fusions','off'],'on')]:
+            argv = self._run_and_capture_argv('serve',flags)
+            self.assertTrue(argv[1].endswith('serve_exl3.py'))
+            self.assertEqual(argv[argv.index('--mmproj')+1],expected)
+
+    def test_bf16_and_rowwise_options_reach_both_consumers(self):
+        for mode in ('serve', 'speed'):
+            with self.subTest(mode=mode):
+                argv = self._run_and_capture_argv(mode, ['--mtp', '2', '--mtp-dtype', 'bf16',
+                    '--verify-attention', 'rowwise', '--decode-fusions', 'off'])
+                self.assertEqual(argv[argv.index('--mtp-dtype') + 1], 'bf16')
+                self.assertEqual(argv[argv.index('--verify-attention') + 1], 'rowwise')
+                defaults = self._run_and_capture_argv(mode, [])
+                self.assertNotIn('--mtp-dtype', defaults)
+                self.assertNotIn('--verify-attention', defaults)
+
     def _write_full_config(self, path, lease_file):
         path.write_text("\n".join([
             "[execution]", "allow_local_inference = true", "allow_backend_probes = true",
@@ -455,9 +524,21 @@ class CachePrecisionForwardingTests(unittest.TestCase):
         argv = self._run_and_capture_argv("speed", ["--cache-type", "q8"])
         self._assert_pair(argv, "q8", "q8")
 
+    def test_q6_q5_shorthand_forwards_pair(self):
+        for precision in ("q6", "q5"):
+            with self.subTest(precision=precision):
+                argv = self._run_and_capture_argv("speed", ["--cache-type", precision])
+                self._assert_pair(argv, precision, precision)
+
     def test_mixed_pair_forwards(self):
         argv = self._run_and_capture_argv("speed", ["--cache-type-k", "q8", "--cache-type-v", "q4"])
         self._assert_pair(argv, "q8", "q4")
+
+    def test_mixed_q6_q5_pair_forwards(self):
+        argv = self._run_and_capture_argv("speed", ["--cache-type-k", "q6", "--cache-type-v", "q5"])
+        self._assert_pair(argv, "q6", "q5")
+        argv = self._run_and_capture_argv("speed", ["-ctk", "q5", "-ctv", "q6"])
+        self._assert_pair(argv, "q5", "q6")
 
     def test_short_syntax_forwards(self):
         argv = self._run_and_capture_argv("speed", ["-ctk", "q4", "-ctv", "q4"])
@@ -488,6 +569,56 @@ class CachePrecisionForwardingTests(unittest.TestCase):
                 argv = self._run_and_capture_argv(mode, ['--prefill-gemm', 'wmma'])
                 self.assertEqual(argv[argv.index('--prefill-gemm') + 1], 'wmma')
 
+    def test_packed_projection_options_forwarded_to_both_workers(self):
+        for mode in ('serve', 'speed'):
+            argv = self._run_and_capture_argv(mode, ['--packed-mid', '--smallm-mlp-warps', '4'])
+            self.assertIn('--packed-mid', argv)
+            self.assertNotIn('--no-packed-mid', argv)
+            self.assertEqual(argv[argv.index('--smallm-mlp-warps') + 1], '4')
+
+    def test_packed_mid_automatic_forwards_neither_flag(self):
+        for mode in ('serve', 'speed'):
+            with self.subTest(mode=mode):
+                argv = self._run_and_capture_argv(mode, [])
+                self.assertNotIn('--packed-mid', argv)
+                self.assertNotIn('--no-packed-mid', argv)
+        argv = self._run_and_capture_argv('generate', ['--prompt', 'hi'])
+        self.assertNotIn('--packed-mid', argv)
+        self.assertNotIn('--no-packed-mid', argv)
+        self.assertIn('evaluate_exl3_candidate.py', argv[1])
+
+    def test_prefill_pair_defaults_and_diagnostic_overrides_reach_workers(self):
+        for mode in ('serve', 'speed', 'generate'):
+            extra = ['--prompt', 'hi'] if mode == 'generate' else []
+            automatic = self._run_and_capture_argv(mode, extra)
+            for flag in ('packed-prefill', 'mlp-pair'):
+                self.assertNotIn('--' + flag, automatic)
+                self.assertNotIn('--no-' + flag, automatic)
+                for prefix in ('--', '--no-'):
+                    argv = self._run_and_capture_argv(mode, extra + [prefix + flag])
+                    self.assertIn(prefix + flag, argv)
+
+    def test_packed_mid_explicit_on_off_forwarded_to_both_workers(self):
+        for mode, worker in (('serve', 'serve_exl3.py'), ('speed', 'evaluate_exl3_candidate.py')):
+            with self.subTest(mode=mode, flag='--packed-mid'):
+                argv = self._run_and_capture_argv(mode, ['--packed-mid'])
+                self.assertIn(worker, argv[1])
+                self.assertIn('--packed-mid', argv)
+                self.assertNotIn('--no-packed-mid', argv)
+            with self.subTest(mode=mode, flag='--no-packed-mid'):
+                argv = self._run_and_capture_argv(mode, ['--no-packed-mid'])
+                self.assertIn(worker, argv[1])
+                self.assertIn('--no-packed-mid', argv)
+                self.assertNotIn('--packed-mid', argv)
+
+    def test_packed_mid_explicit_flags_forwarded_to_generate_worker(self):
+        for flag, absent in (('--packed-mid', '--no-packed-mid'), ('--no-packed-mid', '--packed-mid')):
+            with self.subTest(flag=flag):
+                argv = self._run_and_capture_argv('generate', ['--prompt', 'hi', flag])
+                self.assertIn('evaluate_exl3_candidate.py', argv[1])
+                self.assertIn(flag, argv)
+                self.assertNotIn(absent, argv)
+
     def test_f16_keeps_native_attention_available(self):
         argv = self._run_and_capture_argv("speed", ["--native-attention"])
         self.assertIn("--native-attention", argv)
@@ -497,25 +628,93 @@ class CachePrecisionForwardingTests(unittest.TestCase):
         position = argv.index("--attention-profile")
         self.assertEqual(argv[position + 1], value)
 
-    def test_default_profile_forwards_to_evaluator(self):
+    def test_auto_profile_forwards_to_evaluator(self):
         argv = self._run_and_capture_argv("speed", [])
         self.assertIn("evaluate_exl3_candidate.py", argv[1])
-        self._assert_profile(argv, "default")
+        self._assert_profile(argv, "auto")
 
     def test_long_profile_forwards_to_evaluator(self):
         argv = self._run_and_capture_argv("speed", ["--attention-profile", "long"])
         self.assertIn("evaluate_exl3_candidate.py", argv[1])
         self._assert_profile(argv, "long")
 
-    def test_default_profile_forwards_to_server(self):
+    def test_auto_profile_forwards_to_server(self):
         argv = self._run_and_capture_argv("serve", [])
         self.assertIn("serve_exl3.py", argv[1])
-        self._assert_profile(argv, "default")
+        self._assert_profile(argv, "auto")
 
     def test_long_profile_forwards_to_server(self):
         argv = self._run_and_capture_argv("serve", ["--attention-profile", "long"])
         self.assertIn("serve_exl3.py", argv[1])
         self._assert_profile(argv, "long")
+
+
+class PackedMidParserTests(unittest.TestCase):
+    def _packed_action(self, parser):
+        for action in parser._actions:
+            if '--packed-mid' in action.option_strings:
+                return action
+        self.fail('packed-mid flag missing')
+
+    def _load_worker_parser(self, filename, module_name):
+        import sys
+        from types import ModuleType
+        timing = ModuleType('exl3_timing')
+        timing.TIMING_VERSION = 2
+        timing.FirstIterationTiming = object
+        smoke = ModuleType('run_exl3_model_smoke')
+        smoke.ROOT = SCRIPTS.parent
+        smoke.candidate_preflight = lambda *args, **kwargs: None
+        smoke.check_required_tensors = lambda *args, **kwargs: None
+        smoke.digest = lambda *args, **kwargs: '00'
+        smoke.mapped_text_config = lambda *args, **kwargs: (None, None)
+        smoke.inspect_logits = lambda *args, **kwargs: None
+        smoke.observe_sampler_input = lambda *args, **kwargs: None
+        smoke.observe_mtp_head = lambda *args, **kwargs: None
+        with patch.dict(sys.modules, {'exl3_timing': timing, 'run_exl3_model_smoke': smoke}):
+            spec = importlib.util.spec_from_file_location(module_name, SCRIPTS / filename)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        return module.parser()
+
+    def test_launcher_parser_defaults_to_automatic(self):
+        parser = launch.parser()
+        action = self._packed_action(parser)
+        self.assertIsInstance(action, argparse.BooleanOptionalAction)
+        self.assertIsNone(parser.get_default('packed_mid'))
+        self.assertIsNone(parser.parse_args(['speed']).packed_mid)
+        self.assertTrue(parser.parse_args(['speed', '--packed-mid']).packed_mid)
+        self.assertFalse(parser.parse_args(['speed', '--no-packed-mid']).packed_mid)
+
+    def test_worker_parsers_default_to_automatic(self):
+        serve = self._load_worker_parser('serve_exl3.py', 'serve_under_test')
+        evaluate = self._load_worker_parser('evaluate_exl3_candidate.py', 'evaluate_under_test')
+        for parser in (serve, evaluate):
+            with self.subTest(parser=parser.description[:20]):
+                action = self._packed_action(parser)
+                self.assertIsInstance(action, argparse.BooleanOptionalAction)
+                self.assertIsNone(parser.get_default('packed_mid'))
+                for name in ('packed_prefill', 'mlp_pair'):
+                    self.assertIsNone(parser.get_default(name))
+                    action = next(a for a in parser._actions if a.dest == name)
+                    self.assertIsInstance(action, argparse.BooleanOptionalAction)
+        serve_args = serve.parse_args(['--config', 'c', '--candidate', 'd', '--source-dir', 's',
+                                       '--extension-dir', 'e', '--output', 'o',
+                                       '--expected-extension-sha256', 'x'])
+        self.assertIsNone(serve_args.packed_mid)
+        serve_args = serve.parse_args(['--config', 'c', '--candidate', 'd', '--source-dir', 's',
+                                       '--extension-dir', 'e', '--output', 'o',
+                                       '--expected-extension-sha256', 'x', '--no-packed-mid'])
+        self.assertFalse(serve_args.packed_mid)
+        evaluate_args = evaluate.parse_args(['--config', 'c', '--candidate', 'd', '--source-dir', 's',
+                                             '--extension-dir', 'e', '--suite', 't', '--output', 'o',
+                                             '--expected-extension-sha256', 'x', '--mode', 'speed'])
+        self.assertIsNone(evaluate_args.packed_mid)
+        evaluate_args = evaluate.parse_args(['--config', 'c', '--candidate', 'd', '--source-dir', 's',
+                                             '--extension-dir', 'e', '--suite', 't', '--output', 'o',
+                                             '--expected-extension-sha256', 'x', '--mode', 'speed',
+                                             '--packed-mid'])
+        self.assertTrue(evaluate_args.packed_mid)
 
 
 def _write_metadata(path, lease_file, *, candidate=None, manifest=None, rows=None,

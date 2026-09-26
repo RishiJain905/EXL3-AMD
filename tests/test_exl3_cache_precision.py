@@ -5,6 +5,7 @@ import importlib.util
 import io
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -37,7 +38,7 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(cache_precision.resolve_cache_types(_namespace()), ("f16", "f16"))
 
     def test_shorthand_applies_to_both_sides(self):
-        for shorthand in ("f16", "q8", "q4"):
+        for shorthand in ("f16", "q8", "q6", "q5", "q4", "aster5"):
             with self.subTest(shorthand=shorthand):
                 self.assertEqual(cache_precision.resolve_cache_types(_namespace(cache_type=shorthand)),
                                  (shorthand, shorthand))
@@ -48,6 +49,14 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(cache_precision.resolve_cache_types(_namespace(cache_type_k="q4", cache_type_v="q8")),
                          ("q4", "q8"))
 
+    def test_mixed_q6_q5_accepted(self):
+        for k, v in (("q6", "q5"), ("q5", "q6"), ("q8", "q6"), ("q6", "q8"),
+                      ("q8", "q5"), ("q5", "q8"), ("q6", "q4"), ("q4", "q6"),
+                      ("q5", "q4"), ("q4", "q5"), ("q6", "q6"), ("q5", "q5")):
+            with self.subTest(k=k, v=v):
+                self.assertEqual(cache_precision.resolve_cache_types(
+                    _namespace(cache_type_k=k, cache_type_v=v)), (k, v))
+
     def test_consistent_shorthand_coexists(self):
         self.assertEqual(cache_precision.resolve_cache_types(
             _namespace(cache_type="q8", cache_type_k="q8", cache_type_v="q8")), ("q8", "q8"))
@@ -57,9 +66,14 @@ class ResolveTests(unittest.TestCase):
             cache_precision.resolve_cache_types(_namespace(cache_type="q8", cache_type_k="q4"))
         with self.assertRaisesRegex(ValueError, "conflicts"):
             cache_precision.resolve_cache_types(_namespace(cache_type="q8", cache_type_v="q4"))
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            cache_precision.resolve_cache_types(_namespace(cache_type="q6", cache_type_k="q5"))
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            cache_precision.resolve_cache_types(_namespace(cache_type="q5", cache_type_v="q6"))
 
     def test_f16_quant_mixing_rejected(self):
-        for k, v in (("f16", "q8"), ("q8", "f16"), ("f16", "q4"), ("q4", "f16")):
+        for k, v in (("f16", "q8"), ("q8", "f16"), ("f16", "q4"), ("q4", "f16"),
+                      ("f16", "q6"), ("q6", "f16"), ("f16", "q5"), ("q5", "f16")):
             with self.subTest(k=k, v=v):
                 with self.assertRaisesRegex(ValueError, "mix"):
                     cache_precision.resolve_cache_types(_namespace(cache_type_k=k, cache_type_v=v))
@@ -76,6 +90,9 @@ class ResolveTests(unittest.TestCase):
         self.assertFalse(cache_precision.is_quantized("f16", "f16"))
         self.assertTrue(cache_precision.is_quantized("q8", "q8"))
         self.assertTrue(cache_precision.is_quantized("q8", "q4"))
+        self.assertTrue(cache_precision.is_quantized("q6", "q6"))
+        self.assertTrue(cache_precision.is_quantized("q5", "q5"))
+        self.assertTrue(cache_precision.is_quantized("q6", "q5"))
 
 
 class ParserSyntaxTests(unittest.TestCase):
@@ -96,6 +113,14 @@ class ParserSyntaxTests(unittest.TestCase):
         args = self._parser().parse_args(["--cache-type", "q4"])
         self.assertEqual(cache_precision.resolve_cache_types(args), ("q4", "q4"))
 
+    def test_q6_q5_syntax(self):
+        args = self._parser().parse_args(["--cache-type", "q6"])
+        self.assertEqual(cache_precision.resolve_cache_types(args), ("q6", "q6"))
+        args = self._parser().parse_args(["--cache-type", "q5"])
+        self.assertEqual(cache_precision.resolve_cache_types(args), ("q5", "q5"))
+        args = self._parser().parse_args(["-ctk", "q6", "-ctv", "q5"])
+        self.assertEqual(cache_precision.resolve_cache_types(args), ("q6", "q5"))
+
     def test_no_flag_syntax(self):
         self.assertEqual(cache_precision.resolve_cache_types(self._parser().parse_args([])), ("f16", "f16"))
 
@@ -105,12 +130,16 @@ class ParserSyntaxTests(unittest.TestCase):
                 self._parser().parse_args(["--cache-type", "fp8"])
         self.assertEqual(caught.exception.code, 2)
 
-    def test_attention_profile_defaults_to_default(self):
-        self.assertEqual(self._parser().parse_args([]).attention_profile, "default")
+    def test_attention_profile_defaults_to_auto(self):
+        self.assertEqual(self._parser().parse_args([]).attention_profile, "auto")
 
     def test_attention_profile_long(self):
         args = self._parser().parse_args(["--attention-profile", "long"])
         self.assertEqual(args.attention_profile, "long")
+
+    def test_explicit_inherited_profile_is_still_available(self):
+        args = self._parser().parse_args(["--attention-profile", "default"])
+        self.assertEqual(args.attention_profile, "default")
 
     def test_attention_profile_malformed_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -126,12 +155,33 @@ SERVE_BASE = ["--config", "c", "--candidate", "m", "--source-dir", "s", "--exten
 
 
 class DownstreamParserTests(unittest.TestCase):
+    def test_mtp_precision_guards_run_before_config_or_model_access(self):
+        invalid = (
+            ['--mtp-dtype', 'bf16'],
+            ['--mtp', '--mtp-dtype', 'bf16', '--decode-fusions', 'gdn'],
+            ['--mtp', '--mtp-dtype', 'bf16', '--native-attention'],
+            ['--mtp', '--mtp-dtype', 'bf16', '--cache-mtp', 'fc'],
+            ['--verify-attention', 'rowwise', '--native-attention'],
+            ['--verify-attention', 'rowwise', '--cache-type', 'q8'],
+        )
+        for module, base in ((evaluate, EVAL_BASE), (serve, SERVE_BASE)):
+            for flags in invalid:
+                with self.subTest(module=module.__name__, flags=flags):
+                    with patch.object(sys, 'argv', ['test', *base, '--decode-fusions', 'off', *flags]), \
+                            patch.object(Path, 'read_text', side_effect=AssertionError('config accessed')), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as caught:
+                            module.main()
+                    self.assertEqual(caught.exception.code, 2)
+
     def test_evaluator_parser(self):
         self.assertEqual(cache_precision.resolve_cache_types(evaluate.parser().parse_args(EVAL_BASE)), ("f16", "f16"))
         args = evaluate.parser().parse_args(EVAL_BASE + ["--cache-type", "q8"])
         self.assertEqual(cache_precision.resolve_cache_types(args), ("q8", "q8"))
         args = evaluate.parser().parse_args(EVAL_BASE + ["-ctk", "q8", "-ctv", "q4"])
         self.assertEqual(cache_precision.resolve_cache_types(args), ("q8", "q4"))
+        args = evaluate.parser().parse_args(EVAL_BASE + ["-ctk", "q6", "-ctv", "q5"])
+        self.assertEqual(cache_precision.resolve_cache_types(args), ("q6", "q5"))
 
     def test_server_parser(self):
         self.assertEqual(cache_precision.resolve_cache_types(serve.parser().parse_args(SERVE_BASE)), ("f16", "f16"))
@@ -139,9 +189,13 @@ class DownstreamParserTests(unittest.TestCase):
         self.assertEqual(cache_precision.resolve_cache_types(args), ("q4", "q4"))
         args = serve.parser().parse_args(SERVE_BASE + ["--cache-type-k", "q4", "--cache-type-v", "q8"])
         self.assertEqual(cache_precision.resolve_cache_types(args), ("q4", "q8"))
+        args = serve.parser().parse_args(SERVE_BASE + ["--cache-type", "q6"])
+        self.assertEqual(cache_precision.resolve_cache_types(args), ("q6", "q6"))
+        args = serve.parser().parse_args(SERVE_BASE + ["--cache-type", "q5"])
+        self.assertEqual(cache_precision.resolve_cache_types(args), ("q5", "q5"))
 
     def test_evaluator_attention_profile(self):
-        self.assertEqual(evaluate.parser().parse_args(EVAL_BASE).attention_profile, "default")
+        self.assertEqual(evaluate.parser().parse_args(EVAL_BASE).attention_profile, "auto")
         args = evaluate.parser().parse_args(EVAL_BASE + ["--attention-profile", "long"])
         self.assertEqual(args.attention_profile, "long")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -150,7 +204,7 @@ class DownstreamParserTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
 
     def test_server_attention_profile(self):
-        self.assertEqual(serve.parser().parse_args(SERVE_BASE).attention_profile, "default")
+        self.assertEqual(serve.parser().parse_args(SERVE_BASE).attention_profile, "auto")
         args = serve.parser().parse_args(SERVE_BASE + ["--attention-profile", "long"])
         self.assertEqual(args.attention_profile, "long")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -160,6 +214,22 @@ class DownstreamParserTests(unittest.TestCase):
 
 
 class CacheKwargsTests(unittest.TestCase):
+    def test_aster_uses_its_own_codec(self):
+        uniform, aster = object(), object()
+        kwargs = cache_precision.cache_kwargs("aster5", "aster5",
+                                             quant_layer_type=uniform, aster_layer_type=aster)
+        self.assertIs(kwargs["layer_type"], aster)
+        self.assertEqual((kwargs["k_bits"], kwargs["v_bits"], kwargs["compand_a"]), (5, 5, 0))
+
+    def test_aster_mixing_rejected_before_backend_import(self):
+        for other in ("f16", "q4", "q5", "q6", "q8"):
+            for k, v in (("aster5", other), (other, "aster5")):
+                with self.subTest(k=k, v=v):
+                    with self.assertRaisesRegex(ValueError, "mix"):
+                        cache_precision.resolve_cache_types(_namespace(cache_type_k=k, cache_type_v=v))
+                    with self.assertRaisesRegex(ValueError, "mix"):
+                        cache_precision.cache_kwargs(k, v)
+
     def test_f16_preserves_default(self):
         self.assertEqual(cache_precision.cache_kwargs("f16", "f16"), {})
 
@@ -174,9 +244,21 @@ class CacheKwargsTests(unittest.TestCase):
         kwargs = cache_precision.cache_kwargs("q4", "q4", quant_layer_type=sentinel)
         self.assertEqual((kwargs["k_bits"], kwargs["v_bits"], kwargs["compand_a"]), (4, 4, 0))
 
+    def test_q6_q5_pairs_forward_bits_without_compander(self):
+        sentinel = type("CacheLayer_quant", (), {})
+        for k, v, expected in (("q6", "q6", (6, 6, 0)), ("q5", "q5", (5, 5, 0)),
+                               ("q6", "q5", (6, 5, 0)), ("q5", "q6", (5, 6, 0)),
+                               ("q8", "q6", (8, 6, 0)), ("q5", "q4", (5, 4, 0))):
+            with self.subTest(k=k, v=v):
+                kwargs = cache_precision.cache_kwargs(k, v, quant_layer_type=sentinel)
+                self.assertIs(kwargs["layer_type"], sentinel)
+                self.assertEqual((kwargs["k_bits"], kwargs["v_bits"], kwargs["compand_a"]), expected)
+
     def test_mixing_rejected(self):
-        with self.assertRaisesRegex(ValueError, "mix"):
-            cache_precision.cache_kwargs("f16", "q8", quant_layer_type=object())
+        for k, v in (("f16", "q8"), ("q6", "f16"), ("f16", "q5")):
+            with self.subTest(k=k, v=v):
+                with self.assertRaisesRegex(ValueError, "mix"):
+                    cache_precision.cache_kwargs(k, v, quant_layer_type=object())
 
     def test_unknown_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unknown cache precision"):
@@ -212,6 +294,26 @@ class FakeCache:
 
 
 class StorageTests(unittest.TestCase):
+    def test_policy_storage_reports_actual_precision_instead_of_base_flag(self):
+        aster = FakeQuantLayer([FakeTensor(5, 4, (5,))])
+        aster.cache_format, aster.k_bits, aster.v_bits = 'aster5', 5, 5
+        quant = FakeQuantLayer([FakeTensor(14, 4, (14,))])
+        quant.cache_format, quant.k_bits, quant.v_bits = 'uniform', 6, 8
+        cache = FakeCache({(3, 0): aster, (7, 0): quant})
+        storage = cache_precision.cache_storage(cache, cache_k='aster5', cache_v='aster5')
+        self.assertEqual((storage['cache_k'], storage['cache_v']), ('mixed', 'mixed'))
+        self.assertEqual([(r['layer_idx'], r['cache_k'], r['cache_v']) for r in storage['layers']],
+                         [(3, 'aster5', 'aster5'), (7, 'q6', 'q8')])
+        all_quant = cache_precision.cache_storage(FakeCache({(7, 0): quant}), cache_k='aster5', cache_v='aster5')
+        self.assertEqual((all_quant['cache_k'], all_quant['cache_v']), ('q6', 'q8'))
+
+    def test_counts_immutable_codec_metadata_once(self):
+        layer = FakeQuantLayer([FakeTensor(256, 4, (4, 64))])
+        layer.get_metadata_tensors = lambda: [FakeTensor(32, 4, (32,))]
+        storage = cache_precision.cache_storage(FakeCache({0: layer}), cache_k="aster5", cache_v="aster5")
+        self.assertEqual(storage["tensor_bytes"], 256 * 4 + 128)
+        self.assertEqual(storage["layers"][0]["tensor_shapes"], [[4, 64], [32]])
+
     def test_absent_is_explicit_not_unknown(self):
         self.assertEqual(cache_precision.cache_storage(None, cache_k="q8", cache_v="q8"),
                          {"present": False, "cache_k": None, "cache_v": None,

@@ -1,5 +1,165 @@
 # Release validation
 
+## Consolidated runtime integration: 2026-09-26
+
+The pending packed-kernel/cache changes and the complete MiMo branch chain
+were combined in one checkout, including conversion and packaging tools,
+BF16 MTP, rowwise verification, optional vision, and their tests and reports.
+Merge resolution preserves the qualified native extension sources exactly;
+the registered head/attention ABI-3 binary was reused without rebuilding.
+Validated packed kernels and attention schedules remain automatic, with
+unsupported cases retaining their guarded fallbacks.
+
+- Windows: 804 tests successful, with 46 dependency/platform skips.
+- Linux inference environment: 804 tests successful, with 10 Windows-only skips.
+- CLI help, syntax parsing of all 91 changed Python files, diff whitespace,
+  and public-file credential/workstation-path checks passed.
+- Ordinary MiMo CLI generation with BF16 MTP depth 2, rowwise verification,
+  F16 cache and context 4096 preserved all 64 output IDs against diagnostic
+  kernel controls. The primary recorded 128 packed-head calls; the control
+  recorded zero. Both exercised 336 rowwise attention windows.
+- The MiMo BF16-MTP vision server passed image JSON/SSE output agreement,
+  text requests before/after the image, and remote-image URL rejection.
+  Health recorded four completed requests, zero failures/cancellations,
+  and 52 packed-head calls.
+- The 27B Q6/MTP-depth-2 server processed the same 14333-token prompt through
+  JSON and SSE, producing matching 32-token responses. Health recorded two
+  completed requests, zero failures/cancellations, 108 packed-head calls,
+  and 438 automatic attention calls.
+- Both servers shut down cleanly through their stop files; every inference
+  launcher exited zero. The temporary WSL keepalive was stopped afterward.
+
+These are integration checks, not new throughput or broad-quality benchmarks.
+The earlier 2117 native checks and 716 attention-oracle comparisons remain
+documented in [the head/attention report](HEAD-ATTENTION-PERFORMANCE.md).
+The image check used one synthetic color fixture. Existing model, cache-policy,
+vision, precision and GPU compatibility limits still apply. Portable source
+and reports are committed; raw evidence stays in ignored
+`artifacts/main-integration-20260926/`.
+
+## Vocabulary head and occupied-context attention: 2026-09-26
+
+The next two roadmap items have native and model coverage on RX 7800 XT /
+gfx1101. Repacked-head ABI 3 preserves FP16/FP32 arithmetic, shares its bounded
+compressed view with MTP and selects supported rows automatically. Attention
+uses cache format, query/KV geometry and occupied page-table bounds to choose
+its schedule. Unsupported cases retain inherited dispatch.
+
+The fresh 110-unit build passed 2117 GPU checks: 185 head, 116 attention graph/
+stream checks and 1816 existing projection/prefill/MLP checks. All 332 native/
+build fingerprints matched. Attention sweeps passed another 716 independent
+FP32-oracle comparisons. Windows and Linux each ran 567 unit tests without
+failures, with 25 Windows dependency/platform skips and 10 Linux Windows-only
+skips. Four supervised OMP implementation packages completed successfully.
+
+Corrected FP16 head trials preserved all 6912 measured output tokens and MTP
+acceptance windows across the 9B and 27B models. The candidates recorded 1932
+and 1776 packed-head calls, respectively. Decode gains were 0.44–1.94% for
+MiMo BF16-MTP and 0.96–1.97% for the 27B quantized MTP model. Earlier FP32-only
+full-model head trials never dispatched and are explicitly invalidated in the
+report; their apparent model gains are withdrawn.
+
+At 32K occupied tokens, Q8 attention improved target-only decode by 11.20%
+on 9B and 10.80% on 27B. The 9B continuation changed after 84 common tokens;
+both inspected binary-search functions passed 10801 examples, and timing the
+shared prefix retained an 11.24% gain. This is a narrow functional check,
+not proof of unchanged broad model quality. A warmed 27B Q6/MTP comparison
+at 32K improved from 28.93 to 37.56 tok/s (29.82%), preserving all 768 measured
+tokens and draft acceptance windows. Other attention comparisons and
+the final public-interface checks are recorded in the
+[complete report](HEAD-ATTENTION-PERFORMANCE.md). Extra future-model geometries
+have operator coverage only; no additional GPU family is validated.
+
+The qualified binary is registered locally as primary. Normal MiMo target-only
+CLI generation matched 64 tokens against diagnostic controls and reported
+96 packed-head calls plus 512 automatic attention calls. The normal 27B MTP2
+server returned matching 64-token streaming/non-streaming responses and a
+sampled response. Health reported three completed requests, zero failures,
+175 packed-head calls and 748 automatic attention calls. Monitor-controlled
+shutdown was clean and the launcher exited zero. The 9B BF16-MTP numbers use
+the frozen Step4 evaluator; main-CLI MiMo coverage is target-only.
+
+## MiMo tiled prefill and paired MLP: 2026-09-26
+
+The next two roadmap items are implemented and the measured shape policy is
+primary. Generation and serving automatically select verified packed prefill,
+paired gate/up plus SwiGLU, and dense WMMA fallback. The new gfx1101 extension
+passed 1,816 GPU checks; all 331 native/build source fingerprints matched.
+Both CPU suites passed 542 tests (25 skips on Windows, 10 on Linux).
+
+The final policy preserved all 8,640 output tokens across 108 measured
+BF16-MTP requests with 256- and 1024-token prefill chunks. With 256-token
+chunks, 1244/2924-token prompts improved from 865.74/882.83 to
+1386.28/1401.85 prefill tok/s versus the original BLAS baseline. Improvements
+over the faster WMMA controls are smaller, and decode gains remain modest.
+The broader packed policy was rejected for both performance and changed
+long-prompt token sequences; its losing shapes retain dense fallback.
+
+The normal public CLI, using the newly registered binary with no config or
+optimization flags, selected all three native capabilities and matched 125
+target-only output tokens against disabled-control paths. Live loopback HTTP
+streaming and non-streaming matched 112 tokens; monitor-controlled shutdown
+completed with launcher exit zero. See the
+[complete report](PREFILL-MLP-FUSION.md) for exact dispatch bounds, accepted and
+rejected measurements, public-interface checks, binary identity and limits.
+This does not establish new 27B, RDNA4 or broad model-quality coverage.
+
+## MiMo packed projections: 2026-09-26
+
+The requested MiMo 9B baseline, packed MLP scheduling sweep and packed
+10–64-row implementation are complete on gfx1101. A fresh 110-unit native
+build passed 1,441 GPU checks; all 329 source/build fingerprints matched.
+Windows ran 520 unit tests (25 skips), and the Linux runtime ran the same 520
+(10 Windows-only skips), with no failures in the correctly configured runs.
+
+Repeated BF16-MTP model comparisons show about 1.98 times faster prefill on a
+41-token prompt with exact output-token agreement. Longer prompts and decode
+show no consistent gain. MLP warp overrides were not promoted: four warps
+regressed decode, and a separate MLP-only 16-warp diagnostic changed one SQL
+completion. Default MLP scheduling remains unchanged. The verified ABI-1 build
+was subsequently promoted to the local primary registration; generation and
+serving automatically select its packed 10–64-row path. Older binaries retain
+fallback, and `--no-packed-mid` is available for diagnosis.
+
+After promotion, both unit suites ran 531 tests successfully (25 Windows
+dependency/platform skips; 10 Linux Windows-only skips). A normal MiMo launch
+with no config or kernel flag selected packed-mid ABI 1 and matched all 64
+output tokens from the earlier explicit packed run. Process and monitor exited
+zero. The tested native binary did not change.
+
+The actual main public CLI also passed a held-out target-only comparison with
+64 identical generated tokens. See [PACKED-MLP-PERFORMANCE.md](PACKED-MLP-PERFORMANCE.md)
+for baseline rates, both successful and rejected experiments, commands, binary
+identity, OMP assistance, raw-evidence locations and limits. This is not a new
+27B, RDNA4, broad-quality or saturated-memory-bandwidth validation.
+
+## Checkpoint rename retry: 2026-09-24
+
+Two MiMo conversion launches on WSL's Windows-mounted model drive completed
+their module writes but failed with `PermissionError` at `ckpt_new -> ckpt`.
+Checkpoint saving now retries only permission failures, rechecking sibling
+paths and an absent destination before each attempt. Each rename is bounded
+to 11 attempts and 7.5 seconds of requested sleep; existing process deadlines
+remain in force. Persistent errors still stop conversion. The helper does not
+copy/delete payloads or change quantization calculations, calibration or seeds.
+The shared ownership contract remains necessary: path checks are not an
+OS-level atomic no-replace primitive against arbitrary external writers.
+
+- 16 targeted WSL unit tests passed; Windows passed 13 and skipped three
+  unavailable symlink cases. Tests cover retry exhaustion, unrelated errors,
+  changed paths during backoff, preserved bytes and preexisting destinations.
+- Eight CPU filesystem cases with 64-MiB synthetic payloads did not reproduce
+  the error. A 4,294,978,644-byte synthetic payload did: two permission failures
+  were followed by success after 0.1/0.2-second sleeps. Independent readback
+  matched SHA-256 `8818012e4c68c8ad2ea9bac4bdaea91c7fd6fb10a9afc7431b46aaf1b5fb9cc8`.
+- This demonstrates a recoverable permission failure on the tested filesystem;
+  it does not establish the underlying OS/handle cause or a universal size
+  threshold. Full-model conversion with this helper is still pending.
+
+Source: `vendor/rocm-exl3/exllamav3/conversion/checkpoint_io.py`;
+tests: `tests/test_checkpoint_io.py`. Detailed MiMo provenance and retained
+failed attempts are recorded in the research repository's step-3 report.
+
 ## mul1 and RDNA4 update: 2026-09-16
 
 Implementation proceeded in two stages with bounded OMP assistance: mul1

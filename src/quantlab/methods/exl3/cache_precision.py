@@ -1,16 +1,31 @@
 """Shared EXL3 attention-cache precision plumbing; Torch-free by design.
 
 Exposes the pinned upstream packed integer KV caches (CacheLayer_quant at
-8/4 bits, no compander) through one argparse/resolve/kwarg/storage surface
+8/6/5/4 bits, no compander) through one argparse/resolve/kwarg/storage surface
 shared by the launcher, evaluator and server. Defaults preserve the existing
 f16 cache; only global-attention layers are affected, recurrent state never
 is. These are integer packed formats, not floating point: no fp8 alias.
+Q6/Q5 are inherited uniform rotated integer formats, not AsterKV or TurboQuant.
+The experimental aster5 format has a separate nonuniform encoder/decoder.
 """
 import sys
+from pathlib import Path
 
-CACHE_TYPES = ("f16", "q8", "q4")
-ATTENTION_PROFILES = ("default", "long")
-_BITS = {"q8": 8, "q4": 4}
+CACHE_TYPES = ("f16", "q8", "q6", "q5", "q4", "aster5")
+ATTENTION_PROFILES = ("auto", "default", "long")
+_BITS = {"q8": 8, "q6": 6, "q5": 5, "q4": 4}
+
+
+def _cache_policy():
+    # The host launcher also loads this module by filename before src is on sys.path.
+    if __package__:
+        from . import cache_policy
+        return cache_policy
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("quantlab_cache_policy", Path(__file__).with_name("cache_policy.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def add_cache_precision_args(parser):
@@ -21,8 +36,10 @@ def add_cache_precision_args(parser):
                         help="Attention K cache precision; defaults to --cache-type, then f16")
     parser.add_argument("-ctv", "--cache-type-v", choices=CACHE_TYPES, default=None,
                         help="Attention V cache precision; defaults to --cache-type, then f16")
-    parser.add_argument("--attention-profile", choices=ATTENTION_PROFILES, default="default",
-                        help="Bounded long-context decode attention profile; default preserves inherited attention")
+    parser.add_argument("--attention-profile", choices=ATTENTION_PROFILES, default="auto",
+                        help="Automatic measured attention scheduling (default); default and long retain diagnostic profiles")
+    parser.add_argument("--cache-policy", type=Path, default=None,
+                        help="Experimental offline JSON precision profile for every attention layer; requires a quantized cache type")
     return parser
 
 
@@ -68,7 +85,14 @@ def resolve_cache_types(args):
     v = v if v is not None else "f16"
     if (k == "f16") != (v == "f16"):
         raise ValueError(f"Unsupported KV cache mix K={k} V={v}; "
-                         "CacheLayer_quant needs both sides quantized (q8/q4) or both f16")
+                         "CacheLayer_quant needs both sides quantized (q8/q6/q5/q4) or both f16")
+    if (k == "aster5") != (v == "aster5"):
+        raise ValueError("Unsupported KV cache mix: experimental aster5 requires both K and V")
+    policy_path = getattr(args, "cache_policy", None)
+    if policy_path is not None:
+        if k == "f16":
+            raise ValueError("--cache-policy requires a quantized --cache-type")
+        _cache_policy().load_cache_policy(policy_path)
     return k, v
 
 
@@ -77,7 +101,7 @@ def is_quantized(cache_k, cache_v):
     return cache_k != "f16" or cache_v != "f16"
 
 
-def cache_kwargs(cache_k, cache_v, *, quant_layer_type=None):
+def cache_kwargs(cache_k, cache_v, *, quant_layer_type=None, aster_layer_type=None):
     """Cache constructor kwargs; {} preserves the f16 default path.
 
     The caller passes the imported upstream CacheLayer_quant; the import
@@ -85,9 +109,16 @@ def cache_kwargs(cache_k, cache_v, *, quant_layer_type=None):
     """
     if cache_k == "f16" and cache_v == "f16":
         return {}
+    if cache_k == "aster5" or cache_v == "aster5":
+        if cache_k != cache_v:
+            raise ValueError("Unsupported KV cache mix: experimental aster5 requires both K and V")
+        if aster_layer_type is None:
+            from exllamav3.cache.aster import CacheLayer_aster
+            aster_layer_type = CacheLayer_aster
+        return {"layer_type": aster_layer_type, "k_bits": 5, "v_bits": 5, "compand_a": 0}
     if (cache_k == "f16") != (cache_v == "f16"):
         raise ValueError(f"Unsupported KV cache mix K={cache_k} V={cache_v}; "
-                         "CacheLayer_quant needs both sides quantized (q8/q4) or both f16")
+                         "CacheLayer_quant needs both sides quantized (q8/q6/q5/q4) or both f16")
     try:
         k_bits, v_bits = _BITS[cache_k], _BITS[cache_v]
     except KeyError:
@@ -97,6 +128,27 @@ def cache_kwargs(cache_k, cache_v, *, quant_layer_type=None):
         from exllamav3.cache import CacheLayer_quant
         quant_layer_type = CacheLayer_quant
     return {"layer_type": quant_layer_type, "k_bits": k_bits, "v_bits": v_bits, "compand_a": 0}
+
+
+def model_cache_options(args, config_bytes, models, *, quant_layer_type=None, aster_layer_type=None):
+    """Validate all active components before constructing any cache or loading weights."""
+    k, v = resolve_cache_types(args)
+    base = cache_kwargs(k, v, quant_layer_type=quant_layer_type, aster_layer_type=aster_layer_type)
+    options = {name: dict(base) for name in models}
+    policy_path = getattr(args, "cache_policy", None)
+    if policy_path is None:
+        return options, None
+    policy_module = _cache_policy()
+    policy = policy_module.load_cache_policy(policy_path)
+    descriptors = {name: [dict(layer_idx=layer.layer_idx, kv_heads=layer.num_kv_heads,
+                              head_dim=layer.head_dim) for layer in model.get_cache_layers()]
+                   for name, model in models.items()}
+    assignments = policy_module.validate_cache_policy(policy, config_bytes, descriptors)
+    for name, layers in assignments.items():
+        options[name]["layer_overrides"] = {
+            idx: cache_kwargs(ck, cv, quant_layer_type=quant_layer_type, aster_layer_type=aster_layer_type)
+            for idx, (ck, cv) in layers.items()}
+    return options, policy_module.policy_summary(policy)
 
 
 def _tensor_bytes(tensor):
@@ -125,11 +177,26 @@ def cache_storage(cache, *, cache_k=None, cache_v=None):
                 "attention_layers": 0, "tensor_bytes": 0, "layers": []}
     layers = []
     total = 0
-    for layer in (getattr(cache, "layers", None) or {}).values():
+    for instance, layer in (getattr(cache, "layers", None) or {}).items():
         tensors = layer.get_tensors() or []
+        metadata = getattr(layer, "get_metadata_tensors", lambda: [])() or []
+        tensors = [*tensors, *metadata]
         shapes = [list(tensor.shape) for tensor in tensors if tensor is not None]
         size = sum(_tensor_bytes(tensor) for tensor in tensors)
         total += size
-        layers.append({"class": type(layer).__name__, "tensor_shapes": shapes, "tensor_bytes": size})
+        fmt = getattr(layer, "cache_format", None)
+        k = "aster5" if fmt == "aster5" else "q" + str(layer.k_bits) if hasattr(layer, "k_bits") else cache_k
+        v = "aster5" if fmt == "aster5" else "q" + str(layer.v_bits) if hasattr(layer, "v_bits") else cache_v
+        layers.append({"class": type(layer).__name__, "tensor_shapes": shapes, "tensor_bytes": size,
+                       "layer_idx": instance[0] if isinstance(instance, tuple) else instance,
+                       "cache_k": k, "cache_v": v})
+    if len({row['cache_k'] for row in layers}) > 1:
+        cache_k = "mixed"
+    elif layers:
+        cache_k = layers[0]['cache_k']
+    if len({row['cache_v'] for row in layers}) > 1:
+        cache_v = "mixed"
+    elif layers:
+        cache_v = layers[0]['cache_v']
     return {"present": True, "cache_k": cache_k, "cache_v": cache_v,
             "attention_layers": len(layers), "tensor_bytes": total, "layers": layers}

@@ -869,7 +869,7 @@ class Attention(Module):
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
-        o = attn_dispatch(
+        o = getattr(self, "_quantlab_attn_dispatch", attn_dispatch)(
             q = q,
             k = k,
             v = v,

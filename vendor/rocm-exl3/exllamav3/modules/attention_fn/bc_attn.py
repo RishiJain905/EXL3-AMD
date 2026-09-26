@@ -263,7 +263,8 @@ class BCAttn:
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N",
+            "codebook", "NONUNIFORM", "POLYNOMIAL")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
@@ -271,6 +272,7 @@ class BCAttn:
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            codebook = None, NONUNIFORM = False, POLYNOMIAL = None,
         )
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
 
@@ -440,6 +442,7 @@ def build_bc_attn(module, layer):
         _module_eligible(m) and
         isinstance(layer, (CacheLayer_quant, CacheLayer_fp16)) and
         (not isinstance(layer, CacheLayer_quant) or (
+            layer.cache_format == "uniform" and
             layer.compand_a == 0.0 and layer.qk is not None and
             layer.qk.device == torch.device(m.device)
         )) and

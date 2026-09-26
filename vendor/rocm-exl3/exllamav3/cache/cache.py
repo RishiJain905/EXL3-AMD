@@ -99,6 +99,7 @@ class Cache:
         layer_type: Type[CacheLayer] | None = None,
         max_batch_size: int = 16,
         max_history: int = 0,
+        layer_overrides: dict | None = None,
         **kwargs
     ):
         """
@@ -129,6 +130,10 @@ class Cache:
 
         :param v_bits:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
+
+        :param layer_overrides:
+            Optional layer_idx -> complete constructor options, including layer_type.
+            Recurrent state is unaffected. Runtime policy validation happens before construction.
         """
         self.model = model
         # Set by Model.load() / cleared by Model.unload(): cache tensors are allocated by the
@@ -146,13 +151,20 @@ class Cache:
         cl = self.model.get_cache_layers()
         self.num_layers = len(cl)
         self.layers = {}
+        overrides = layer_overrides or {}
+        if overrides.keys() - {attn.layer_idx for attn in cl}:
+            raise ValueError("Cache override references an unknown attention layer")
         for attn in cl:
+            requested_kwargs = dict(overrides.get(attn.layer_idx, kwargs))
+            requested_type = requested_kwargs.pop("layer_type", self.layer_type)
             # Attention variants with a different cache geometry (MLA stores one latent plus one
             # shared rope key instead of per-head K/V) map the requested layer type to their own
             layer_type, layer_kwargs = (
-                attn.cache_layer_type(self.layer_type, kwargs)
-                if hasattr(attn, "cache_layer_type") else (self.layer_type, kwargs)
+                attn.cache_layer_type(requested_type, requested_kwargs)
+                if hasattr(attn, "cache_layer_type") else (requested_type, requested_kwargs)
             )
+            if getattr(requested_type, "cache_format", None) == "aster5" and layer_type is not requested_type:
+                raise NotImplementedError("AsterKV currently requires standard per-head K/V cache geometry")
             for instance in self.model.get_layer_instances(attn.layer_idx):
                 self.layers[instance] = \
                     layer_type(self.config, attn, id(self), self.max_num_tokens, **layer_kwargs)
