@@ -183,6 +183,8 @@ int exl3_gemv_splitk_warps(int k_tiles, int n_tiles, int bszm)
 // -----------------------------------------------------------------------------
 
 #include "rdna-smallm.hip.h"
+#include "rdna-mlp-pair.hip.h"
+#include "rdna-head-tiled.hip.h"
 
 static void exl3_gemv_rdna_launch
 (
@@ -383,6 +385,13 @@ bool exl3_gemv_try_launch
     const half*     suh_ptr   = *(const half* const*)     kernel_args[7];
     half*           A_had_ptr = *(half* const*)           kernel_args[8];
     const half*     svh_ptr   = *(const half* const*)     kernel_args[9];
+
+    if (exl3_head_tiled_try(A_ptr, B_ptr, C_ptr, size_m, size_k, size_n,
+        K, cb, c_fp32, suh_ptr, A_had_ptr, svh_ptr, device, stream))
+    {
+        if (launched_kernel) *launched_kernel = nullptr;
+        return true;
+    }
 
     if (exl3_smallm_try_launch(A_ptr, B_ptr, C_ptr, size_m, size_k, size_n,
         K, cb, c_fp32, suh_ptr, A_had_ptr, svh_ptr, stream))

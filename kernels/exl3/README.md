@@ -15,6 +15,29 @@ The supervised `scripts/check_exl3_kernels.py` command runs small-M and prefill
 checks with registered permissions, hash verification and GPU ownership.
 See [GPU compatibility](../../docs/GPU-COMPATIBILITY.md) for commands and limits.
 
+`check_highbit_smallm.py` covers the retained MiMo mul1 K5/K6 dot extension.
+`check_packed_mid.py` checks every row count from 10 through 64 against an
+independent CPU reference, including output/scratch guards, non-default streams
+and external graph replay with changed inputs. Select these suites with
+`--checks highbit-smallm packed-mid`. See the [packed MLP report](../../docs/PACKED-MLP-PERFORMANCE.md)
+for capability gates, tuning scope and validation status.
+
+`check_packed_prefill.py` validates tiled packed projections from 65–4096 rows
+against independent CPU weights, including tails and long reductions.
+`check_mlp_pair.py` requires exact agreement with separate gate/up/SwiGLU
+operations and covers malformed buffers, alignment, streams, and external
+graph replay. Run them with `--checks packed-prefill mlp-pair` and a matching
+verified build. See the [prefill/MLP report](../../docs/PREFILL-MLP-FUSION.md).
+
+`check_head_tiled.py` covers wide FP16 and FP32 vocabulary heads against independently
+decoded weights and exact inherited outputs. It also checks the compressed
+layout adapter's shared-copy lifecycle, memory fallback, streams and graph
+replay. `check_attention_schedule.py` checks format/geometry-specific attention
+options with shuffled pages, output guards and changed-length graph replay.
+Run `--checks head-tiled attention-schedule` with the matching verified build.
+The [head/attention report](../../docs/HEAD-ATTENTION-PERFORMANCE.md) separates
+operator checks from full-model and MTP evidence.
+
 `check_hgemm.py` exposes `run_checks(torch, extension)` for the optional FP32-output
 prefill GEMM. The caller must already hold the GPU lease and supply a verified,
 loaded extension; the validator neither loads nor builds a binary. It checks
@@ -22,3 +45,25 @@ numerical references, dispatch fallbacks, output canaries, invalid arguments,
 stream behavior and graph replay, including both sides of the 512-row WMMA
 dispatch boundary. [Initial measurements](../../docs/GPU-PERFORMANCE.md) and
 [full CLI follow-up](../../docs/RUNTIME-PERFORMANCE.md).
+
+`check_kv_cache.py` and `check_asterkv.py` check packed cache storage and online
+attention, independently of model task quality. With an existing registered
+Linux/WSL installation, run the supervised validator from this checkout:
+
+```bash
+python scripts/check_exl3_kernels.py --checks kv-cache asterkv --output artifacts/kv-checks
+```
+
+The result directory must be new. Registration permissions, extension hashing,
+the GPU lease and resource monitoring remain active. `asterkv_reference.py`
+provides a separate NumPy quantization/calibration reference; its byte-sized
+codes are unpacked reference data, not the runtime's five-bit storage.
+
+`profile_asterkv.py` exposes `run_profile(torch, extension, ...)` to a caller
+that already owns the GPU lease and has verified the extension. It compares a
+bounded set of schedules on seeded synthetic caches and checks each output
+against its codec's default. Optional capacity, occupancy, query lengths and
+graph-replay timing support long-context diagnosis without loading a model.
+Metadata records effective staging and decode-profile settings; these must
+match serving when making a serving-related comparison. Microbenchmarks do
+not establish end-to-end speed or task quality.

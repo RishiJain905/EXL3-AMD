@@ -23,6 +23,7 @@ Read `README.md` and relevant documentation before changing behavior. Consult `d
 - Keep APIs small, behavior explicit, and naming clear. Follow surrounding code conventions.
 - Inspect relevant code before editing, preserve unrelated work, and keep changes focused on the requested task.
 - Update documentation when CLI flags, configuration, setup, or observable API behavior changes.
+- Promote measured inference improvements to the primary runtime automatically after correctness and regression validation. Do not leave a validated improvement opt-in; retain guarded fallbacks for unsupported cases and diagnostic overrides when useful.
 
 ## Runtime boundaries
 

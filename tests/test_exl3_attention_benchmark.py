@@ -9,7 +9,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from benchmark_exl3_attention import MAX_CASES, MAX_CONFIGS_PER_CASE, PAGE_SIZE, validate_plan
+from benchmark_exl3_attention import MAX_CASES, MAX_CONFIGS_PER_CASE, MEMORY_BUDGET_BYTES, PAGE_SIZE, validate_plan
 import evaluate_exl3_candidate as evaluator
 import launch_runtime as launcher
 
@@ -183,6 +183,90 @@ class OccupiedCodingModeTests(unittest.TestCase):
             self.assertIn('--context-speed-task', stderr.getvalue())
         finally:
             sys.argv = saved
+
+
+class GeometryFormatTests(unittest.TestCase):
+    def test_defaults_match_current_geometry(self):
+        (case,) = validate_plan([_case(length=4000, q_len=1)])
+        self.assertEqual(case['query_heads'], 24)
+        self.assertEqual(case['kv_heads'], 4)
+        self.assertEqual(case['head_dim'], 256)
+        self.assertIsNone(case['k_bits'])
+        self.assertIsNone(case['v_bits'])
+        self.assertLessEqual(case['estimated_bytes'], MEMORY_BUDGET_BYTES)
+
+    def test_mimo_and_supported_geometries_accepted(self):
+        for query_heads, kv_heads, head_dim in ((16, 4, 256), (24, 4, 256),
+                                                (8, 8, 128), (32, 8, 64)):
+            with self.subTest(query_heads=query_heads, kv_heads=kv_heads, head_dim=head_dim):
+                (case,) = validate_plan([_case(length=4000, q_len=1, query_heads=query_heads,
+                                               kv_heads=kv_heads, head_dim=head_dim)])
+                self.assertEqual((case['query_heads'], case['kv_heads'], case['head_dim']),
+                                 (query_heads, kv_heads, head_dim))
+
+    def test_head_bounds_and_divisibility(self):
+        for field in ('query_heads', 'kv_heads'):
+            for bad in (True, 0, 129, '4', None):
+                with self.subTest(field=field, bad=bad):
+                    with self.assertRaisesRegex(ValueError, field):
+                        validate_plan([_case(**{field: bad})])
+        with self.assertRaisesRegex(ValueError, 'divisible'):
+            validate_plan([_case(query_heads=16, kv_heads=6)])
+        for bad_dim in (True, 32, 96, 512, '256'):
+            with self.subTest(bad_dim=bad_dim):
+                with self.assertRaisesRegex(ValueError, 'head_dim'):
+                    validate_plan([_case(head_dim=bad_dim)])
+
+    def test_integer_formats_default_to_symmetric_bits(self):
+        for cache_type, bits in (('q4', 4), ('q5', 5), ('q6', 6), ('q8', 8)):
+            with self.subTest(cache_type=cache_type):
+                (case,) = validate_plan([_case(length=4000, q_len=1, cache_type=cache_type)])
+                self.assertEqual((case['k_bits'], case['v_bits']), (bits, bits))
+
+    def test_mixed_kv_bits_pairs(self):
+        (case,) = validate_plan([_case(length=4000, q_len=1, cache_type='q4',
+                                       k_bits=8, v_bits=4)])
+        self.assertEqual((case['k_bits'], case['v_bits']), (8, 4))
+        (case,) = validate_plan([_case(length=4000, q_len=1, cache_type='q8',
+                                       k_bits=4, v_bits=6)])
+        self.assertEqual((case['k_bits'], case['v_bits']), (4, 6))
+
+    def test_invalid_bits_and_f16_bits_rejected(self):
+        for field in ('k_bits', 'v_bits'):
+            for bad in (True, 3, 7, 9, '8'):
+                with self.subTest(field=field, bad=bad):
+                    with self.assertRaisesRegex(ValueError, field):
+                        validate_plan([_case(cache_type='q4', **{field: bad})])
+        with self.assertRaisesRegex(ValueError, 'k_bits'):
+            validate_plan([_case(cache_type='f16', k_bits=8)])
+        with self.assertRaisesRegex(ValueError, 'v_bits'):
+            validate_plan([_case(cache_type='f16', v_bits=4)])
+        with self.assertRaisesRegex(ValueError, 'cache_type'):
+            validate_plan([_case(cache_type='aster')])
+
+    def test_backwards_compatible_plan_unchanged(self):
+        (case,) = validate_plan([_case(length=4000, q_len=1)])
+        self.assertEqual(case['capacity'], 4096)
+        self.assertEqual(case['seed'], 4197)
+        self.assertEqual((case['query_heads'], case['kv_heads'], case['head_dim']), (24, 4, 256))
+
+    def test_resource_rejection_before_allocation(self):
+        with self.assertRaisesRegex(ValueError, 'exceeds'):
+            validate_plan([_case(length=130000, q_len=16, query_heads=128,
+                                 kv_heads=128, head_dim=256)])
+        try:
+            validate_plan([_case(length=130000, q_len=16, query_heads=128,
+                                 kv_heads=128, head_dim=256)])
+        except ValueError as exc:
+            self.assertIn('query_heads=128', str(exc))
+            self.assertIn('capacity=', str(exc))
+
+    def test_estimate_grows_with_geometry(self):
+        (small,) = validate_plan([_case(length=4000, q_len=1, query_heads=16,
+                                        kv_heads=4, head_dim=256)])
+        (large,) = validate_plan([_case(length=4000, q_len=1, query_heads=64,
+                                        kv_heads=16, head_dim=256)])
+        self.assertLess(small['estimated_bytes'], large['estimated_bytes'])
 
 
 if __name__ == '__main__':

@@ -113,12 +113,36 @@ static bool exl3_smallm_use_register_b()
     return value && atoi(value) == 2;
 }
 
-static int exl3_smallm_warps(int k, int n)
+static int exl3_smallm_mlp_warps()
+{
+    const char* env = std::getenv("EXL3_SMALLM_MLP_WARPS");
+    if (!env) return 0;
+    int value = atoi(env);
+    return value == 4 || value == 8 || value == 16 ? value : 0;
+}
+
+static int exl3_smallm_warps(int k, int n, int m)
 {
     int head = exl3_quantlab_head_warps();
     if (n / 16 > EXL3_GEMV_SPLITK_MAX_TILES && head) return head;
-    return exl3_gemv_splitk_enabled() && n / 16 <= EXL3_GEMV_SPLITK_MAX_TILES
-        ? exl3_gemv_splitk_warps(k / 16, n / 16, 1) : 1;
+    if (!exl3_gemv_splitk_enabled() || n / 16 > EXL3_GEMV_SPLITK_MAX_TILES)
+        return 1;
+    // Existing explicit overrides keep precedence over the MLP selector below.
+    // Mirrors the EXL3_GEMV_SPLITK_WARPS check in exl3_gemv_splitk_warps; the
+    // head override returned above.
+    const char* splitk_env = std::getenv("EXL3_GEMV_SPLITK_WARPS");
+    if (splitk_env)
+    {
+        int forced = atoi(splitk_env);
+        if (forced == 4 || forced == 8 || forced == 16) return forced;
+    }
+    // Experimental gfx1101 MLP split-K selector (tuning only, not itself a
+    // claimed optimization): narrow non-head matrix envelope, unset or invalid
+    // keeps prior behavior.
+    int mlp = exl3_smallm_mlp_warps();
+    if (mlp && m > 1 && k >= 2048 && n >= 2048 && n <= 32768)
+        return mlp;
+    return exl3_gemv_splitk_warps(k / 16, n / 16, 1);
 }
 
 template <int M, int BITS, int CB, bool FP32>
@@ -127,7 +151,7 @@ static void exl3_smallm_launch_typed(const half* a, const uint16_t* b, void* c,
 {
     hipLaunchKernelGGL((exl3_smallm_had<false, false>), dim3((k / 128 + 7) / 8, 1, M),
         dim3(256), 0, stream, a, ah, suh, k, nullptr);
-    int warps = exl3_smallm_warps(k, n);
+    int warps = exl3_smallm_warps(k, n, M);
     #define SMALLM_DOT(W) do { \
         if (exl3_smallm_use_register_b()) \
             hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W, false, true>), \
@@ -150,10 +174,24 @@ static void exl3_smallm_launch_typed(const half* a, const uint16_t* b, void* c,
         dim3(256), 0, stream, c, c, svh, n, nullptr);
 }
 
+#include "rdna-packed-prefill.hip.h"
+#include "rdna-smallm-mid.hip.h"
+#include "rdna-smallm-highbit.hip.h"
+
 static bool exl3_smallm_try_launch(const half* a, const uint16_t* b, void* c,
     int m, int k, int n, int bits, int cb, bool fp32,
     const half* suh, half* ah, const half* svh, cudaStream_t stream)
 {
+    // Tiled prefill ahead of the small-M rejection: independent envelope
+    // (rows 65..4096). No flag set means no behavior change.
+    if (exl3_packed_prefill_try(a,b,c,m,k,n,bits,cb,fp32,suh,ah,svh,stream))
+        return true;
+    // Packed mid-M path: independent envelope (rows 10..64) ahead of the
+    // small-M m>9 rejection below. No flag set means no behavior change.
+    if (exl3_packed_mid_try(a,b,c,m,k,n,bits,cb,fp32,suh,ah,svh,stream))
+        return true;
+    if (bits == 5 || bits == 6)
+        return exl3_smallm_highbit_try(a,b,c,m,k,n,bits,cb,fp32,suh,ah,svh,stream);
     const char* flag = std::getenv("EXL3_SMALLM");
     if (!flag || atoi(flag) != 1 || (m < 2 || m > 9) || (cb != 0 && cb != 2) ||
         bits < 2 || bits > 4 || k % 128 || n % 128 || !suh || !ah || !svh)

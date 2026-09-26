@@ -17,8 +17,16 @@ A model-selectable EXL3 inference runtime for AMD GPUs, with a Python CLI and a 
 
 - Local EXL3 model directories selected with `-m`.
 - Generation, speed/quality checks, occupied-context measurements and persistent serving.
-- FP16, integer Q8 and integer Q4 attention KV caches.
+- FP16 and integer Q8/Q6/Q5/Q4 attention KV caches, plus an experimental
+  [AsterKV-5 research prototype](docs/KVCache-Research/README.md).
 - Integrated MTP drafting when the model includes compatible weights.
+- Automatic packed projections for eligible 10–64-row batches with a compatible native build.
+- Automatic tiled prefill, dense WMMA selection, and paired MLP kernels for
+  their validated shapes. [MiMo measurements and dispatch policy](docs/PREFILL-MLP-FUSION.md).
+- Automatic attention scheduling by cache format, head geometry and occupied
+  context. [9B/27B measurements and supported shapes](docs/HEAD-ATTENTION-PERFORMANCE.md).
+- Automatic compressed vocabulary-head layout for supported decode and MTP
+  verification batches, with memory-bounded fallback.
 - OpenAI Chat Completions tools for recognized Qwen XML and Hermes JSON templates.
 - Configurable resource limits, GPU lease, extension hash checks, offline loading and private artifacts.
 
@@ -30,8 +38,8 @@ EXL3-AMD uses a modified copy of CarouselAether's ROCm port, pinned at `550dcfed
 
 | Area | Upstream foundation | Our additions and modifications |
 | --- | --- | --- |
-| AMD execution and MTP verification | Turboderp's packed-weight decoding and CarouselAether's HIP/RDNA kernels and dispatch | WSL dispatch repairs, shared packed projection kernels for eligible 2–9 token rows, graph integration and decode fusions. The small-row kernels reuse decoded weight fragments during MTP verification. |
-| KV cache and long context | Inherited packed Q8/Q4 storage, rotation and attention kernels | CLI/server cache selection for target and draft, plus an opt-in Q8 attention scheduling/reduction profile with explicit GPU, shape and context guards. |
+| AMD execution and MTP verification | Turboderp's packed-weight decoding and CarouselAether's HIP/RDNA kernels and dispatch | WSL dispatch repairs, shared packed projection kernels for eligible 2–9 token rows, automatic packed projections for 10–64 rows, graph integration and decode fusions. The small-row kernels reuse decoded weight fragments during MTP verification. |
+| KV cache and long context | Inherited packed Q8/Q4 storage, rotation and attention kernels | CLI/server cache selection for target and draft, plus automatic attention scheduling/reduction with explicit GPU, cache-format, shape and context guards. |
 | Conversion and native builds | ExLlamaV3's converter and the ROCm build system | K2 encoder shared-memory repairs, memory-bounded conversion buffers, Qwen text/source adaptation, build compatibility fixes and guarded object reuse. |
 | CLI and installation | Upstream model loading, tokenization and generation | The `run.py` interface with familiar `-m`, `-c` and MTP flags; model-independent installation registration; extension verification, GPU ownership, configurable resource monitoring and private run artifacts. |
 | Serving and function tools | An [HTTP server already exists upstream](vendor/rocm-exl3/rocm_tools/exl3_server/README.md); its disconnect/stream-cleanup design informed this work | Our text-only HTTP adapter, serialized request lifecycle, Qwen XML/Hermes JSON tool parsing, structured responses, validation and recoverable malformed-tool errors. Persistent serving has no overall lifetime cap. |
@@ -96,12 +104,14 @@ The server has no overall lifetime timeout. Explicit shutdown and resource/error
 | `-c / --ctx-size` | Total context; default 4096, minimum 1024, multiple of 256 |
 | `-n / --n-predict` | Generate-mode output limit, 1–8192 |
 | `-p / --prompt`, `-f / --file` | Prompt text or UTF-8 file |
-| `--cache-type f16\|q8\|q4` | Both KV precisions; default f16 |
+| `--cache-type f16\|q8\|q6\|q5\|q4\|aster5` | Both KV precisions; default f16; aster5 is experimental |
+| `--cache-policy POLICY.json` | Experimental per-layer precision profile; see the [Stage 2 contract](docs/KVCache-Research/STAGE2.md) |
 | `-ctk`, `-ctv` | Separate K/V precision; both quantized or both f16 |
 | `--spec-type draft-mtp` | Integrated MTP; drafting is off by default |
 | `--spec-draft-n-max` | Draft depth 0–8; draft-mtp alone selects 2 |
 | `--draft-confidence` | Optional adaptive confidence, strictly between 0 and 1 |
-| `--attention-profile default\|long` | Default scheduling or guarded Q8 long-context optimization |
+| `--attention-profile auto\|default\|long` | Automatic measured scheduling; inherited and legacy long profiles for diagnosis |
+| `--no-packed-mid` | Diagnostic fallback for 10–64-row projections; compatible builds use packed kernels automatically |
 | `--output` | New private artifact directory; existing directories refused |
 | `--reasoning on\|off\|auto` | Serve thinking-template mode; default auto respects the template |
 | `--temperature`, `--top-p`, `--top-k`, `--min-p`, penalties, `--seed` | Serve sampling defaults with per-request overrides; default greedy |

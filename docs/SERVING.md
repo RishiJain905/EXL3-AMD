@@ -8,9 +8,32 @@ python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --alias exl3 --
 
 Add compatible MTP flags if the model includes drafting weights. The model remains loaded; every serialized request has its own generation job and sampler. There is one active GPU request and four queue slots, without continuous batching. Normal launches need no `--config`.
 
+Eligible 10–64-row projections use the packed kernels automatically when the
+verified native build supports them. No kernel-selection flag is needed.
+`--no-packed-mid` retains a reconstruction fallback for diagnosis.
+Tiled prefill and paired MLP kernels are also automatic with a matching
+verified build. Their [shape policy](PREFILL-MLP-FUSION.md) keeps dense fallback
+where it is faster. `--no-packed-prefill` and `--no-mlp-pair` are diagnostic overrides.
+Verified repacked-head ABI 3 also selects the supported compressed vocabulary
+head automatically. It preserves FP16 or FP32 logits and their intermediate
+rounding, shares the view with MTP when the head is shared, and falls back
+when its memory budget cannot be met.
+`/health` reports packed-head calls, allocated bytes and memory fallback.
+
 `--execute` is no longer a runtime CLI flag. Launching a command runs it once
 both installation execution permissions are enabled; native hash checks and
 resource guards still apply.
+
+Serving defaults to `--attention-profile auto`, selecting measured launch
+geometry for supported GPUs, cache formats and occupied contexts. No enabling
+flag is required. `--attention-profile default` restores inherited scheduling
+for comparisons. See [dispatch and validation](HEAD-ATTENTION-PERFORMANCE.md).
+Different split reductions can change rounding and a greedy continuation;
+this control is available when reproducing the inherited schedule matters.
+
+Experimental `--cache-policy POLICY.json` loads an offline per-layer attention
+precision assignment. The [Stage 2 profile contract](KVCache-Research/STAGE2.md)
+describes configuration binding, target/draft coverage and validation limits.
 
 ## API
 
@@ -57,8 +80,8 @@ Greedy decoding is the default (`temperature: 0`, `top_p: 1`, `n: 1`). Serve fla
 `--prefill-gemm wmma` selects the native FP16-input, FP32-output GEMM on
 gfx1101 for at least 64 rows and K/N dimensions divisible by 128. Accumulation
 and output remain FP32. Other shapes and FP16 outputs keep the BLAS path.
-The default is `blas`; opting in requires a hash-verified extension exporting
-prefill GEMM ABI 1. This is separate from `--smallm-kernel`, which controls
+The default is `auto`, selecting WMMA with a hash-verified extension exporting
+prefill GEMM ABI 1 and BLAS otherwise. This is separate from `--smallm-kernel`, which controls
 packed decode projections.
 
 ## Prefix reuse

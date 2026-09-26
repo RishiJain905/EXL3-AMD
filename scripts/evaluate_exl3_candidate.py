@@ -72,7 +72,14 @@ def parser():
     p.add_argument('--decode-fusions', choices=('off', 'gdn', 'gdn-mlp', 'gdn-mlp-mgemv'), default='off')
     p.add_argument('--gemv-splitk-warps', type=int, choices=(4, 8, 16))
     p.add_argument('--smallm-kernel', choices=('dot','wmma','wmma-register'), default='dot')
-    p.add_argument('--prefill-gemm', choices=('blas','wmma'), default='blas')
+    p.add_argument('--prefill-gemm', choices=('auto','blas','wmma'), default='auto')
+    p.add_argument('--packed-mid', action=argparse.BooleanOptionalAction, default=None,
+                   help='Packed projections for 10-64 rows; enabled by default when the verified binary supports them')
+    p.add_argument('--packed-prefill', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically use validated tiled packed prefill; disable for diagnostics')
+    p.add_argument('--mlp-pair', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically pair eligible MLP gate/up projections; disable for diagnostics')
+    p.add_argument('--smallm-mlp-warps', type=int, choices=(4,8,16), help='Experimental packed MLP split-K scheduling override')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16))
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off')
     p.add_argument('--draft-step-graph', action='store_true', help='Experimental whole MTP step graph; requires GPU drafting and metadata')
@@ -220,7 +227,7 @@ def main():
         for key, value in dict(EXL3_BC_ATTN='1' if args.native_attention else '0', EXL3_GEMV='2', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1').items():
             os.environ[key] = value
         os.environ['EXL3_SMALLM_GRAPH'] = '1' if args.native_smallm_graph else '0'
-        os.environ['EXL3_QC_DECODE_PROFILE'] = getattr(args, 'attention_profile', 'default')
+        os.environ['EXL3_QC_DECODE_PROFILE'] = getattr(args, 'attention_profile', 'auto')
         if (cache_k, cache_v) != ('f16', 'f16'):
             # Packed attention without full-cache FP16 staging.
             os.environ['EXL3_QC_STAGING'] = '0'
@@ -247,7 +254,9 @@ def main():
         from quantlab.methods.exl3.optimizations import configure_native
         status['native_optimizations'] = configure_native(binary,
             smallm_kernel=args.smallm_kernel, head_warps=args.head_warps,
-            prefill_gemm=args.prefill_gemm, native_smallm=args.native_smallm)
+            prefill_gemm=args.prefill_gemm, native_smallm=args.native_smallm,
+            packed_mid=getattr(args, 'packed_mid', None), mlp_warps=getattr(args, 'smallm_mlp_warps', None),
+            packed_prefill=getattr(args, 'packed_prefill', None), mlp_pair=getattr(args, 'mlp_pair', None))
         sys.path.insert(0, str(args.source_dir))
         from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer, Generator, Job, ArgmaxSampler
         from quantlab.methods.exl3.compat import install, prepare_loaded_module
@@ -285,7 +294,10 @@ def main():
             raise ValueError('Requested context exceeds or lacks model metadata limit')
         install(cfg, native_smallm=args.native_smallm, native_smallm_max_rows=args.native_smallm_max_rows,
                 native_attention=args.native_attention,
-                native_smallm_codebooks=status['native_optimizations']['smallm_codebooks'])
+                native_smallm_codebooks=status['native_optimizations']['smallm_codebooks'],
+                native_smallm_highbit=status['native_optimizations']['smallm_highbit_abi'] == 1,
+                native_packed_mid=status['native_optimizations']['packed_mid'],
+                native_packed_prefill=status['native_optimizations']['packed_prefill'])
         record('gemv_environment', values={k: os.environ.get(k) for k in (
             'EXL3_GEMV', 'EXL3_GEMV_SPLITK', 'EXL3_GEMV_SPLITK_WARPS',
             'EXL3_GEMV_LDS', 'EXL3_GEMV_GRAPH', 'EXL3_MGEMV',
@@ -297,10 +309,14 @@ def main():
         model = Model.from_config(cfg)
         draft = Model.from_config(cfg, component='mtp') if args.mtp else None
         check_required_tensors(cfg, (model, draft) if draft is not None else (model,))
-        cache_options = _cache_precision().cache_kwargs(cache_k, cache_v, quant_layer_type=CacheLayer_quant)
+        models = dict(target=model)
+        if draft is not None:
+            models['draft'] = draft
+        cache_options, status['cache_policy'] = _cache_precision().model_cache_options(
+            args, (candidate / 'config.json').read_bytes(), models, quant_layer_type=CacheLayer_quant)
         cache = Cache(model, max_num_tokens=args.context, max_batch_size=1, max_history=args.draft_tokens if args.mtp else 0,
-                      **cache_options)
-        draft_cache = Cache(draft, max_num_tokens=args.context, max_batch_size=1, **cache_options) if args.mtp else None
+                      **cache_options['target'])
+        draft_cache = Cache(draft, max_num_tokens=args.context, max_batch_size=1, **cache_options['draft']) if args.mtp else None
         torch.cuda.synchronize()
         load_start = time.monotonic()
         def prepare(module):
@@ -321,6 +337,11 @@ def main():
         status['optimizations'] = install_optimizations(model, draft,
             gpu_embedding=args.gpu_embedding, batch_greedy=args.batch_greedy,
             gpu_draft=args.gpu_draft, gpu_draft_metadata=args.gpu_draft_metadata)
+        from quantlab.methods.exl3.packed_mlp import install_mlp_pair
+        status['optimizations']['mlp_pair'] = install_mlp_pair(model, draft, enabled=status['native_optimizations']['mlp_pair'])
+        from quantlab.methods.exl3.packed_head import install_packed_head
+        status['optimizations']['packed_head'] = install_packed_head(model, draft,
+            enabled=status['native_optimizations']['head_repacked'], memory_fraction=gpu_fraction)
         if args.draft_step_graph:
             from quantlab.methods.exl3.draft_graph import DraftStepGraph
             model.quantlab_draft_step = DraftStepGraph(draft)

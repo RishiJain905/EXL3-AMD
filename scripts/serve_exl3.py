@@ -83,7 +83,7 @@ class Engine:
             raise ValueError('Extension hash mismatch')
         os.environ.update(EXL3_BC_ATTN='1' if args.native_attention else '0', EXL3_GEMV='2', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
                           EXL3_SMALLM_GRAPH='1' if args.native_smallm_graph else '0')
-        os.environ['EXL3_QC_DECODE_PROFILE'] = getattr(args, 'attention_profile', 'default')
+        os.environ['EXL3_QC_DECODE_PROFILE'] = getattr(args, 'attention_profile', 'auto')
         if (self.cache_k, self.cache_v) != ('f16', 'f16'):
             # Packed attention without full-cache FP16 staging.
             os.environ['EXL3_QC_STAGING'] = '0'
@@ -107,7 +107,9 @@ class Engine:
         from quantlab.methods.exl3.optimizations import configure_native
         native_options = configure_native(binary,
             smallm_kernel=args.smallm_kernel, head_warps=args.head_warps,
-            prefill_gemm=getattr(args, 'prefill_gemm', 'blas'), native_smallm=args.native_smallm)
+            prefill_gemm=getattr(args, 'prefill_gemm', 'blas'), native_smallm=args.native_smallm,
+            packed_mid=getattr(args, 'packed_mid', None), mlp_warps=getattr(args, 'smallm_mlp_warps', None),
+            packed_prefill=getattr(args, 'packed_prefill', None), mlp_pair=getattr(args, 'mlp_pair', None))
         self.record('native_optimizations', **native_options)
         sys.path.insert(0, str(args.source_dir))
         from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer, Generator, Job, ArgmaxSampler
@@ -147,17 +149,27 @@ class Engine:
             raise ValueError('Requested context exceeds or lacks model metadata limit')
         install(cfg, native_smallm=args.native_smallm, native_smallm_max_rows=args.native_smallm_max_rows,
                 native_attention=args.native_attention,
-                native_smallm_codebooks=native_options['smallm_codebooks'])
+                native_smallm_codebooks=native_options['smallm_codebooks'],
+                native_smallm_highbit=native_options['smallm_highbit_abi'] == 1,
+                native_packed_mid=native_options['packed_mid'],
+                native_packed_prefill=native_options['packed_prefill'])
         _say('stage=load model=1')
         self.model = Model.from_config(cfg)
         self.draft = Model.from_config(cfg, component='mtp') if args.mtp else None
         check_required_tensors(cfg, (self.model, self.draft) if self.draft else (self.model,))
         self.depth = args.draft_tokens if args.mtp else 0
-        cache_options = _cache_precision().cache_kwargs(self.cache_k, self.cache_v, quant_layer_type=CacheLayer_quant)
+        models = dict(target=self.model)
+        if self.draft is not None:
+            models['draft'] = self.draft
+        cache_options, self.cache_policy = _cache_precision().model_cache_options(
+            args, (args.candidate / 'config.json').read_bytes(), models, quant_layer_type=CacheLayer_quant)
         self.cache = Cache(self.model, max_num_tokens=args.context, max_batch_size=1, max_history=self.depth,
-                           **cache_options)
+                           **cache_options['target'])
         self.draft_cache = Cache(self.draft, max_num_tokens=args.context, max_batch_size=1,
-                                 **cache_options) if self.draft else None
+                                 **cache_options['draft']) if self.draft else None
+        self.record('cache_policy', policy=self.cache_policy)
+        if self.cache_policy is not None:
+            _say(f"stage=cache-policy version=1 sha256={self.cache_policy['sha256']}")
         self.fusion_counters = []
         with torch.inference_mode():
             for model in (self.draft, self.model):
@@ -188,6 +200,11 @@ class Engine:
             self.optimizations = install_optimizations(self.model, self.draft,
                 gpu_embedding=args.gpu_embedding, batch_greedy=args.batch_greedy,
                 gpu_draft=args.gpu_draft, gpu_draft_metadata=args.gpu_draft_metadata)
+            from quantlab.methods.exl3.packed_mlp import install_mlp_pair
+            self.optimizations['mlp_pair'] = install_mlp_pair(self.model, self.draft, enabled=native_options['mlp_pair'])
+            from quantlab.methods.exl3.packed_head import install_packed_head
+            self.optimizations['packed_head'] = install_packed_head(self.model, self.draft,
+                enabled=native_options['head_repacked'], memory_fraction=gpu_fraction)
             if args.draft_step_graph:
                 from quantlab.methods.exl3.draft_graph import DraftStepGraph
                 self.model.quantlab_draft_step = DraftStepGraph(self.draft)
@@ -222,6 +239,7 @@ class Engine:
                     template_sha256=hashlib.sha256(self.tokenizer.hf_tokenizer.chat_template.encode()).hexdigest(),
                     template_source=template_source,
                     cache_k=self.cache_k, cache_v=self.cache_v, tool_protocol=self.tool_protocol,
+                    cache_policy=self.cache_policy,
                     attention_profile=_cache_precision().attention_profile_status(),
                     cache_storage_target=_cache_precision().cache_storage(self.cache, cache_k=self.cache_k, cache_v=self.cache_v),
                     cache_storage_draft=_cache_precision().cache_storage(self.draft_cache, cache_k=self.cache_k, cache_v=self.cache_v))
@@ -314,6 +332,8 @@ class Engine:
                     prefix_cache=self._prefix_status(),
                     prefill_chunk=self.chunk_size,
                     prefill_gemm=getattr(self.args, 'prefill_gemm', 'blas'),
+                    cache_policy=getattr(self, 'cache_policy', None),
+                    packed_head=getattr(self, 'optimizations', {}).get('packed_head', []),
                     attention_profile=_cache_precision().attention_profile_status())
 
     def shutdown(self):
@@ -705,7 +725,14 @@ def parser():
     p.add_argument('--native-smallm-graph', action='store_true')
     p.add_argument('--gemv-splitk-warps', type=int, choices=(4, 8, 16))
     p.add_argument('--smallm-kernel', choices=('dot','wmma','wmma-register'), default='dot')
-    p.add_argument('--prefill-gemm', choices=('blas','wmma'), default='blas')
+    p.add_argument('--prefill-gemm', choices=('auto','blas','wmma'), default='auto')
+    p.add_argument('--packed-mid', action=argparse.BooleanOptionalAction, default=None,
+                   help='Packed projections for 10-64 rows; enabled by default when the verified binary supports them')
+    p.add_argument('--packed-prefill', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically use validated tiled packed prefill; disable for diagnostics')
+    p.add_argument('--mlp-pair', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically pair eligible MLP gate/up projections; disable for diagnostics')
+    p.add_argument('--smallm-mlp-warps', type=int, choices=(4,8,16), help='Experimental packed MLP split-K scheduling override')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16))
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off')
     p.add_argument('--draft-step-graph', action='store_true', help='Experimental whole MTP step graph; requires GPU drafting and metadata')

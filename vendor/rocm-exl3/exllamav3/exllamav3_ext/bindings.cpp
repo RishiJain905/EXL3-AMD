@@ -129,6 +129,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+    m.def("exl3_mlp_gate_up", &exl3_mlp_gate_up,
+        py::arg("x"), py::arg("gate_trellis"), py::arg("up_trellis"),
+        py::arg("gate_suh"), py::arg("up_suh"), py::arg("gate_svh"),
+        py::arg("up_svh"), py::arg("input_scratch"),
+        py::arg("projection_scratch"), py::arg("output"), py::arg("bits"),
+        py::arg("mul1"));
+    m.def("exl3_head_repacked", &exl3_head_repacked,
+        py::arg("x"), py::arg("packed"), py::arg("suh"),
+        py::arg("input_scratch"), py::arg("svh"), py::arg("output"),
+        py::arg("bits"), py::arg("codebook"));
+#endif
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
