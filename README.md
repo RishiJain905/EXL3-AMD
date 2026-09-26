@@ -49,7 +49,7 @@ EXL3-AMD uses a modified copy of CarouselAether's ROCm port, pinned at `550dcfed
 
 The implementation is in [scripts](scripts/), [src/quantlab](src/quantlab/), [kernel work](kernels/exl3/README.md) and the modified [vendored backend](vendor/rocm-exl3/). [UPSTREAMS.md](docs/UPSTREAMS.md) gives component-level credit and source references.
 
-This comparison is against the pinned upstream revision. Aether's server exposes broader sampling and endpoint options; our adapter concentrates on the documented text/tool contract and tested AMD/WSL path. These additions do not establish a general speed advantage over Aether's runtime or compatibility with every EXL3 model. See [validation scope](docs/VALIDATION.md) and [measurement guidance](docs/OPTIMIZATION.md).
+This comparison is against the pinned upstream revision. Aether's server exposes broader sampling and endpoint options; our adapter concentrates on the documented text/tool and optional-image contracts and tested AMD/WSL path. These additions do not establish a general speed advantage over Aether's runtime or compatibility with every EXL3 model. See [validation scope](docs/VALIDATION.md) and [measurement guidance](docs/OPTIMIZATION.md).
 
 ## Install once
 

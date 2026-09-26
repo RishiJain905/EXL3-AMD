@@ -1,5 +1,42 @@
 # Release validation
 
+## Consolidated runtime integration: 2026-09-26
+
+The pending packed-kernel/cache changes and the complete MiMo branch chain
+were combined in one checkout, including conversion and packaging tools,
+BF16 MTP, rowwise verification, optional vision, and their tests and reports.
+Merge resolution preserves the qualified native extension sources exactly;
+the registered head/attention ABI-3 binary was reused without rebuilding.
+Validated packed kernels and attention schedules remain automatic, with
+unsupported cases retaining their guarded fallbacks.
+
+- Windows: 804 tests successful, with 46 dependency/platform skips.
+- Linux inference environment: 804 tests successful, with 10 Windows-only skips.
+- CLI help, syntax parsing of all 91 changed Python files, diff whitespace,
+  and public-file credential/workstation-path checks passed.
+- Ordinary MiMo CLI generation with BF16 MTP depth 2, rowwise verification,
+  F16 cache and context 4096 preserved all 64 output IDs against diagnostic
+  kernel controls. The primary recorded 128 packed-head calls; the control
+  recorded zero. Both exercised 336 rowwise attention windows.
+- The MiMo BF16-MTP vision server passed image JSON/SSE output agreement,
+  text requests before/after the image, and remote-image URL rejection.
+  Health recorded four completed requests, zero failures/cancellations,
+  and 52 packed-head calls.
+- The 27B Q6/MTP-depth-2 server processed the same 14333-token prompt through
+  JSON and SSE, producing matching 32-token responses. Health recorded two
+  completed requests, zero failures/cancellations, 108 packed-head calls,
+  and 438 automatic attention calls.
+- Both servers shut down cleanly through their stop files; every inference
+  launcher exited zero. The temporary WSL keepalive was stopped afterward.
+
+These are integration checks, not new throughput or broad-quality benchmarks.
+The earlier 2117 native checks and 716 attention-oracle comparisons remain
+documented in [the head/attention report](HEAD-ATTENTION-PERFORMANCE.md).
+The image check used one synthetic color fixture. Existing model, cache-policy,
+vision, precision and GPU compatibility limits still apply. Portable source
+and reports are committed; raw evidence stays in ignored
+`artifacts/main-integration-20260926/`.
+
 ## Vocabulary head and occupied-context attention: 2026-09-26
 
 The next two roadmap items have native and model coverage on RX 7800 XT /
