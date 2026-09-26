@@ -70,12 +70,14 @@ class KernelValidatorTests(unittest.TestCase):
                 self.assertEqual(request['timeout'], 900)
                 self.assertEqual(request['expected_sha256'], digest)
                 self.assertEqual(request['runtime']['gpu_arch'], 'gfx1201')
+                self.assertEqual(request['checks'], ['kv-cache', 'asterkv'])
                 return 7  # Preserve failures from the monitored child.
             # Keep temp paths native in this CPU-only cross-platform fixture.
             with patch.object(sys, 'platform', 'linux'), \
                     patch.object(validator.launcher, 'linux_path', side_effect=str), \
                     patch.object(validator.launcher, 'worker', side_effect=worker):
-                self.assertEqual(validator.main(['--config', str(config), '--output', str(root / 'results')]), 7)
+                self.assertEqual(validator.main(['--config', str(config), '--output', str(root / 'results'),
+                                                 '--checks', 'kv-cache', 'asterkv', 'kv-cache']), 7)
             self.assertFalse(lock.exists())
 
 

@@ -24,7 +24,7 @@ template <int M, int BITS, int CB, bool FP32>
 static void exl3_smallm_graph_typed(const Exl3GemvGraphParams* pb,
     int k, int n, cudaStream_t stream)
 {
-    int warps = exl3_smallm_warps(k, n);
+    int warps = exl3_smallm_warps(k, n, M);
     #define SMALLM_GRAPH_DOT(W) do { \
         if (exl3_smallm_use_register_b()) \
             hipLaunchKernelGGL((exl3_smallm_wmma<M, BITS, CB, FP32, W, true, true>), \

@@ -49,7 +49,7 @@ def expected_tile(symbols, bits, codebook=0):
 class Exl3OracleTests(unittest.TestCase):
     def test_mul1_circular_tiles_match_scalar_reference(self):
         rng = np.random.default_rng(917)
-        for bits in (2, 3, 4):
+        for bits in (2, 3, 4, 5, 6):
             symbols = rng.integers(0, 1 << bits, 256)
             symbols[0], symbols[-1] = 0, (1 << bits) - 1
             packed = fixture(symbols, bits).reshape(1, 1, 16 * bits)
@@ -148,7 +148,7 @@ class Exl3OracleTests(unittest.TestCase):
 
     def test_malformed_inputs(self):
         valid = np.zeros((8, 8, 32), dtype=np.int16)
-        for bits in (True, 2.0, 1, 5, None):
+        for bits in (True, 2.0, 1, 7, None):
             with self.assertRaises(ValueError):
                 decode_trellis(valid, bits)
         for packed in (valid.astype(np.uint16), valid.astype(np.float32), valid[0], valid[..., :-1], valid[:0]):

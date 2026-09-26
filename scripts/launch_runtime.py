@@ -248,8 +248,15 @@ def parser():
     p.add_argument('--decode-fusions', choices=('off','gdn','gdn-mlp'), default='gdn')
     p.add_argument('--warps', type=int, choices=(4,8,16))
     p.add_argument('--smallm-kernel', choices=('dot','wmma','wmma-register'), default='dot', help='Experimental packed projection kernel')
-    p.add_argument('--prefill-gemm', choices=('blas','wmma'), default='blas',
-                   help='FP32-output prefill GEMM; WMMA requires a matching extension (gfx1101 or experimental gfx1200/gfx1201)')
+    p.add_argument('--prefill-gemm', choices=('auto','blas','wmma'), default='auto',
+                   help='Automatically use verified FP32-output WMMA prefill; blas/wmma force a diagnostic backend')
+    p.add_argument('--packed-mid', action=argparse.BooleanOptionalAction, default=None,
+                   help='Packed projections for 10-64 rows; enabled by default when the verified binary supports them')
+    p.add_argument('--packed-prefill', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically use validated tiled packed prefill; disable for diagnostics')
+    p.add_argument('--mlp-pair', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically pair eligible MLP gate/up projections; disable for diagnostics')
+    p.add_argument('--smallm-mlp-warps', type=int, choices=(4,8,16), help='Experimental packed MLP split-K scheduling override')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16), help='Experimental wide-projection split-K override')
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off',
                    help='Cache selected reconstructed draft projections on GPU (extra VRAM)')
@@ -512,11 +519,20 @@ def main():
     if args.mtp: argv += ['--mtp','--draft-tokens',str(args.mtp)]
     if args.draft_confidence is not None: argv += ['--draft-confidence', str(args.draft_confidence)]
     if args.warps: argv += ['--gemv-splitk-warps',str(args.warps)]
+    if args.packed_mid is True: argv += ['--packed-mid']
+    elif args.packed_mid is False: argv += ['--no-packed-mid']
+    for option in ('packed_prefill', 'mlp_pair'):
+        value = getattr(args, option)
+        if value is not None:
+            argv.append('--' + ('' if value else 'no-') + option.replace('_', '-'))
+    if args.smallm_mlp_warps is not None: argv += ['--smallm-mlp-warps', str(args.smallm_mlp_warps)]
     argv += ['--smallm-kernel',args.smallm_kernel]
     argv += ['--prefill-gemm',args.prefill_gemm]
     argv += ['--gpu-memory-fraction', str(args.gpu_memory_fraction)]
     if args.head_warps is not None: argv += ['--head-warps',str(args.head_warps)]
     argv += ['--cache-type-k',cache_k,'--cache-type-v',cache_v]
+    if args.cache_policy is not None:
+        argv += ['--cache-policy', linux_path(args.cache_policy.resolve())]
     argv += ['--attention-profile',args.attention_profile]
     if args.cache_mtp != 'off': argv += ['--cache-mtp',args.cache_mtp]
     if args.draft_step_graph: argv += ['--draft-step-graph']

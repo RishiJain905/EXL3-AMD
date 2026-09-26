@@ -12,6 +12,8 @@ import numpy as np
 
 class CacheLayer_quant(CacheLayer):
 
+    cache_format = "uniform"
+
     def __init__(
         self,
         config: Config | None,
@@ -120,6 +122,8 @@ class CacheLayer_quant(CacheLayer):
 
     @override
     def copy_page(self, source: CacheLayer_quant, from_page: int, to_page: int, num_tokens: int):
+        if self.cache_format != source.cache_format:
+            raise ValueError("Cannot copy pages between different KV cache formats")
         assert self.qshape_k == source.qshape_k
         assert self.qshape_v == source.qshape_v
         self.qk[to_page, :num_tokens, :].copy_(source.qk[from_page, :num_tokens, :], non_blocking = True)

@@ -1,5 +1,101 @@
 # Release validation
 
+## Vocabulary head and occupied-context attention: 2026-09-26
+
+The next two roadmap items have native and model coverage on RX 7800 XT /
+gfx1101. Repacked-head ABI 3 preserves FP16/FP32 arithmetic, shares its bounded
+compressed view with MTP and selects supported rows automatically. Attention
+uses cache format, query/KV geometry and occupied page-table bounds to choose
+its schedule. Unsupported cases retain inherited dispatch.
+
+The fresh 110-unit build passed 2117 GPU checks: 185 head, 116 attention graph/
+stream checks and 1816 existing projection/prefill/MLP checks. All 332 native/
+build fingerprints matched. Attention sweeps passed another 716 independent
+FP32-oracle comparisons. Windows and Linux each ran 567 unit tests without
+failures, with 25 Windows dependency/platform skips and 10 Linux Windows-only
+skips. Four supervised OMP implementation packages completed successfully.
+
+Corrected FP16 head trials preserved all 6912 measured output tokens and MTP
+acceptance windows across the 9B and 27B models. The candidates recorded 1932
+and 1776 packed-head calls, respectively. Decode gains were 0.44–1.94% for
+MiMo BF16-MTP and 0.96–1.97% for the 27B quantized MTP model. Earlier FP32-only
+full-model head trials never dispatched and are explicitly invalidated in the
+report; their apparent model gains are withdrawn.
+
+At 32K occupied tokens, Q8 attention improved target-only decode by 11.20%
+on 9B and 10.80% on 27B. The 9B continuation changed after 84 common tokens;
+both inspected binary-search functions passed 10801 examples, and timing the
+shared prefix retained an 11.24% gain. This is a narrow functional check,
+not proof of unchanged broad model quality. A warmed 27B Q6/MTP comparison
+at 32K improved from 28.93 to 37.56 tok/s (29.82%), preserving all 768 measured
+tokens and draft acceptance windows. Other attention comparisons and
+the final public-interface checks are recorded in the
+[complete report](HEAD-ATTENTION-PERFORMANCE.md). Extra future-model geometries
+have operator coverage only; no additional GPU family is validated.
+
+The qualified binary is registered locally as primary. Normal MiMo target-only
+CLI generation matched 64 tokens against diagnostic controls and reported
+96 packed-head calls plus 512 automatic attention calls. The normal 27B MTP2
+server returned matching 64-token streaming/non-streaming responses and a
+sampled response. Health reported three completed requests, zero failures,
+175 packed-head calls and 748 automatic attention calls. Monitor-controlled
+shutdown was clean and the launcher exited zero. The 9B BF16-MTP numbers use
+the frozen Step4 evaluator; main-CLI MiMo coverage is target-only.
+
+## MiMo tiled prefill and paired MLP: 2026-09-26
+
+The next two roadmap items are implemented and the measured shape policy is
+primary. Generation and serving automatically select verified packed prefill,
+paired gate/up plus SwiGLU, and dense WMMA fallback. The new gfx1101 extension
+passed 1,816 GPU checks; all 331 native/build source fingerprints matched.
+Both CPU suites passed 542 tests (25 skips on Windows, 10 on Linux).
+
+The final policy preserved all 8,640 output tokens across 108 measured
+BF16-MTP requests with 256- and 1024-token prefill chunks. With 256-token
+chunks, 1244/2924-token prompts improved from 865.74/882.83 to
+1386.28/1401.85 prefill tok/s versus the original BLAS baseline. Improvements
+over the faster WMMA controls are smaller, and decode gains remain modest.
+The broader packed policy was rejected for both performance and changed
+long-prompt token sequences; its losing shapes retain dense fallback.
+
+The normal public CLI, using the newly registered binary with no config or
+optimization flags, selected all three native capabilities and matched 125
+target-only output tokens against disabled-control paths. Live loopback HTTP
+streaming and non-streaming matched 112 tokens; monitor-controlled shutdown
+completed with launcher exit zero. See the
+[complete report](PREFILL-MLP-FUSION.md) for exact dispatch bounds, accepted and
+rejected measurements, public-interface checks, binary identity and limits.
+This does not establish new 27B, RDNA4 or broad model-quality coverage.
+
+## MiMo packed projections: 2026-09-26
+
+The requested MiMo 9B baseline, packed MLP scheduling sweep and packed
+10–64-row implementation are complete on gfx1101. A fresh 110-unit native
+build passed 1,441 GPU checks; all 329 source/build fingerprints matched.
+Windows ran 520 unit tests (25 skips), and the Linux runtime ran the same 520
+(10 Windows-only skips), with no failures in the correctly configured runs.
+
+Repeated BF16-MTP model comparisons show about 1.98 times faster prefill on a
+41-token prompt with exact output-token agreement. Longer prompts and decode
+show no consistent gain. MLP warp overrides were not promoted: four warps
+regressed decode, and a separate MLP-only 16-warp diagnostic changed one SQL
+completion. Default MLP scheduling remains unchanged. The verified ABI-1 build
+was subsequently promoted to the local primary registration; generation and
+serving automatically select its packed 10–64-row path. Older binaries retain
+fallback, and `--no-packed-mid` is available for diagnosis.
+
+After promotion, both unit suites ran 531 tests successfully (25 Windows
+dependency/platform skips; 10 Linux Windows-only skips). A normal MiMo launch
+with no config or kernel flag selected packed-mid ABI 1 and matched all 64
+output tokens from the earlier explicit packed run. Process and monitor exited
+zero. The tested native binary did not change.
+
+The actual main public CLI also passed a held-out target-only comparison with
+64 identical generated tokens. See [PACKED-MLP-PERFORMANCE.md](PACKED-MLP-PERFORMANCE.md)
+for baseline rates, both successful and rejected experiments, commands, binary
+identity, OMP assistance, raw-evidence locations and limits. This is not a new
+27B, RDNA4, broad-quality or saturated-memory-bandwidth validation.
+
 ## mul1 and RDNA4 update: 2026-09-16
 
 Implementation proceeded in two stages with bounded OMP assistance: mul1

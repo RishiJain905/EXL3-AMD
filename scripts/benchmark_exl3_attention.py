@@ -1,7 +1,8 @@
 """Bounded decode-attention config benchmark over paged EXL3 KV caches.
 
 Run through the existing external monitor with the configured pinned extension.
-Uses synthetic tensors only, fixed 24 Q/4 KV heads and D256. Does not load weights or claim model fidelity.
+Uses synthetic tensors only; per-case geometry defaults to 24 Q/4 KV heads and D256.
+MiMo 9B uses 16/4/256, MiMo 27B 24/4/256. Does not load weights or claim model fidelity.
 """
 
 import argparse
@@ -21,6 +22,8 @@ MAX_CONFIGS_PER_CASE = 12
 N_Q_HEADS = 24
 N_KV_HEADS = 4
 HEAD_DIM = 256
+SUPPORTED_HEAD_DIMS = (64, 128, 256)
+SUPPORTED_Q_BITS = (4, 5, 6, 8)
 PAGE_SIZE = 256
 MAX_CAPACITY = 131072
 DEFAULT_SEED = 4197
@@ -31,6 +34,8 @@ WARMUPS = 2
 TIMING_BATCHES = 5
 TIMING_REPEATS = 10
 MEMORY_BUDGET_BYTES = 6 * 2**30
+
+_CACHE_DEFAULT_BITS = {'q4': 4, 'q5': 5, 'q6': 6, 'q8': 8}
 
 
 def _is_power_of_2(x):
@@ -47,6 +52,29 @@ def _next_pow2(x):
 def _check_bool_int(value, name):
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f'{name} must be an int')
+
+
+def _estimate_case_bytes(*, capacity, total, table_columns, q_len,
+                         n_q_heads, n_kv_heads, head_dim,
+                         cache_type, k_bits, v_bits):
+    """Conservative pre-allocation byte estimate for cache/inputs/oracle."""
+    kv_elems = n_kv_heads * head_dim
+    q_elems = n_q_heads * head_dim
+    inputs = (2 * total * kv_elems + q_len * q_elems) * 2 + table_columns * 4 + 4096
+    if cache_type == 'f16':
+        # k_cache + v_cache plus the padded staging copies; refs alias the inputs.
+        cache = 4 * capacity * kv_elems * 2
+    else:
+        groups = kv_elems // 32
+        packed = capacity * groups * (k_bits + v_bits) * 4
+        scales = 2 * capacity * groups * 2
+        dequant_tmp = 2 * capacity * kv_elems * 2
+        refs = 2 * total * kv_elems * 2
+        cache = packed + scales + dequant_tmp + refs
+    # Oracle: float32 scores + probs over (q_len, n_q, total), float32 K/V, output.
+    oracle = (2 * q_len * n_q_heads * total * 4 + 2 * total * kv_elems * 4
+              + q_len * q_elems * 4)
+    return inputs + cache + oracle + q_len * q_elems * 2
 
 
 def validate_plan(plan):
@@ -68,8 +96,41 @@ def validate_plan(plan):
             raise ValueError(f'duplicate case name {name!r}')
         seen_cases.add(name)
         cache_type = case.get('cache_type')
-        if cache_type not in ('f16', 'q8', 'q4'):
-            raise ValueError(f'{where}.cache_type must be one of f16/q8/q4')
+        if cache_type not in ('f16', 'q4', 'q5', 'q6', 'q8'):
+            raise ValueError(f'{where}.cache_type must be one of f16/q4/q5/q6/q8')
+        k_bits = case.get('k_bits')
+        v_bits = case.get('v_bits')
+        if cache_type == 'f16':
+            if k_bits is not None or v_bits is not None:
+                raise ValueError(f'{where} k_bits/v_bits require an integer cache_type')
+        else:
+            default_bits = _CACHE_DEFAULT_BITS[cache_type]
+            if k_bits is None:
+                k_bits = default_bits
+            else:
+                _check_bool_int(k_bits, f'{where}.k_bits')
+                if k_bits not in SUPPORTED_Q_BITS:
+                    raise ValueError(f'{where}.k_bits must be one of 4/5/6/8')
+            if v_bits is None:
+                v_bits = default_bits
+            else:
+                _check_bool_int(v_bits, f'{where}.v_bits')
+                if v_bits not in SUPPORTED_Q_BITS:
+                    raise ValueError(f'{where}.v_bits must be one of 4/5/6/8')
+        n_q_heads = case.get('query_heads', N_Q_HEADS)
+        _check_bool_int(n_q_heads, f'{where}.query_heads')
+        if n_q_heads < 1 or n_q_heads > 128:
+            raise ValueError(f'{where}.query_heads must be in 1..128')
+        n_kv_heads = case.get('kv_heads', N_KV_HEADS)
+        _check_bool_int(n_kv_heads, f'{where}.kv_heads')
+        if n_kv_heads < 1 or n_kv_heads > 128:
+            raise ValueError(f'{where}.kv_heads must be in 1..128')
+        if n_q_heads % n_kv_heads != 0:
+            raise ValueError(f'{where} needs query_heads divisible by kv_heads')
+        head_dim = case.get('head_dim', HEAD_DIM)
+        _check_bool_int(head_dim, f'{where}.head_dim')
+        if head_dim not in SUPPORTED_HEAD_DIMS:
+            raise ValueError(f'{where}.head_dim must be one of 64/128/256')
         length = case.get('length')
         _check_bool_int(length, f'{where}.length')
         q_len = case.get('q_len')
@@ -87,6 +148,18 @@ def validate_plan(plan):
         _check_bool_int(table_pad_pages, f'{where}.table_pad_pages')
         if table_pad_pages not in (1, 16):
             raise ValueError(f'{where}.table_pad_pages must be one of 1/16')
+        total = length + q_len
+        num_pages = capacity // PAGE_SIZE
+        table_columns = ((num_pages + table_pad_pages - 1) // table_pad_pages) * table_pad_pages
+        estimated_bytes = _estimate_case_bytes(
+            capacity=capacity, total=total, table_columns=table_columns, q_len=q_len,
+            n_q_heads=n_q_heads, n_kv_heads=n_kv_heads, head_dim=head_dim,
+            cache_type=cache_type, k_bits=k_bits, v_bits=v_bits)
+        if estimated_bytes > MEMORY_BUDGET_BYTES:
+            raise ValueError(
+                f'{where} estimated {estimated_bytes} bytes exceeds {MEMORY_BUDGET_BYTES} budget '
+                f'(query_heads={n_q_heads}, kv_heads={n_kv_heads}, head_dim={head_dim}, '
+                f'capacity={capacity}, cache_type={cache_type})')
         raw_configs = case.get('configs')
         if not isinstance(raw_configs, list) or not raw_configs:
             raise ValueError(f'{where}.configs must be a non-empty list')
@@ -138,8 +211,11 @@ def validate_plan(plan):
             configs.append(dict(name=cname, block_n=block_n, num_splits=num_splits,
                                 num_warps=num_warps, num_stages=num_stages,
                                 head_block=head_block, parallel_combine=parallel_combine))
-        cases.append(dict(name=name, cache_type=cache_type, length=length, q_len=q_len,
-                          seed=seed, capacity=capacity, table_pad_pages=table_pad_pages, configs=configs))
+        cases.append(dict(name=name, cache_type=cache_type, k_bits=k_bits, v_bits=v_bits,
+                          query_heads=n_q_heads, kv_heads=n_kv_heads, head_dim=head_dim,
+                          length=length, q_len=q_len, seed=seed, capacity=capacity,
+                          table_pad_pages=table_pad_pages, estimated_bytes=estimated_bytes,
+                          configs=configs))
     return cases
 
 
@@ -199,7 +275,8 @@ def main():
         props = torch.cuda.get_device_properties(device)
         torch.cuda.set_per_process_memory_fraction(min(1.0, MEMORY_BUDGET_BYTES / props.total_memory))
         torch.manual_seed(42961)
-        status.update(device=props.name, query_heads=N_Q_HEADS, kv_heads=N_KV_HEADS, head_dim=HEAD_DIM, gpu_arch=getattr(props, "gcnArchName", None), multiprocessor_count=props.multi_processor_count,
+        status.update(device=props.name, gpu_arch=getattr(props, "gcnArchName", None),
+                      multiprocessor_count=props.multi_processor_count,
                       total_memory_bytes=props.total_memory, torch=torch.__version__, hip=torch.version.hip,
                       extension_sha256=args.expected_extension_sha256,
                       harness_sha256=hashlib.sha256(source).hexdigest())
@@ -213,18 +290,18 @@ def main():
                         relative_l2=error / norm if norm else (0.0 if error == 0 else None),
                         max_abs=(a - b).abs().max().item())
 
-        def oracle_attention(q, k, v, length):
-            # Float32 grouped decode attention without repeating K/V 4x.
+        def oracle_attention(q, k, v, length, n_q_heads, n_kv_heads, head_dim):
+            # Float32 grouped decode attention without repeating K/V.
             # Query row i attends logical KV rows 0..length+i (causal, no window/sinks).
             q_len, total = q.shape[1], k.shape[0]
-            qg = q.float().view(1, q_len, N_KV_HEADS, N_Q_HEADS // N_KV_HEADS, HEAD_DIM)
+            qg = q.float().view(1, q_len, n_kv_heads, n_q_heads // n_kv_heads, head_dim)
             k, v = k.float(), v.float()
-            scores = torch.einsum('bqghd,tgd->bqght', qg, k) / (HEAD_DIM ** 0.5)
+            scores = torch.einsum('bqghd,tgd->bqght', qg, k) / (head_dim ** 0.5)
             kv_pos = torch.arange(total, device=device)
             q_pos = length + torch.arange(q_len, device=device)
             mask = kv_pos[None, :] > q_pos[:, None]
             probs = scores.masked_fill(mask.view(1, q_len, 1, 1, total), -torch.inf).softmax(dim=-1)
-            return torch.einsum('bqght,tgd->bqghd', probs, v).reshape(1, q_len, N_Q_HEADS, HEAD_DIM)
+            return torch.einsum('bqght,tgd->bqghd', probs, v).reshape(1, q_len, n_q_heads, head_dim)
 
         def gpu_usable():
             try:
@@ -246,14 +323,21 @@ def main():
         aborted = None
         for case in cases:
             name, cache_type = case['name'], case['cache_type']
+            n_q_heads, n_kv_heads, head_dim = case['query_heads'], case['kv_heads'], case['head_dim']
+            case_k_bits, case_v_bits = case['k_bits'], case['v_bits']
             length, q_len, seed = case['length'], case['q_len'], case['seed']
             total, capacity = length + q_len, case['capacity']
             table_pad_pages = case['table_pad_pages']
             num_pages = capacity // PAGE_SIZE
             table_columns = ((num_pages + table_pad_pages - 1) // table_pad_pages) * table_pad_pages
-            row = dict(name=name, cache_type=cache_type, length=length, q_len=q_len,
-                       seed=seed, capacity=capacity, table_pad_pages=table_pad_pages,
-                       table_columns=table_columns, status='running', configs=[])
+            row = dict(name=name, cache_type=cache_type, k_bits=case_k_bits, v_bits=case_v_bits,
+                       query_heads=n_q_heads, kv_heads=n_kv_heads, head_dim=head_dim,
+                       length=length, q_len=q_len, seed=seed, capacity=capacity,
+                       table_pad_pages=table_pad_pages, table_columns=table_columns,
+                       estimated_bytes=case['estimated_bytes'], status='running', configs=[])
+            print(f'{name}: q_heads={n_q_heads} kv_heads={n_kv_heads} head_dim={head_dim} '
+                  f'cache={cache_type} capacity={capacity} estimated_bytes={case["estimated_bytes"]}',
+                  flush=True)
             status['cases'].append(row)
             k_all = v_all = queries = table = seqlens = None
             k_cache = v_cache = k_ref = v_ref = expected = out = actual = None
@@ -265,20 +349,20 @@ def main():
             layer = None
             try:
                 gen = torch.Generator().manual_seed(seed)
-                k_all = torch.randn((total, N_KV_HEADS, HEAD_DIM), generator=gen,
+                k_all = torch.randn((total, n_kv_heads, head_dim), generator=gen,
                                     dtype=torch.float32, device='cpu').half().to(device)
-                v_all = torch.randn((total, N_KV_HEADS, HEAD_DIM), generator=gen,
+                v_all = torch.randn((total, n_kv_heads, head_dim), generator=gen,
                                     dtype=torch.float32, device='cpu').half().to(device)
-                queries = (torch.randn((1, q_len, N_Q_HEADS, HEAD_DIM), generator=gen,
+                queries = (torch.randn((1, q_len, n_q_heads, head_dim), generator=gen,
                                        dtype=torch.float32, device='cpu') * 0.125).half().to(device)
                 physical_pages = torch.randperm(num_pages, generator=gen).tolist()
                 table = torch.tensor([physical_pages + [0] * (table_columns - num_pages)],
                                      dtype=torch.int32, device=device)
                 seqlens = torch.tensor([length], dtype=torch.int32, device=device)
                 row['data_sha256'] = hashlib.sha256(json.dumps(
-                    dict(seed=seed, cache_type=cache_type, length=length, q_len=q_len,
-                         n_q_heads=N_Q_HEADS, n_kv_heads=N_KV_HEADS, head_dim=HEAD_DIM,
-                         num_pages=num_pages, physical_pages=physical_pages,
+                    dict(seed=seed, cache_type=cache_type, k_bits=case_k_bits, v_bits=case_v_bits,
+                         length=length, q_len=q_len, n_q_heads=n_q_heads, n_kv_heads=n_kv_heads,
+                         head_dim=head_dim, num_pages=num_pages, physical_pages=physical_pages,
                          table_pad_pages=table_pad_pages, table_columns=table_columns),
                     sort_keys=True).encode()).hexdigest()
                 row['inputs_finite'] = bool(torch.isfinite(k_all).all() and torch.isfinite(v_all).all()
@@ -287,41 +371,40 @@ def main():
                 call_kw = dict(q=queries, k=None, v=None, block_table=table, cache_seqlens=seqlens,
                                causal=True, pre_appended_len=q_len)
                 if cache_type == 'f16':
-                    k_cache = torch.empty((num_pages, PAGE_SIZE, N_KV_HEADS, HEAD_DIM),
+                    k_cache = torch.empty((num_pages, PAGE_SIZE, n_kv_heads, head_dim),
                                           dtype=torch.float16, device=device)
                     v_cache = torch.empty_like(k_cache)
                     # Padded logical capacity; only live total rows are copied,
                     # so a partial final page scatters full pages correctly.
-                    k_pad = torch.zeros((capacity, N_KV_HEADS, HEAD_DIM),
+                    k_pad = torch.zeros((capacity, n_kv_heads, head_dim),
                                         dtype=torch.float16, device=device)
                     v_pad = torch.zeros_like(k_pad)
                     k_pad[:total] = k_all
                     v_pad[:total] = v_all
-                    blocks_k = k_pad.view(num_pages, PAGE_SIZE, N_KV_HEADS, HEAD_DIM)
-                    blocks_v = v_pad.view(num_pages, PAGE_SIZE, N_KV_HEADS, HEAD_DIM)
+                    blocks_k = k_pad.view(num_pages, PAGE_SIZE, n_kv_heads, head_dim)
+                    blocks_v = v_pad.view(num_pages, PAGE_SIZE, n_kv_heads, head_dim)
                     order = torch.tensor(physical_pages, dtype=torch.int64, device=device)
                     k_cache[order] = blocks_k
                     v_cache[order] = blocks_v
                     call_kw.update(k_cache=k_cache, v_cache=v_cache)
                     k_ref, v_ref = k_all, v_all
                 else:
-                    bits = 8 if cache_type == 'q8' else 4
-                    layer = CacheLayer_quant(None, SimpleNamespace(num_kv_heads=N_KV_HEADS,
-                                                                   head_dim=HEAD_DIM),
-                                             1, capacity, bits, bits)
+                    layer = CacheLayer_quant(None, SimpleNamespace(num_kv_heads=n_kv_heads,
+                                                                   head_dim=head_dim),
+                                             1, capacity, case_k_bits, case_v_bits)
                     layer.alloc(device)
                     layer.update_kv_direct(torch.zeros((1,), dtype=torch.int32, device=device),
                                            table, k_all.unsqueeze(0), v_all.unsqueeze(0), total)
                     qk, sk, qv, sv, k_bits, v_bits = layer.get_qkv()
                     call_kw.update(k_cache=qk, v_cache=qv, qc=(sk, sv, k_bits, v_bits),
-                                   n_kv_heads_override=N_KV_HEADS)
+                                   n_kv_heads_override=n_kv_heads)
                     native_k, native_v = layer.get_kv(torch.tensor([total], dtype=torch.int32, device=device),
                                                       table)
                     k_ref = torch.cat([native_k[i] for i in physical_pages], dim=0)[:total]
                     v_ref = torch.cat([native_v[i] for i in physical_pages], dim=0)[:total]
                     del native_k, native_v
                 torch.cuda.synchronize(device)
-                expected = oracle_attention(queries, k_ref, v_ref, length)
+                expected = oracle_attention(queries, k_ref, v_ref, length, n_q_heads, n_kv_heads, head_dim)
                 torch.cuda.synchronize(device)
                 row['oracle_finite'] = bool(torch.isfinite(expected).all().item())
 
@@ -392,7 +475,7 @@ def main():
                             break
                         crow['gpu_usable'] = True
                     save()
-                    print(f'{name} {crow["name"]}: {crow["status"]}', flush=True)
+                    print(f'{name}[q{n_q_heads}kv{n_kv_heads}d{head_dim}/{cache_type}] {crow["name"]}: {crow["status"]}', flush=True)
                 if aborted is not None:
                     row.update(status='failed', error=aborted)
                 else:

@@ -22,7 +22,7 @@ class AttnArgs(NamedTuple):
     block_table: torch.Tensor | None
     cache_seqlens: torch.Tensor | None
     non_causal_spans: list | None = None
-    q_cache: tuple | None = None    # (qk, sk, qv, sv, k_bits, v_bits): packed quantized cache
+    q_cache: tuple | None = None    # (qk, sk, qv, sv, k_bits, v_bits[, codebook, polynomial]): packed cache
     sinks: torch.Tensor | None = None    # learned per-q-head sink logits (gpt-oss style)
 
     def sanity_check(self):
@@ -88,7 +88,7 @@ def get_non_causal_span_arglist(args: AttnArgs):
             # dispatch, so each span is a pure read over the packed cache up to kv position
             # cache_seqlens + b. Rows past b are already written but sit above the length the
             # kernel derives from cache_seqlens + pre_appended_len, so they are never read
-            qk, sk, qv, sv, k_bits, v_bits = args.q_cache
+            qk, sk, qv, sv, k_bits, v_bits = args.q_cache[:6]
             arglist.append(dict(
                 q = args.q[:, a: b].contiguous(),
                 k = None,
@@ -103,6 +103,8 @@ def get_non_causal_span_arglist(args: AttnArgs):
                 softcap = args.softcap,
                 sinks = args.sinks,
                 qc = (sk, sv, k_bits, v_bits),
+                codebook = args.q_cache[6] if len(args.q_cache) >= 7 else None,
+                polynomial = args.q_cache[7] if len(args.q_cache) == 8 else None,
                 pre_appended_len = l,
                 n_kv_heads_override = args.num_kv_heads,
             ))

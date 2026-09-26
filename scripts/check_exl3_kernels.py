@@ -13,6 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts import launch_runtime as launcher
 
+CHECKERS = {"smallm": "check_smallm", "hgemm": "check_hgemm",
+            "packed-mid": "check_packed_mid", "highbit-smallm": "check_highbit_smallm",
+            "packed-prefill": "check_packed_prefill", "mlp-pair": "check_mlp_pair",
+            "head-tiled": "check_head_tiled",
+            "attention-schedule": "check_attention_schedule",
+            "kv-cache": "check_kv_cache", "asterkv": "check_asterkv"}
+
 
 def verified_file(binary, expected):
     if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', expected):
@@ -37,7 +44,7 @@ def run_checks(request):
     if request.get('wmma_probe'):
         probe = verified_file(Path(request['wmma_probe']), request['wmma_probe_sha256'])
         subprocess.run([str(probe)], check=True, timeout=120)
-    sys.path.insert(0, str(ROOT / 'src'))
+    sys.path[:0] = [str(ROOT / 'src'), str(ROOT / 'vendor/rocm-exl3')]
     import torch
     import torch.utils.cpp_extension as cpp
 
@@ -50,20 +57,28 @@ def run_checks(request):
     props = torch.cuda.get_device_properties(0)
     spec = importlib.util.spec_from_file_location('exllamav3_ext', binary)
     extension = importlib.util.module_from_spec(spec)
+    sys.modules['exllamav3_ext'] = extension
     spec.loader.exec_module(extension)
     from quantlab.methods.exl3.optimizations import configure_native
-    options = configure_native(binary, native_smallm=True, prefill_gemm='wmma')
-    if options['smallm_codebooks'] != [0, 2]:
+    checks = request.get('checks', ['smallm', 'hgemm'])
+    options = configure_native(binary, native_smallm=any(name in checks for name in
+                               ('smallm', 'packed-mid', 'highbit-smallm', 'packed-prefill', 'mlp-pair', 'head-tiled')),
+                               packed_mid='packed-mid' in checks,
+                               packed_prefill='packed-prefill' in checks, mlp_pair='mlp-pair' in checks,
+                               prefill_gemm='wmma' if 'hgemm' in checks else 'blas')
+    if 'smallm' in checks and options['smallm_codebooks'] != [0, 2]:
         raise ValueError('These checks require a build with mul1 small-M support')
+    if 'highbit-smallm' in checks and options['smallm_highbit_abi'] != 1:
+        raise ValueError('High-bit checks require small-M high-bit ABI 1')
     results = dict(device=props.name, arch=props.gcnArchName, torch=torch.__version__,
                    hip=torch.version.hip, extension_sha256=request['expected_sha256'],
                    native_options=options, checks={})
     if request.get('wmma_probe'):
         results['wmma_probe_sha256'] = request['wmma_probe_sha256']
     output = Path(request['run']) / 'results.json'
-    for name in ('smallm', 'hgemm'):
+    for name in checks:
         spec = importlib.util.spec_from_file_location('check_' + name,
-                    ROOT / 'kernels/exl3' / ('check_' + name + '.py'))
+                    ROOT / 'kernels/exl3' / (CHECKERS[name] + '.py'))
         checker = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(checker)
         results['checks'][name] = checker.run_checks(torch, extension)
@@ -76,6 +91,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=ROOT / '.runtime/installation.toml')
     parser.add_argument('--output', type=Path, required=True, help='New private result directory')
+    parser.add_argument('--checks', nargs='+', choices=tuple(CHECKERS), default=['smallm', 'hgemm'],
+                        help='Model-free suites to run; KV suites include the checked-in vendor source')
     parser.add_argument('--extension-dir', type=Path, help='Candidate build; requires its explicit hash')
     parser.add_argument('--expected-extension-sha256')
     parser.add_argument('--wmma-probe', type=Path, help='Optional compiled check_wmma.hip executable')
@@ -110,6 +127,7 @@ def main(argv=None):
     run.mkdir(parents=True, exist_ok=False)
     request_file = run / 'request.json'
     request = dict(run=str(run), root=str(ROOT), runtime=runtime, timeout=min(timeout, 900),
+                   checks=list(dict.fromkeys(args.checks)),
                    extension_dir=str(directory.resolve()), expected_sha256=expected.lower(),
                    argv=[runtime['python'], str(Path(__file__).resolve()), '--worker', str(request_file)])
     if args.wmma_probe:
