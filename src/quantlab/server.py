@@ -46,6 +46,7 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 
 from quantlab.sampling import check_sampling as _sampling_params
+from quantlab.images import IMAGE_BODY_BYTES, MAX_IMAGES, ImageInputError, image_url_bytes
 from quantlab.tool_calls import ToolCallError, loads_json
 
 MAX_BODY_BYTES = 1024 * 1024  # 1 MiB request cap, enforced while reading.
@@ -250,8 +251,8 @@ def _check_template_kwargs(body: dict) -> dict | None:
     return dict(kwargs)
 
 
-def _normalize_content(value: Any, ctx: str, *, allow_null: bool) -> str | None:
-    """Plain string or text-only content array -> string. Rejects media parts."""
+def _normalize_content(value: Any, ctx: str, *, allow_null: bool, allow_images=False):
+    """Normalize text arrays; preserve validated user image parts in order."""
     if isinstance(value, str):
         return value
     if value is None and allow_null:
@@ -260,9 +261,23 @@ def _normalize_content(value: Any, ctx: str, *, allow_null: bool) -> str | None:
         if not value:
             raise _Invalid(f"{ctx} must be a string or a non-empty content array")
         texts: list[str] = []
+        has_image = False
+        parts = []
         for j, part in enumerate(value):
             if not isinstance(part, dict):
                 raise _Invalid(f"{ctx}[{j}] must be an object")
+            if part.get('type') == 'image_url':
+                if not allow_images:
+                    raise _Invalid('Images are disabled or unsupported in this role; restart with --mmproj on for user images')
+                if set(part) != {'type', 'image_url'}:
+                    raise _Invalid('image_url content parts require exactly type and image_url')
+                try:
+                    image_url_bytes(part['image_url'])
+                except ImageInputError as exc:
+                    raise _Invalid(str(exc)) from None
+                has_image = True
+                parts.append(dict(part))
+                continue
             for key in part:
                 if key not in ("type", "text"):
                     raise _Invalid(f"unsupported parameter: '{ctx}[{j}].{key}'")
@@ -276,6 +291,9 @@ def _normalize_content(value: Any, ctx: str, *, allow_null: bool) -> str | None:
             if not isinstance(text, str):
                 raise _Invalid(f"{ctx}[{j}].text must be a string")
             texts.append(text)
+            parts.append(dict(type='text', text=text))
+        if has_image:
+            return parts
         return "".join(texts)
     if value is None:
         raise _Invalid(f"{ctx} must be a string")
@@ -416,7 +434,7 @@ _TOOL_KEYS = frozenset({"role", "content", "tool_call_id", "name"})
 _TEXT_KEYS = frozenset({"role", "content"})
 
 
-def _check_messages(body: dict) -> list[dict]:
+def _check_messages(body: dict, *, allow_images=False) -> list[dict]:
     if "messages" not in body:
         raise _Invalid("messages is required")
     messages = body["messages"]
@@ -530,10 +548,14 @@ def _check_messages(body: dict) -> list[dict]:
                 {
                     "role": role,
                     "content": _normalize_content(
-                        message["content"], ctx, allow_null=False
+                        message["content"], ctx, allow_null=False, allow_images=allow_images and role == 'user'
                     ),
                 }
             )
+    image_count = sum(1 for m in checked if isinstance(m.get('content'), list)
+                      for part in m['content'] if part.get('type') == 'image_url')
+    if image_count > MAX_IMAGES:
+        raise _Invalid('At most four images are supported per request')
     # Cross-turn tool protocol: IDs unique, every result matches one pending
     # call, and no other turn interleaves before pending calls resolve.
     seen_ids: set[str] = set()
@@ -784,6 +806,8 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
         raise ValueError("max_pending must be a non-negative integer")
 
     gate = _Gate(max_pending)
+    allow_images = getattr(engine, 'vision_enabled', False) is True
+    body_limit = IMAGE_BODY_BYTES if allow_images else MAX_BODY_BYTES
     app = FastAPI(title="quantlab-server")
     app.add_middleware(_LocalRequestsOnly)
     app.state.gate = gate  # introspection/testing; not part of the API
@@ -792,7 +816,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
         length = request.headers.get("content-length")
         if length is not None:
             try:
-                if int(length) > MAX_BODY_BYTES:
+                if int(length) > body_limit:
                     raise _TooLarge()
             except ValueError:
                 pass  # fall through to streaming enforcement
@@ -803,7 +827,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                 if not chunk:
                     continue
                 total += len(chunk)
-                if total > MAX_BODY_BYTES:
+                if total > body_limit:
                     raise _TooLarge()  # abandon the iterator; ASGI >= 2.4 allows it
                 chunks.append(chunk)
         except ClientDisconnect:
@@ -864,7 +888,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
         except _TooLarge:
             return _error(
                 413,
-                "request body exceeds the 1 MiB limit",
+                f"request body exceeds the {body_limit // (1024**2)} MiB limit",
                 "invalid_request_error",
                 "payload_too_large",
             )
@@ -881,7 +905,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
             stream, include_usage = _check_stream(body)
             template_kwargs = _check_template_kwargs(body) if kind == "chat" else None
             if kind == "chat":
-                messages = _check_messages(body)
+                messages = _check_messages(body, allow_images=allow_images)
                 prompt = None
                 tools = _check_tools(body)
                 tool_choice = _check_tool_choice(body, tools)
@@ -967,6 +991,8 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
                     "model_output_error",
                     "invalid_tool_call",
                 )
+            except ImageInputError as exc:
+                return _invalid(str(exc))
             except ValueError as exc:
                 message = str(exc) or "prompt rejected by engine"
                 lowered = message.lower()

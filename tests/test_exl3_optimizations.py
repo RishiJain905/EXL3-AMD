@@ -194,6 +194,21 @@ class NativeOptionsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'ABI'):
                 configure_native('new.so', native_smallm=True)
 
+    def test_highbit_capability_requires_exact_supported_abi(self):
+        for abi in (1, 2):
+            def version(): return abi
+            lib = SimpleNamespace(quantlab_exl3_smallm_highbit_abi=version)
+            with patch('ctypes.CDLL', return_value=lib):
+                if abi == 1:
+                    self.assertEqual(configure_native('new.so', native_smallm=True)['smallm_highbit_abi'], 1)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'high-bit ABI'):
+                        configure_native('new.so', native_smallm=True)
+
+    def test_old_binary_does_not_enable_highbit(self):
+        with patch('ctypes.CDLL', return_value=object()):
+            self.assertIsNone(configure_native('old.so', native_smallm=True)['smallm_highbit_abi'])
+
     def test_defaults_do_not_require_new_binary(self):
         with patch('ctypes.CDLL') as library, patch.dict('os.environ',{},clear=True):
             result = configure_native('unused')

@@ -66,7 +66,13 @@ def parser():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--candidate-manifest', type=Path)
     p.add_argument('--expected-extension-sha256', required=True)
-    p.add_argument('--mode', choices=('speed', 'quality', 'context', 'context-speed', 'profile', 'generate'), required=True)
+    p.add_argument('--mode', choices=('speed', 'quality', 'context', 'context-speed', 'profile', 'generate', 'logprobs'), required=True)
+    p.add_argument('--teacher-forced-protocol', type=Path,
+                   help='Frozen explicit input_ids/target_id probes; required for logprobs mode')
+    p.add_argument('--validation-protocol', type=Path,
+                   help='Enforce frozen suite, tokenizer, prompt tokens, stops and runtime controls')
+    p.add_argument('--enable-thinking', action='store_true',
+                   help='Render the native thinking-enabled template for a frozen quality protocol')
     p.add_argument('--context-speed-task', choices=('docstring', 'canonical'), default='docstring',
                    help='Occupied-coding question: 192-token docstring protocol or exact suite first_index task with 128 tokens; canonical requires context-speed mode')
     p.add_argument('--decode-fusions', choices=('off', 'gdn', 'gdn-mlp', 'gdn-mlp-mgemv'), default='off')
@@ -92,6 +98,10 @@ def parser():
     p.add_argument('--gpu-draft-metadata', action='store_true')
     p.add_argument('--context', type=int, default=4096)
     p.add_argument('--mtp', action='store_true')
+    p.add_argument('--mtp-dtype', choices=('fp16', 'bf16'), default='fp16',
+                   help='Dense MTP projection weight/compute dtype; BF16 keeps existing mixed-precision interfaces')
+    p.add_argument('--verify-attention', choices=('default', 'rowwise'), default='default',
+                   help='Experimental one-query attention during short target verification')
     p.add_argument('--draft-tokens', type=int, choices=range(1, 9), default=2)
     p.add_argument('--draft-confidence', type=float, default=None,
                    help='Adaptive MTP truncation target acceptance in (0,1); requires MTP')
@@ -119,6 +129,19 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    if args.mtp_dtype == 'bf16' and (not args.mtp or args.decode_fusions != 'off'
+            or args.native_attention or args.draft_step_graph or args.cache_mtp != 'off'):
+        p.error('BF16 MTP requires MTP, off decode fusions, and no native attention/draft graph/projection cache')
+    if args.verify_attention == 'rowwise' and (args.decode_fusions != 'off' or args.native_attention):
+        p.error('Rowwise verification attention requires off decode fusions and no native attention')
+    if args.enable_thinking and (args.mode != 'quality' or not args.validation_protocol):
+        p.error('--enable-thinking requires quality mode and a frozen validation protocol')
+    if args.mode == 'logprobs' and (not args.teacher_forced_protocol or args.mtp):
+        p.error('logprobs requires --teacher-forced-protocol and MTP off')
+    if args.teacher_forced_protocol and args.mode != 'logprobs':
+        p.error('--teacher-forced-protocol requires logprobs mode')
+    if args.validation_protocol and args.mode not in ('quality', 'speed', 'logprobs'):
+        p.error('--validation-protocol requires quality, speed or logprobs mode')
     try:
         _resources().validate_fraction(args.gpu_memory_fraction, '--gpu-memory-fraction')
     except ValueError as exc:
@@ -148,6 +171,8 @@ def main():
         p.error(str(exc))
     if (cache_k, cache_v) != ('f16', 'f16') and (args.native_attention or args.draft_step_graph):
         p.error('Quantized KV cache cannot combine with --native-attention or --draft-step-graph in this integration')
+    if args.verify_attention == 'rowwise' and (cache_k, cache_v) != ('f16','f16'):
+        p.error('Rowwise verification attention currently requires F16 K/V cache')
     if args.mode == 'generate' and (args.prompt_file is None or not 1 <= args.max_tokens <= 8192):
         p.error('generate requires --prompt-file and --max-tokens in [1,8192]')
     if args.native_smallm_graph and (not args.native_smallm or args.decode_fusions not in ('gdn', 'gdn-mlp')):
@@ -166,6 +191,17 @@ def main():
         p.error('--cpu-moe all conflicts with --n-cpu-moe')
     if args.moe_cpu_threads is not None and not 1 <= args.moe_cpu_threads <= 256:
         p.error('--moe-cpu-threads must be in [1,256]')
+    validation = None
+    if args.validation_protocol:
+        validation = json.loads(args.validation_protocol.read_text(encoding='utf-8'))
+        if digest(args.suite) != validation['suite_file_sha256']:
+            p.error('Validation suite hash differs from frozen protocol')
+        if (args.context != validation['context'] or cache_k != validation['cache']
+                or cache_v != validation['cache'] or args.mtp != validation['mtp']
+                or args.enable_thinking != validation['thinking']):
+            p.error('Runtime controls differ from frozen validation protocol')
+        if args.mode == 'logprobs' and digest(args.teacher_forced_protocol) != digest(args.validation_protocol):
+            p.error('Teacher-forced and validation protocols differ')
     candidate = args.candidate.resolve()
     output = args.output.resolve()
     if candidate == output or candidate in output.parents or output in candidate.parents:
@@ -174,6 +210,15 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     (output / 'harness.py').write_bytes(Path(__file__).read_bytes())
     suite = json.loads(args.suite.read_text())
+    validation_by_prompt = None
+    if validation is not None:
+        if suite['quality_max_tokens'] != validation['max_new_tokens']:
+            p.error('Suite output budget differs from frozen validation protocol')
+        if [x['id'] for x in suite['tasks']] != [x['id'] for x in validation['cases']]:
+            p.error('Validation case inventory differs from suite')
+        validation_by_prompt = {task['prompt']: case for task, case in zip(suite['tasks'], validation['cases'])}
+        if len(validation_by_prompt) != len(suite['tasks']):
+            p.error('Validation prompts must be unique')
     expected = None
     if args.expected_results:
         reference = json.loads(args.expected_results.read_text())
@@ -181,6 +226,7 @@ def main():
     (output / 'suite.json').write_text(json.dumps(suite, indent=2))
     started = time.monotonic()
     status = dict(status='running', mode=args.mode, mtp=args.mtp, cache_tokens=args.context,
+                  thinking=args.enable_thinking,
                   cache_k=cache_k, cache_v=cache_v,
                   draft_tokens=args.draft_tokens if args.mtp else 0,
                   dynamic_draft_tokens=args.draft_confidence is not None,
@@ -333,6 +379,12 @@ def main():
         model.load(device='cuda:0')
         for module in model.modules:
             prepare(module)
+        if args.mtp_dtype == 'bf16':
+            from quantlab.methods.exl3.mtp_precision import preserve_mtp_bf16
+            status['mtp_precision'] = preserve_mtp_bf16(draft)
+        if args.verify_attention == 'rowwise':
+            from quantlab.methods.exl3.verifier_attention import install_rowwise_verifier_attention
+            status['verifier_attention'] = install_rowwise_verifier_attention(model)
         from quantlab.methods.exl3.optimizations import install_optimizations
         status['optimizations'] = install_optimizations(model, draft,
             gpu_embedding=args.gpu_embedding, batch_greedy=args.batch_greedy,
@@ -366,19 +418,31 @@ def main():
         record('tokenizer', tokenizer_sha256=digest(candidate / 'tokenizer.json'),
                template_sha256=hashlib.sha256(tokenizer.hf_tokenizer.chat_template.encode()).hexdigest(),
                eos_ids=cfg.eos_token_id_list, actual_vocab_size=tokenizer.actual_vocab_size)
+        if validation is not None:
+            if (digest(candidate / 'tokenizer.json') != validation['tokenizer_sha256']
+                    or digest(candidate / 'chat_template.jinja') != validation['template_sha256']
+                    or set(cfg.eos_token_id_list) != set(validation['stop_ids'])
+                    or tokenizer.actual_vocab_size != validation['valid_vocabulary_size']):
+                raise ValueError('Tokenizer, template, stops or vocabulary differ from frozen protocol')
+            record('validation_protocol', sha256=digest(args.validation_protocol),
+                   suite_sha256=validation['suite_file_sha256'], stop_ids=cfg.eos_token_id_list)
 
         def encode_chat(prompt):
             messages = [dict(role='system', content=suite['system']), dict(role='user', content=prompt)]
-            rendered = tokenizer.hf_render_chat_template(messages, enable_thinking=False)
+            rendered = tokenizer.hf_render_chat_template(messages, enable_thinking=args.enable_thinking)
             # The same runtime tokenizer is used for all modes; preserve rendered text and actual IDs.
             ids = tokenizer.encode(rendered, add_bos=False, add_eos=False, encode_special_tokens=True)
             return rendered, ids
 
-        def run_case(name, prompt, limit, *, fixed=False, warmup=False, ids_override=None, metadata=None, profiling=None):
+        def run_case(name, prompt, limit, *, fixed=False, warmup=False, ids_override=None, metadata=None, profiling=None, target_id=None):
             rendered, ids = encode_chat(prompt)
             if ids_override is not None:
                 ids = ids_override
                 rendered = tokenizer.hf_tokenizer.decode(ids.flatten().tolist(), skip_special_tokens=False)
+            elif validation_by_prompt is not None:
+                frozen = validation_by_prompt[prompt]
+                if rendered != frozen['rendered'] or ids.flatten().tolist() != frozen['input_ids']:
+                    raise ValueError('Rendered prompt or token prefix differs from frozen protocol: ' + name)
             if ids.numel() + limit + 4 > args.context:
                 raise ValueError('Prompt/output exceeds context')
             (output / (name + '-input.json')).write_text(json.dumps(dict(
@@ -393,6 +457,31 @@ def main():
             # and retain live recurrent state. Fresh generators prevent reuse
             # across requests; retain the verified 1-GiB in-request budget.
             sampler = ArgmaxSampler()
+            if fixed and validation is not None:
+                # llama.cpp ignore_eos suppresses EOG logits. Match it for the
+                # frozen fixed-length protocol. Install this inner hook first:
+                # probability/finite-check hooks below must see original logits.
+                def suppress_stop_logits(logits):
+                    logits[..., validation['stop_ids']] = -float('inf')
+                observe_sampler_input(sampler, suppress_stop_logits)
+            probability = {}
+            if target_id is not None:
+                if not 0 <= target_id < tokenizer.actual_vocab_size:
+                    raise ValueError('Teacher-forced target outside valid vocabulary')
+                def capture_probability(logits):
+                    if probability:
+                        return
+                    row = logits[0, -1].float()
+                    valid = row[:tokenizer.actual_vocab_size]
+                    if not torch.isfinite(valid).all():
+                        raise RuntimeError('Nonfinite teacher-forced logits')
+                    normalizer = torch.logsumexp(valid, dim=0)
+                    probability.update(target_id=target_id,
+                        target_nll=float((normalizer-valid[target_id]).item()),
+                        top1_id=int(valid.argmax().item()),
+                        valid_vocabulary_size=tokenizer.actual_vocab_size,
+                        excluded_probability_mass=float((1-torch.exp(normalizer-torch.logsumexp(row,dim=0))).clamp(0,1).item()))
+                observe_sampler_input(sampler, capture_probability)
             original_draft_sample = draft.sample_from_state if args.mtp else None
             if warmup:
                 checked = []
@@ -476,6 +565,7 @@ def main():
             decode_tokens = timing.decode_tokens(len(tokens))
             result = dict(name=name, warmup=warmup, input_tokens=ids.numel(), output_tokens=len(tokens),
                           output_limit=limit, fixed_length=fixed, eos_reason=eos_reason,
+                          fixed_eos_policy='suppress_stop_logits' if fixed and validation is not None else None,
                           input_sha256=hashlib.sha256(ids.numpy().tobytes()).hexdigest(),
                           output_token_ids=tokens, output_text=job.full_completion,
                           prefill_call_seconds=prefill_seconds, prefill_calls=prefill_calls,
@@ -494,6 +584,10 @@ def main():
                           rejected_draft_tokens=job.rejected_draft_tokens if args.mtp else None,
                           draft_windows=list(job.draft_stats),
                           calibrated_labels=gen.draft_calibrator.total if gen.draft_calibrator is not None else None)
+            if target_id is not None:
+                if not probability:
+                    raise RuntimeError('Teacher-forced probe produced no logits')
+                result['teacher_forced'] = probability
             status['results'].append(result)
             (output / (name + '-result.json')).write_text(json.dumps(result, indent=2, allow_nan=False))
             record('case_completed', **result)
@@ -511,7 +605,17 @@ def main():
 
         if args.mode in ('speed', 'quality', 'profile', 'generate'):
             run_case('warmup', suite['tasks'][0]['prompt'], 32, fixed=True, warmup=True)
-        if args.mode == 'generate':
+        if args.mode == 'logprobs':
+            protocol = json.loads(args.teacher_forced_protocol.read_text())
+            record('teacher_forced_protocol', sha256=digest(args.teacher_forced_protocol))
+            for probe in protocol['teacher_forced_probes']:
+                ids = torch.tensor([probe['input_ids']], dtype=torch.long)
+                if ids.numel() == 0 or ids.min() < 0 or ids.max() >= tokenizer.actual_vocab_size:
+                    raise ValueError('Invalid frozen teacher-forced input IDs')
+                run_case(probe['id'], 'Explicit frozen teacher-forced prefix', 1,
+                         fixed=True, ids_override=ids, target_id=probe['target_id'],
+                         metadata=dict(task_id=probe['task_id'], position=probe['position']))
+        elif args.mode == 'generate':
             run_case('answer', args.prompt_file.read_text(encoding='utf-8'), args.max_tokens)
         elif args.mode == 'profile':
             task = suite['tasks'][4]

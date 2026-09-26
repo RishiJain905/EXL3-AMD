@@ -105,8 +105,14 @@ def check_required_tensors(config, models):
     for model in models:
         for module in model:
             if isinstance(module, Linear):
-                if module.qmap is not None:
-                    for suffix in ("trellis", "suh", "svh"):
+                packed_suffixes = ("trellis", "suh", "svh")
+                has_packed = any(config.stc.has_tensor(module.key + "." + suffix)
+                                 for suffix in packed_suffixes)
+                # qmap names a conversion group, not the stored format. An
+                # unquantized donor can retain qmap and load from .weight.
+                # Reject partial packed groups even if a dense fallback exists.
+                if module.qmap is not None and (has_packed or not config.stc.has_tensor(module.key + ".weight")):
+                    for suffix in packed_suffixes:
                         require(module.key + "." + suffix)
                 else:
                     require(module.key + ".weight")
@@ -132,9 +138,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tokens", type=int, choices=(8, 32), default=8)
     parser.add_argument("--mtp", action="store_true")
+    parser.add_argument("--mtp-dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--gpu-budget-gib", type=float, default=12)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
+    if args.mtp_dtype == 'bf16' and not args.mtp:
+        parser.error('--mtp-dtype bf16 requires --mtp')
     if not 0 < args.gpu_budget_gib <= 14:
         parser.error("--gpu-budget-gib must be positive and at most 14")
     config_file = tomllib.loads(args.config.read_text())
@@ -196,7 +205,10 @@ def main():
             raise RuntimeError("C++ JIT build forbidden")
         cpp.load = cpp.load_inline = no_build
         torch.set_num_threads(2)
-        faulthandler.dump_traceback_later(120, repeat=True)
+        # Match the evaluation harness: repeated asynchronous stack dumps
+        # crashed this Python/Triton combination in an earlier runtime run.
+        # The external supervisor enforces the timeout and resource limits.
+        faulthandler.enable()
         spec = importlib.util.spec_from_file_location("exllamav3_ext", binary)
         extension = importlib.util.module_from_spec(spec)
         sys.modules["exllamav3_ext"] = extension
@@ -213,11 +225,13 @@ def main():
         cfg, _ = mapped_text_config(candidate)
         install(cfg)
         model = Model.from_config(cfg)
-        draft = Model.from_config(cfg, component="mtp")
+        if args.mtp and "mtp" not in cfg.model_classes:
+            raise ValueError("MTP requested but candidate has no MTP weights")
+        draft = Model.from_config(cfg, component="mtp") if "mtp" in cfg.model_classes else None
         # Verify MTP completeness even in target-only mode: a partial target
         # export must not accidentally count as the requested complete artifact.
-        check_required_tensors(cfg, (model, draft))
-        record("candidate_checked", text_modules=len(model.modules), mtp_modules=len(draft.modules))
+        check_required_tensors(cfg, (model, draft) if draft is not None else (model,))
+        record("candidate_checked", text_modules=len(model.modules), mtp_modules=len(draft.modules) if draft else 0)
         cache = Cache(model, max_num_tokens=512, max_batch_size=1, max_history=2 if args.mtp else 0)
         draft_cache = Cache(draft, max_num_tokens=512, max_batch_size=1) if args.mtp else None
         torch.cuda.synchronize()
@@ -229,6 +243,9 @@ def main():
         model.load(device="cuda:0")
         for module in model.modules:
             prepare_loaded_module(module)
+        if args.mtp_dtype == 'bf16':
+            from quantlab.methods.exl3.mtp_precision import preserve_mtp_bf16
+            status['mtp_precision'] = preserve_mtp_bf16(draft)
         torch.cuda.synchronize()
         status["load_seconds"] = time.monotonic() - load_started
         status["embedding_device"] = str(model.modules[0].embedding.weight.device)

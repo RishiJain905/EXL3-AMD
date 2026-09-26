@@ -152,6 +152,22 @@ class LeaseTests(unittest.TestCase):
 
 
 class MainRejectionTests(unittest.TestCase):
+    def test_mtp_precision_and_attention_dependencies_reject_before_launch(self):
+        invalid = (
+            ['--mtp-dtype', 'bf16'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--decode-fusions', 'gdn'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--native-attention'],
+            ['--mtp', '2', '--mtp-dtype', 'bf16', '--cache-mtp', 'fc'],
+            ['--verify-attention', 'rowwise', '--native-attention'],
+            ['--verify-attention', 'rowwise', '--decode-fusions', 'gdn'],
+            ['--verify-attention', 'rowwise', '--cache-type', 'q8'],
+        )
+        for flags in invalid:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._assert_rejects(['launch', 'speed', '--config', str(root/'missing.toml'),
+                                      '--output', str(root/'out'), *flags], root/'out')
+
     def test_gpu_draft_dependencies_rejected_before_config_access(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)/'out'
@@ -425,6 +441,36 @@ class _FakeTelemetry:
 
 
 class CachePrecisionForwardingTests(unittest.TestCase):
+    def test_vision_options_and_local_image_reach_the_image_consumer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'image with spaces.png'
+            path.write_bytes(b'header-only-launch-test')
+            argv = self._run_and_capture_argv('generate', ['--mmproj','on','--decode-fusions','off',
+                '--image',str(path),'--image-max-pixels','1048576','--prompt','Describe it'])
+        self.assertTrue(argv[1].endswith('generate_multimodal.py'))
+        self.assertEqual(argv[argv.index('--image')+1],launch.linux_path(path))
+        self.assertEqual(argv[argv.index('--mmproj')+1],'on')
+        self.assertEqual(argv[argv.index('--image-max-pixels')+1],'1048576')
+        self.assertNotIn('--suite',argv)
+        self.assertNotIn('--mode',argv)
+
+    def test_vision_startup_selection_reaches_server_and_defaults_off(self):
+        for flags,expected in [([], 'off'),(['--mmproj','on','--decode-fusions','off'],'on')]:
+            argv = self._run_and_capture_argv('serve',flags)
+            self.assertTrue(argv[1].endswith('serve_exl3.py'))
+            self.assertEqual(argv[argv.index('--mmproj')+1],expected)
+
+    def test_bf16_and_rowwise_options_reach_both_consumers(self):
+        for mode in ('serve', 'speed'):
+            with self.subTest(mode=mode):
+                argv = self._run_and_capture_argv(mode, ['--mtp', '2', '--mtp-dtype', 'bf16',
+                    '--verify-attention', 'rowwise', '--decode-fusions', 'off'])
+                self.assertEqual(argv[argv.index('--mtp-dtype') + 1], 'bf16')
+                self.assertEqual(argv[argv.index('--verify-attention') + 1], 'rowwise')
+                defaults = self._run_and_capture_argv(mode, [])
+                self.assertNotIn('--mtp-dtype', defaults)
+                self.assertNotIn('--verify-attention', defaults)
+
     def _write_full_config(self, path, lease_file):
         path.write_text("\n".join([
             "[execution]", "allow_local_inference = true", "allow_backend_probes = true",

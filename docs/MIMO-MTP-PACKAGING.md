@@ -1,0 +1,111 @@
+# MiMo donor MTP packaging
+
+`scripts/package_mimo_mtp.py` creates a fresh derived package from an existing
+MiMo EXL3 target and a separately acquired official Qwen3.5-9B MTP component.
+This is a CPU packaging utility. It does not acquire weights, run inference or
+establish useful MTP acceptance/speed. No source or previous candidate is modified.
+
+```text
+python scripts/package_mimo_mtp.py \
+  --target TARGET_PACKAGE \
+  --target-manifest TARGET_FILE_MANIFEST.json \
+  --donor-directory VERIFIED_DONOR_DIRECTORY \
+  --output NEW_DERIVED_PACKAGE \
+  --report NEW_EXTERNAL_REPORT.json
+```
+
+The output/report must not already exist and must be outside both inputs. Their
+parents must exist. Only use output when the external report has `complete:
+true`. A failed copy or verification preserves partial output with an incomplete
+report. Invalid path requests write nothing. CLI symlinks and file-name
+collisions are rejected.
+
+## Required inputs
+
+The target manifest is an array of `{file, bytes, sha256}` records for every
+target file, as produced by the existing fresh-load smoke. The tool verifies
+the complete inventory and hashes, dense Qwen3.5 configuration, MTP depth zero,
+absence of MTP tensors, and exact shard/index coverage and payload byte counts.
+
+The donor directory contains `manifest.json` plus these four files:
+
+| File | Role |
+| --- | --- |
+| `mtp.safetensors` | Exactly the 15 canonical BF16 tensors for one MTP layer |
+| `config.json` | Original donor geometry; MTP depth one, shared embedding/head |
+| `tokenizer.json` | Exact parsed-JSON match, or the explicitly pinned MiMo/official pair described below |
+| `LICENSE` | Donor license copied into the derived package |
+
+The manifest has `schema_version: 1`, `complete: true`,
+`repository: "Qwen/Qwen3.5-9B"`, a 40-hex commit `revision`, a `files` map for
+exactly those four files with `{bytes, sha256}`, and a `tensors` map of
+`{dtype, shape, bytes, sha256}` records. Tensor digests cover raw payload bytes.
+Acquisition must separately establish the source/revision and preserve its
+evidence; matching a caller-supplied manifest does not authenticate a publisher.
+
+Architecture comparison includes attention/linear-attention geometry, layer
+types, RoPE, norm settings and embedding-sharing configuration. The default
+tokenizer check allows only whitespace and JSON object ordering differences.
+One audited exception accepts the complete MiMo/official tokenizer hashes pinned
+in the script: 248044 shared vocabulary IDs, 247587 normalized ordered BPE merge
+pairs, 26 common added-token definitions, and exactly seven MiMo audio markers.
+The files are **not semantically equivalent**: Unicode-mark preprocessing and
+ByteLevel settings differ. Provenance records this explicitly. This exception
+is valid only because the integrated donor consumes target token IDs and shares
+the target embedding/head; inference uses the target tokenizer, template and
+generation configuration. No donor tokenizer is copied into the output, and no
+audio/vision correctness is claimed. Other mismatching hash pairs fail closed.
+
+## Output and preservation
+
+| Change | Contract |
+| --- | --- |
+| Target files | Independent copies; identical hashes except the two declared metadata changes |
+| `config.json` | Only `text_config.mtp_num_hidden_layers` changes from 0 to 1 |
+| `model.safetensors.index.json` | Add 15 donor entries and update actual tensor-payload `total_size`; preserve other fields |
+| `mtp-donor-bf16.safetensors` | Byte-identical donor payload container |
+| `MTP-DONOR-LICENSE` | Byte-identical donor license |
+| `mtp-donor.json` | Whitelisted source/hashes/precision/sharing provenance without local paths |
+| External report | Output inventory, hashes, size, outcome and precision limits; contains private local paths |
+
+Donor tensors must have expected shapes, contiguous non-overlapping extents,
+complete hashes and finite BF16 values. The builder does not quantize, cast or
+add 1 to stored norms. Qwen's norm bias is applied at runtime; ordinary donor
+projections load as FP16. The target keeps its embedding and EXL3 output head.
+The shared runtime preflight accepts these dense donor projections alongside
+packed target projections. A conversion-group (`qmap`) label does not imply
+packed storage. Partial `.trellis/.suh/.svh` groups still fail the completeness
+check, including when a dense fallback is also present.
+Vision storage is preserved; this utility does not implement image inference
+or an mmproj control.
+
+## Validation and next gate
+
+Tiny stdlib fixtures exercise preservation, token/geometry mismatch, file/tensor
+tampering, missing/extra/malformed/nonfinite weights, index mismatch, collisions,
+protected-input/report boundaries and partial-copy failures.
+
+```text
+python -m unittest discover -s tests -p test_mimo_mtp_package.py -v
+```
+
+After packaging, the experiment still needs an independent fresh runtime load,
+finite target/draft logits, MTP-off/on output parity, recurrent rollback/stopping
+coverage and matched speed/memory measurements. The packaging report alone
+does not provide that GPU evidence.
+
+The [MiMo step-4 execution report](https://github.com/RishiJain905/QuantizationResearch/blob/codex/mimo-step4-20260924/reports/QEXP-002/QEXP-002-20260924T202616Z-agent-mimo-step4-d31c6e63/execution-report.md)
+records the actual follow-up: preserved MTP-off outputs and a passing eight-token
+MTP smoke, followed by a reproduced longer depth-1 token mismatch at a target-score
+tie. MTP is not qualified for deployment from this result; speed/confirmation
+were not reached. The original package remains available with MTP off.
+
+`scripts/mimo_mtp_evaluation.py compare` independently checks complete evaluator
+records for identical inputs, generated token IDs, stopping reasons and protocol
+controls. Its `speed` command compares an MTP run with bracketing MTP-off controls:
+two prefixes, three measured 128-token repetitions each, discarded warmups,
+median request times, geometric mean speed ratio and a 10% control-drift gate.
+It records truncated draft-window coverage without mislabeling unused draft
+tails as conditional prediction errors. Output files must be new. The experiment
+preregistration governs depth selection and confirmation; passing this analysis
+alone does not establish the entire experiment's acceptance criteria.
