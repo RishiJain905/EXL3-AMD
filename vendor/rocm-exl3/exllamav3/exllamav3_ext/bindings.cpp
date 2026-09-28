@@ -10,6 +10,9 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+#include "rocm/narrow_gemm.hip.h"
+#endif
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
@@ -140,6 +143,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("x"), py::arg("packed"), py::arg("suh"),
         py::arg("input_scratch"), py::arg("svh"), py::arg("output"),
         py::arg("bits"), py::arg("codebook"));
+    m.def("narrow_gemm_bf16", &narrow_gemm_bf16, py::arg("a"), py::arg("b"), py::arg("c"));
 #endif
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");

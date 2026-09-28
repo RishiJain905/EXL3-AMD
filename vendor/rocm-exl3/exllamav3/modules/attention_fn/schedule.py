@@ -55,3 +55,15 @@ def decode_options(*, arch, batch, query_rows, query_heads, kv_heads, head_dim,
     else:
         return {}
     return options
+
+
+def prefill_tiles(*, arch, head_dim, query_rows):
+    """(block_m, block_n, num_warps, num_stages) for the FP16 paged prefill kernel, or None.
+
+    quantlab: measured on gfx1101 at head_dim 256 over 17-2048 query rows and 8K-128K
+    context: 2.0-2.5x the inherited (64, 32, 8, 2) tile with the same FP32-reference error.
+    Both keep 16 query rows per warp. Other GPUs and head sizes keep the inherited tile.
+    """
+    if arch != 'gfx1101' or not 128 < head_dim <= 256 or query_rows < 1:
+        return None
+    return (64, 64, 4, 1) if query_rows <= 128 else (128, 64, 8, 1)

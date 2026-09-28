@@ -215,11 +215,12 @@ above. Automatic policies already select the promoted implementations.
 | `--smallm-kernel` | `dot`, `wmma`, `wmma-register` | `dot` is the qualified choice here; alternatives need compatible native support. |
 | `--prefill-gemm` | `auto`, `blas`, `wmma` | Keep `auto`; forced choices are useful for comparisons. |
 | `--attention-profile` | `auto`, `default`, `long` | `auto` uses the measured schedules. `default` selects inherited scheduling; `long` is the legacy long-context policy. |
+| `--prefill-staging` | `on`, `off` | Quantized KV caches: `on` (default) dequantizes each prefill window once into a shared FP16 scratch (one layer's K/V for the pool) and runs the faster FP16 kernel; `off` keeps in-kernel dequantization as a diagnostic override. See [PREFILL-ATTENTION.md](PREFILL-ATTENTION.md). |
 | `--warps`, `--smallm-mlp-warps` | `4`, `8`, `16` | Scheduling overrides. Leave unset for the selected policy. |
 | `--head-warps` | `1`, `4`, `8`, `16` | Vocabulary-head scheduling override; leave unset normally. |
 | `--cache-mtp` | `off`, `fc`, `attention`, `mlp`, `all` | Caches reconstructed draft projections using extra VRAM. Requires positive MTP and `off`/`gdn` fusions. Incompatible with MiMo's BF16 MTP setting. |
 | `--gpu-embedding`, `--gpu-draft`, `--gpu-draft-metadata` | Presence enables each | Experimental GPU bookkeeping. Drafting requires GPU embedding and MTP; metadata requires GPU drafting. Extra VRAM needed. |
-| `--no-packed-mid`, `--no-packed-prefill`, `--no-mlp-pair` | Presence disables each | Diagnostic comparisons against automatically enabled optimizations. |
+| `--no-packed-mid`, `--no-packed-prefill`, `--no-mlp-pair`, `--no-narrow-gemm` | Presence disables each | Diagnostic comparisons against automatically enabled optimizations. `--no-narrow-gemm` restores BLAS for decode-sized dense GEMMs ([decode profiling](DECODE-PROFILING.md)). |
 
 To test `--mtp 0` on MiMo, also remove `--mtp-dtype bf16` or set it to `fp16`.
 The qualified BF16/rowwise profile otherwise requires positive MTP depth,
@@ -238,6 +239,8 @@ the draft-step graph and reconstructed MTP projection caching.
 | `--jinja` | Accepted, but templating already uses Jinja. |
 | `--chat-template-file` | Overrides the model's template with a local file. |
 | `--request-timeout` | `0` disables (default); any positive integer sets seconds per request, including queue time. |
+| `--warmup` | `on` (default), `off`. Compiles first-use GPU kernels before ready; `off` is a diagnostic override. See [COLD-START.md](COLD-START.md). |
+| `--spec-sampling` | `on` (default), `off`. With `--mtp`, sampled requests use speculative sampling (same output distribution, higher acceptance); `off` keeps argmax drafts and exact matching as a diagnostic override. See [SPECULATIVE-SAMPLING.md](SPECULATIVE-SAMPLING.md). |
 | `--alias`, `--port` | API model name and listening port. |
 
 Requests can override the supported sampling and reasoning defaults; keep

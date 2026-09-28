@@ -72,7 +72,7 @@ void exl3_mlp_pair_dot(const half* __restrict__ A,
 
     // Keep accumulation order while overlapping tiles for narrow high-bit rows.
     // Low-bit formats and wider rows retain the lower register footprint.
-    #pragma clang loop unroll_count(M <= 3 && BITS >= 4 && BITS <= 6 ? 2 : 1)
+    #pragma clang loop unroll_count(M <= 3 && BITS >= 5 && BITS <= 6 ? 4 : (M <= 3 && BITS == 4 ? 2 : 1))
     for (int tile_k = begin; tile_k < end; ++tile_k)
     {
         const uint32_t* packed = (const uint32_t*)

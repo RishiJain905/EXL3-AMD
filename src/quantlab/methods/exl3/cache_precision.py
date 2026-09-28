@@ -13,6 +13,7 @@ from pathlib import Path
 
 CACHE_TYPES = ("f16", "q8", "q6", "q5", "q4", "aster5")
 ATTENTION_PROFILES = ("auto", "default", "long")
+PREFILL_STAGING = ("on", "off")
 _BITS = {"q8": 8, "q6": 6, "q5": 5, "q4": 4}
 
 
@@ -38,6 +39,9 @@ def add_cache_precision_args(parser):
                         help="Attention V cache precision; defaults to --cache-type, then f16")
     parser.add_argument("--attention-profile", choices=ATTENTION_PROFILES, default="auto",
                         help="Automatic measured attention scheduling (default); default and long retain diagnostic profiles")
+    parser.add_argument("--prefill-staging", choices=PREFILL_STAGING, default="on",
+                        help="Quantized KV: dequantize the referenced window to an FP16 scratch for chunked "
+                             "prefill (default on); off keeps in-kernel dequantization (diagnostic)")
     parser.add_argument("--cache-policy", type=Path, default=None,
                         help="Experimental offline JSON precision profile for every attention layer; requires a quantized cache type")
     return parser
@@ -94,6 +98,18 @@ def resolve_cache_types(args):
             raise ValueError("--cache-policy requires a quantized --cache-type")
         _cache_policy().load_cache_policy(policy_path)
     return k, v
+
+
+def qc_staging_env(cache_k, cache_v, prefill_staging):
+    """EXL3_QC_STAGING value for the backend, or None to keep the vendored default (1).
+
+    Staging dequantizes each prefill chunk's referenced window once into a shared FP16
+    scratch (one layer's K/V for the whole pool) and runs the FP16 prefill kernel over it.
+    See docs/PREFILL-ATTENTION.md.
+    """
+    if prefill_staging not in PREFILL_STAGING:
+        raise ValueError(f"Unknown prefill staging {prefill_staging!r}")
+    return "0" if is_quantized(cache_k, cache_v) and prefill_staging == "off" else None
 
 
 def is_quantized(cache_k, cache_v):

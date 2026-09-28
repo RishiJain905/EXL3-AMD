@@ -38,6 +38,38 @@ Use [BUILD.md](BUILD.md) and [local.example.toml](../configs/local.example.toml)
 | `server_deps` | Optional HTTP package overlay |
 | `lease_file` | Shared exclusive GPU lease for cooperating launchers |
 
+## Runtime storage placement
+
+Keep the WSL distribution that holds the interpreter, SDK and caches on an
+SSD. Startup imports tens of thousands of small files, and Triton reads its
+compiled-kernel and autotune cache from `~/.triton/cache`. Measured
+cold-page-cache imports of Torch, Transformers, Triton and FLA took 58.6 s
+from a WSL disk on a USB HDD, but 6.0 s from NVMe; warm imports took about
+3.4 s on either ([COLD-START.md](COLD-START.md)). Model weights can stay on
+a slower disk. They are read once, sequentially, per load.
+
+A Windows path under `/mnt/<drive>` is a 9P mount and is slow for Python
+imports. Use a WSL distribution whose virtual disk is on the SSD instead. If
+the existing distribution is too large to move, copy only what the runtime
+needs into a new distribution with identical paths:
+
+```powershell
+# 1. From the existing distro, archive system files, ROCm, the runtime and caches.
+#    Exclude large unrelated home data with additional --exclude options.
+wsl -d Ubuntu -u root -- bash -c "cd / && tar --numeric-owner --xattrs --acls --one-file-system -cpf /mnt/f/WSL/staging/runtime.tar --exclude='./var/cache/*' --exclude='./var/log/*' --exclude='./tmp/*' ."
+# 2. Import it onto the SSD.
+wsl --import EXL3-Runtime F:\WSL\EXL3-Runtime F:\WSL\staging\runtime.tar --version 2
+# 3. Default user, and no systemd (the backend does not need it).
+wsl -d EXL3-Runtime -u root -- bash -c "printf '[boot]\nsystemd=false\n\n[user]\ndefault=YOUR_USER\n' > /etc/wsl.conf"
+wsl --terminate EXL3-Runtime
+```
+
+Then set `distribution = 'EXL3-Runtime'` in the installation record. The
+interpreter, SDK and preload paths are unchanged because the copy keeps them.
+GNU tar exits with status 1 when files change while being read; re-copy
+`~/.triton` afterwards if a backend ran during the archive. Delete the
+staging archive after validation.
+
 Both execution permissions must be true for inference. Models are selected separately with `-m`. Registration and launch install nothing. Automatic native-extension JIT rebuilding is disabled; Triton compilation remains part of execution.
 
 ## Resource controls

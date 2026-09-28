@@ -9,12 +9,23 @@ from functools import partial
 
 
 def bf16_projection_forward(inner, x, params, out_dtype=None):
-    """Use BF16 operands and result, then restore the caller's interface dtype."""
+    """Use BF16 operands and result, then restore the caller's interface dtype.
+
+    Up to four rows use the verified narrow GEMM when EXL3_NARROW_GEMM=1 (FP32
+    accumulation, BF16 result like BLAS; see docs/DECODE-PROFILING.md).
+    """
+    import os
     import torch
 
     shape = x.shape[:-1] + (inner.out_features,)
     operands = x.reshape(-1, inner.in_features).to(torch.bfloat16)
-    result = torch.matmul(operands, inner.weight)
+    narrow = getattr(inner, 'bf16_narrow', None)
+    if narrow is not None and operands.shape[0] <= 4 and os.environ.get('EXL3_NARROW_GEMM') == '1':
+        result = torch.empty((operands.shape[0], inner.out_features), dtype=torch.bfloat16, device=operands.device)
+        narrow(operands.contiguous(), inner.weight, result)
+        inner.bf16_narrow_calls += 1
+    else:
+        result = torch.matmul(operands, inner.weight)
     if inner.bias is not None:
         result += inner.bias
     inner.bf16_calls += 1
@@ -64,6 +75,13 @@ def preserve_mtp_bf16(draft):
     for module in draft.modules:
         prepare_loaded_module(module)
 
+    try:
+        from exllamav3.ext import exllamav3_ext as extension
+    except ImportError:
+        extension = None
+    # Resolve the entry per call so wrappers (e.g. scripts/profile_decode_round.py) see it.
+    narrow = ((lambda a, b, c: extension.narrow_gemm_bf16(a, b, c))
+              if hasattr(extension, 'narrow_gemm_bf16') else None)
     records = []
     for module in linears:
         inner = module.inner
@@ -78,10 +96,15 @@ def preserve_mtp_bf16(draft):
         inner.bc = None
         inner.weight = weight
         inner.bf16_calls = 0
+        # The native entry needs contiguous 16-byte aligned rows (N % 8 == 0).
+        inner.bf16_narrow = narrow if (narrow is not None and weight.is_contiguous()
+                                       and weight.data_ptr() % 16 == 0 and weight.shape[1] % 8 == 0) else None
+        inner.bf16_narrow_calls = 0
         inner.forward = partial(bf16_projection_forward, inner)
         inner.quant_type = module.quant_type = 'bf16'
         records.append(dict(key=module.key, dtype=str(weight.dtype),
-                            bytes=weight.numel()*weight.element_size()))
+                            bytes=weight.numel()*weight.element_size(),
+                            narrow_gemm=inner.bf16_narrow is not None))
     report = dict(weight_dtype='bfloat16', projection_operands='bfloat16',
                   projection_result='bfloat16', target_head='shared EXL3, unchanged',
                   other_arithmetic='existing mixed FP16/BF16/FP32 paths',

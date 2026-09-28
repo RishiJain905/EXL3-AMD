@@ -636,6 +636,13 @@ class Generator:
         warmup_defer = cal is not None and cal.total < cal.burn_in
         gpu_draft = getattr(self, "quantlab_gpu_draft", False) and cal is None
         device_draft_ids = []
+        # quantlab: at temperature > 0, draft from the draft's own filtered distribution and
+        # verify with the speculative sampling rule (quantlab.methods.exl3.spec_sampling)
+        spec = None
+        if getattr(self, "quantlab_spec_sampling", False) and cal is None:
+            from quantlab.methods.exl3.spec_sampling import begin_round
+            spec = begin_round(self, [job for job in self.active_jobs if job.is_prefill_done()])
+        self.quantlab_spec_round = spec
         if gpu_draft:
             batch_ids = batch_ids.to(temp_hidden.device, non_blocking=True)
             if getattr(self, "quantlab_gpu_draft_metadata", False):
@@ -652,13 +659,16 @@ class Generator:
             if cal is not None:
                 params["export_draft_conf"] = True
             step_graph = getattr(self.model, "quantlab_draft_step", None)
-            if step_graph is not None and gpu_draft:
+            if step_graph is not None and gpu_draft and spec is None:
                 batch_state, new_ids = step_graph(batch_ids, params)
             else:
                 batch_state = self.draft_model.forward(batch_ids, params)
                 lm_head = self.model.modules[self.model.logit_layer_idx]
                 batch_state = lm_head.prepare_for_device(batch_state, params)
-                new_ids = self.draft_model.sample_from_state(batch_state, params)
+                if spec is not None:
+                    new_ids = spec.draft_step(self.draft_model, batch_state, params)
+                else:
+                    new_ids = self.draft_model.sample_from_state(batch_state, params)
             if gpu_draft:
                 device_draft_ids.append(new_ids)
                 batch_ids = new_ids
@@ -840,6 +850,10 @@ class Generator:
 
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+
+        # quantlab: draft distributions from this round's MTP drafting, used once
+        spec_round = getattr(self, "quantlab_spec_round", None)
+        self.quantlab_spec_round = None
 
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
@@ -1063,8 +1077,17 @@ class Generator:
                 accepted_length = 1
                 rejected = 0
 
+                # quantlab: speculative sampling resolves the window in one pass. Its tokens
+                # replace per-position sampling; when final, the last one ends the window,
+                # otherwise exact matching continues after them
+                spec_tokens, spec_final = None, False
+                if spec_round is not None and draft_tokens is not None:
+                    spec = spec_round.verify(job, job_logits)
+                    if spec is not None:
+                        spec_tokens, spec_final = spec
+
                 greedy_tokens = None
-                if getattr(self, "quantlab_batch_greedy", False):
+                if spec_tokens is None and getattr(self, "quantlab_batch_greedy", False):
                     from quantlab.methods.exl3.optimizations import can_batch_greedy
                     if can_batch_greedy(job, job_logits):
                         # Preserve the sampler's vocabulary handling and tie policy.
@@ -1075,7 +1098,10 @@ class Generator:
 
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
-                    if greedy_tokens is None:
+                    if spec_tokens is not None and i < spec_tokens.shape[-1]:
+                        next_token = spec_tokens[:, i:i + 1]
+                        next_k_tokens = next_k_probs = next_prob = None
+                    elif greedy_tokens is None:
                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(token_logits)
                     else:
                         job.rng.randint(0, (1 << 32) - 1)
@@ -1135,7 +1161,8 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        spec_end = spec_final and i == spec_tokens.shape[-1] - 1
+                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary or spec_end:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 

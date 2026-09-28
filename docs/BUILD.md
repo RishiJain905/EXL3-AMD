@@ -75,6 +75,13 @@ recurrence. They are selected automatically within their supported geometry;
 single-token GDN and unsupported shapes keep the previous implementation.
 Rebuild and register the resulting binary to receive these changes. Native
 binaries and benchmark artifacts are not source dependencies or release assets.
+
+Narrow-GEMM ABI 1 (`quantlab_exl3_narrow_gemm_abi`) adds a deterministic dense
+kernel for decode-sized projections: FP16 GatedDeltaNet `in_proj_a`/`in_proj_b`
+through `hgemm` and the BF16 MTP draft projections. It is selected automatically
+from the verified binary; `--no-narrow-gemm` restores BLAS for diagnosis and older
+binaries keep BLAS. Validate a build with `--checks narrow-gemm`.
+[Profile and measurements](DECODE-PROFILING.md).
 See [native kernel qualification](NATIVE-KERNEL-PERFORMANCE.md) for the measured
 9B/27B gains, rejected experiments and hardware limits.
 

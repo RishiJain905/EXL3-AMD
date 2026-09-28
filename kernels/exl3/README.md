@@ -55,6 +55,13 @@ automatic for eligible multi-token ROCm calls. Single-token recurrence and
 convolution retain their previous kernels; the independent convolution checker
 is retained to catch regressions in future changes.
 
+`check_narrow_gemm.py` checks the narrow dense GEMM (narrow-gemm ABI 1): FP16
+through `hgemm` for 1–8 rows and 8–128 columns and BF16 through
+`narrow_gemm_bf16` for 1–4 rows, against an independent CPU FP64 product, with
+canaries, determinism, a non-default stream, graph replay, BLAS-kept shapes and
+BF16 rejections. Run `--checks narrow-gemm`. See
+[decode profiling](../../docs/DECODE-PROFILING.md).
+
 `check_hgemm.py` exposes `run_checks(torch, extension)` for the optional FP32-output
 prefill GEMM. The caller must already hold the GPU lease and supply a verified,
 loaded extension; the validator neither loads nor builds a binary. It checks

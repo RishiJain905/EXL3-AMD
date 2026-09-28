@@ -85,6 +85,8 @@ def parser():
                    help='Automatically use validated tiled packed prefill; disable for diagnostics')
     p.add_argument('--mlp-pair', action=argparse.BooleanOptionalAction, default=None,
                    help='Automatically pair eligible MLP gate/up projections; disable for diagnostics')
+    p.add_argument('--narrow-gemm', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically use the verified narrow dense GEMM for decode-sized FP16/BF16 projections; disable for diagnostics')
     p.add_argument('--smallm-mlp-warps', type=int, choices=(4,8,16), help='Experimental packed MLP split-K scheduling override')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16))
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off')
@@ -274,9 +276,9 @@ def main():
             os.environ[key] = value
         os.environ['EXL3_SMALLM_GRAPH'] = '1' if args.native_smallm_graph else '0'
         os.environ['EXL3_QC_DECODE_PROFILE'] = getattr(args, 'attention_profile', 'auto')
-        if (cache_k, cache_v) != ('f16', 'f16'):
-            # Packed attention without full-cache FP16 staging.
-            os.environ['EXL3_QC_STAGING'] = '0'
+        staging = _cache_precision().qc_staging_env(cache_k, cache_v, getattr(args, 'prefill_staging', 'on'))
+        if staging is not None:
+            os.environ['EXL3_QC_STAGING'] = staging
         if args.native_smallm_graph:
             os.environ['EXL3_GEMV_GRAPH'] = '1'
         if args.gemv_splitk_warps is not None:
@@ -302,7 +304,8 @@ def main():
             smallm_kernel=args.smallm_kernel, head_warps=args.head_warps,
             prefill_gemm=args.prefill_gemm, native_smallm=args.native_smallm,
             packed_mid=getattr(args, 'packed_mid', None), mlp_warps=getattr(args, 'smallm_mlp_warps', None),
-            packed_prefill=getattr(args, 'packed_prefill', None), mlp_pair=getattr(args, 'mlp_pair', None))
+            packed_prefill=getattr(args, 'packed_prefill', None), mlp_pair=getattr(args, 'mlp_pair', None),
+            narrow_gemm=getattr(args, 'narrow_gemm', None))
         sys.path.insert(0, str(args.source_dir))
         from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer, Generator, Job, ArgmaxSampler
         from quantlab.methods.exl3.compat import install, prepare_loaded_module

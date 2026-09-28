@@ -20,7 +20,8 @@ CHECKERS = {"smallm": "check_smallm", "hgemm": "check_hgemm",
             "attention-schedule": "check_attention_schedule",
             "gdn-recurrent": "check_gdn_recurrent",
             "gdn-conv": "check_gdn_conv",
-            "kv-cache": "check_kv_cache", "asterkv": "check_asterkv"}
+            "kv-cache": "check_kv_cache", "asterkv": "check_asterkv",
+            "narrow-gemm": "check_narrow_gemm"}
 
 
 def verified_file(binary, expected):
@@ -67,7 +68,8 @@ def run_checks(request):
                                ('smallm', 'packed-mid', 'highbit-smallm', 'packed-prefill', 'mlp-pair', 'head-tiled')),
                                packed_mid='packed-mid' in checks,
                                packed_prefill='packed-prefill' in checks, mlp_pair='mlp-pair' in checks,
-                               prefill_gemm='wmma' if 'hgemm' in checks else 'blas')
+                               prefill_gemm='wmma' if 'hgemm' in checks else 'blas',
+                               narrow_gemm=True if 'narrow-gemm' in checks else None)
     if 'smallm' in checks and options['smallm_codebooks'] != [0, 2]:
         raise ValueError('These checks require a build with mul1 small-M support')
     if 'highbit-smallm' in checks and options['smallm_highbit_abi'] != 1:

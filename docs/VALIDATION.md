@@ -1,5 +1,131 @@
 # Release validation
 
+## Decode profiling and narrow dense GEMM: 2026-09-28
+
+RX 7800 XT / gfx1101, WSL `EXL3-Runtime`. Details in
+[DECODE-PROFILING.md](DECODE-PROFILING.md).
+
+- rocprofv3 1.1.0: kernel/HSA tracing unavailable on this WSL stack (no KFD
+  topology; the WSL HSA runtime does not register with rocprofiler-sdk). HIP API
+  tracing works after forcing one rocprofiler-sdk instance. Per-kernel time
+  comes from `scripts/profile_decode_round.py` (event-based, GPU pre-queued).
+- New build `narrow-v2`, SHA-256
+  `f3c131266a3f8461bdd0b7f9bec36c0c986225b9e072fb1eeeb19923d9370047`: native
+  suites narrow-gemm 119, hgemm 56, smallm 408, highbit-smallm 60, mlp-pair 143,
+  packed-mid 929, packed-prefill 232, head-tiled 185, gdn-recurrent 75 and
+  attention-schedule 116, all passed.
+- MiMo 9B K5/H6 mul1, BF16 MTP 2, Q6/Q6, 131072 context, greedy, bracketed
+  baseline/candidate/baseline: decode 77.6–78.1 → 90.7 tokens/s short and
+  64.9–65.3 → 76.1 at 16K occupied (+16%). Unroll-only +0.8%.
+- Greedy outputs: identical to baseline at short, 4K and 32K occupied for 256
+  tokens; at 16K they diverge at a near-tie (token 114 without MTP, 40 with MTP)
+  into equivalent text. The narrow GEMM changes accumulation order; unroll is
+  bit-identical.
+- Qwenseek 27B (GDN decode fusions, quantized MTP 2, Q6): within control drift,
+  identical outputs.
+- Serving smoke with the candidate (sampled 0.6/0.95/20 with speculative
+  sampling, and greedy): 4 requests completed, repeated greedy outputs identical,
+  clean shutdown (`RUN-20260928T205830Z-0726dd0b`).
+- Unit suite: Windows 863 tests OK (66 dependency/platform skips); Linux
+  runtime 863 OK (12 skips).
+- Not validated: other GPUs, sampled-decode throughput, other models with
+  narrow dense projections.
+
+## Ideas 4–6 combined on the promoted binary: 2026-09-28
+
+One MiMo 9B serving process with every default (`narrow-v2`, SHA-256
+`f3c131266a3f8461bdd0b7f9bec36c0c986225b9e072fb1eeeb19923d9370047`; BF16 MTP
+2, Q6/Q6, 131072 context, prefix cache on; `RUN-20260928T210253Z-0ac321a6`):
+
+- **Startup:** warm-up 5.3 s, with 111 attention variants and 221 Triton
+  specializations cached.
+- **Decode:** 84.3 tokens/s with the serving sampler (8 × 512-token chat
+  requests) and 87.4 greedy.
+- **Prefill:** staged, 1757 tokens/s at 8.8K and 1088 tokens/s over 69K →
+  128K occupied.
+- **Correctness:** speculative sampling ran 1800 rounds with no fallbacks;
+  `jit_after_ready = 0`; no failed requests.
+- **Unit suites:**
+  - Windows: 863 tests OK, 66 skips.
+  - Linux runtime interpreter: 863 OK, 12 skips, with the server-deps path
+    on `PYTHONPATH`. Without it, the 4 HTTP test modules cannot import
+    `fastapi` and the other 761 pass.
+
+## Long-context prefill: staged quantized KV and gfx1101 tiles: 2026-09-28
+
+RX 7800 XT / gfx1101, MiMo 9B K5/H6 mul1, BF16 MTP 2, Q6/Q6, 131072 context,
+chunk 1024, prefix cache on; extension SHA-256
+`0ad3db65fcda9a59629a81d3a93b85f2af7dd40013207ced7088b19a6b0c132a`.
+Details in [PREFILL-ATTENTION.md](PREFILL-ATTENTION.md).
+
+- **Operator** (`benchmark_exl3_prefill_attention.py`, head_dim 256, 16/4
+  heads):
+  - The new tiles are 2.0–2.5× faster than the inherited tile at 17–2048
+    query rows and 8K–128K context.
+  - Relative L2 against FP32 is 2.8–3.0 × 10⁻⁴ for both, the FP16 output
+    floor.
+- **Full model** (prefix-hit spans of about 17K tokens):
+  - 1008 against 463 tokens/s at 122K occupied context.
+  - 1614 against 1126 at 35K.
+  - 1742 against 1578 at 8.8K.
+  - Chunk 2048: +1–2% for +248 MiB, so it was not adopted.
+- **Greedy output:**
+  - The first token after nine prefixes (8.8K–128K) was identical.
+  - A 64-token continuation was identical at 77K. At 26K it diverged at a
+    wording near-tie after about 45 tokens.
+- **Memory:** reserved 9170 against 8658 MiB (the scratch).
+  `jit_after_ready = 0` (111 warmed attention variants).
+- **Not validated:** other GPUs, head sizes other than 256, Qwenseek 27B,
+  quantized-cache queries under 256 rows (unchanged direct path), and cache
+  formats other than Q6 end to end.
+
+## Speculative sampling for MTP drafts: 2026-09-28
+
+Same GPU, model and configuration. Details in
+[SPECULATIVE-SAMPLING.md](SPECULATIVE-SAMPLING.md).
+
+- **Unit coverage:** `tests/test_spec_sampling.py`, 20 tests. The WSL
+  runtime interpreter runs them all, including the GPU Triton-against-reference
+  test.
+- **Distribution:** seeded 1500-request comparisons against MTP-off sampling
+  (permutation χ²):
+  - T=1.0 / top-k 50, fixed version: p = 0.22–0.93 at positions 1–6.
+  - Spec off matches MTP off token for token.
+  - A first version with whole-round tie fallback showed p = 0.002; it was
+    fixed by the per-position handoff.
+- **Speed (same session):**
+  - Serving sampling: 73.1 against 72.8 t/s (neutral).
+  - T=1.0 / top-k 50: 68.7 against 62.4 t/s (+10%).
+  - Greedy output: token-identical with spec on and off.
+- **Draft depth:** re-sweep under sampling keeps depth 2. Depth 3 runs at
+  74.6 ms/round without native 4-row kernels; depth 4 at 39.1 ms/round for
+  2.67 tokens.
+- **Not validated:** batched sampled MTP, `--draft-confidence`, n-gram,
+  DFlash or separate draft models, and models other than MiMo 9B.
+
+## Cold start: autotune cache, warm-up and NVMe runtime: 2026-09-28
+
+Validated on RX 7800 XT / gfx1101 with MiMo 9B K5/H6 mul1 (BF16 MTP 2, Q6/Q6,
+131072 context, chunk 1024, prefix cache on); extension SHA-256
+`0ad3db65fcda9a59629a81d3a93b85f2af7dd40013207ced7088b19a6b0c132a` unchanged.
+Details in [COLD-START.md](COLD-START.md).
+
+- Windows unit suite: 830 tests successful, 46 dependency/platform skips.
+  New coverage: `tests/test_warmup.py`, `--warmup` forwarding/rejection and
+  `TRITON_CACHE_AUTOTUNING` in `tests/test_launcher.py`.
+- Warm-up on: `jit_after_ready = 0` in every run, including prefix-hit
+  growth to 72K occupied context. Warm-up off: 33 late specializations
+  (two runs).
+- Greedy outputs: identical across warm-up-on processes and across
+  warm-up-off processes. On vs off matched except on an off process's first
+  request, which matched once preceded by a short request (per-process prefill
+  `num_stages` timing pick).
+- Cold-VM startup to ready: 143.9/146.5 s on the HDD-hosted distro and
+  39.8/37.6 s on the NVMe `EXL3-Runtime` distro, including warm-up.
+- Not validated: vision and native-attention/BC graph warm-up coverage,
+  Qwenseek 27B, other cache formats and contexts. The first launch after a
+  new extension or configuration still compiles its variants during warm-up.
+
 ## Native kernel integration into main: 2026-09-27
 
 The three qualified native-kernel stages and their public validators, reports

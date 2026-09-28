@@ -87,6 +87,11 @@ class RuntimeEnvironmentTests(unittest.TestCase):
                       str(Path(runtime["hsa_preload"]).parent)):
             self.assertIn(entry, env["LD_LIBRARY_PATH"])
 
+    def test_persists_triton_autotune_results(self):
+        with patch.dict(os.environ, {"TRITON_CACHE_AUTOTUNING": "0"}):
+            env = launch.runtime_environment(_runtime())
+        self.assertEqual(env["TRITON_CACHE_AUTOTUNING"], "1")
+
 
 class LeaseTests(unittest.TestCase):
     def test_clean_server_stop_requires_shutdown_and_preserves_failures(self):
@@ -555,6 +560,34 @@ class CachePrecisionForwardingTests(unittest.TestCase):
         argv = self._run_and_capture_argv("speed", [])
         self.assertNotIn("--prefix-cache", argv)
 
+    def test_warmup_defaults_on_and_forwards_only_to_serve(self):
+        for extra, expected in (([], "on"), (["--warmup", "off"], "off")):
+            with self.subTest(extra=extra):
+                argv = self._run_and_capture_argv("serve", extra)
+                self.assertEqual(argv[argv.index("--warmup") + 1], expected)
+        self.assertNotIn("--warmup", self._run_and_capture_argv("speed", []))
+
+    def test_warmup_override_rejected_outside_serve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            MainRejectionTests()._assert_rejects(
+                ["launch", "speed", "--config", str(root / "missing.toml"),
+                 "--output", str(root / "out"), "--warmup", "off"], root / "out")
+
+    def test_spec_sampling_defaults_on_and_forwards_only_to_serve(self):
+        for extra, expected in (([], "on"), (["--spec-sampling", "off"], "off")):
+            with self.subTest(extra=extra):
+                argv = self._run_and_capture_argv("serve", extra)
+                self.assertEqual(argv[argv.index("--spec-sampling") + 1], expected)
+        self.assertNotIn("--spec-sampling", self._run_and_capture_argv("speed", []))
+
+    def test_spec_sampling_override_rejected_outside_serve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            MainRejectionTests()._assert_rejects(
+                ["launch", "speed", "--config", str(root / "missing.toml"),
+                 "--output", str(root / "out"), "--spec-sampling", "off"], root / "out")
+
     def test_serve_timeout_is_disabled_by_default_and_explicit_has_no_ceiling(self):
         for extra, expected in (([], '0'), (['--request-timeout', '0'], '0'),
                                 (['--request-timeout', '3600'], '3600')):
@@ -598,7 +631,7 @@ class CachePrecisionForwardingTests(unittest.TestCase):
         for mode in ('serve', 'speed', 'generate'):
             extra = ['--prompt', 'hi'] if mode == 'generate' else []
             automatic = self._run_and_capture_argv(mode, extra)
-            for flag in ('packed-prefill', 'mlp-pair'):
+            for flag in ('packed-prefill', 'mlp-pair', 'narrow-gemm'):
                 self.assertNotIn('--' + flag, automatic)
                 self.assertNotIn('--no-' + flag, automatic)
                 for prefix in ('--', '--no-'):
@@ -649,6 +682,13 @@ class CachePrecisionForwardingTests(unittest.TestCase):
         argv = self._run_and_capture_argv("serve", [])
         self.assertIn("serve_exl3.py", argv[1])
         self._assert_profile(argv, "auto")
+
+    def test_prefill_staging_forwards_to_every_backend(self):
+        for mode, extra, expected in (("speed", [], "on"), ("serve", [], "on"),
+                                      ("serve", ["--prefill-staging", "off"], "off")):
+            with self.subTest(mode=mode, extra=extra):
+                argv = self._run_and_capture_argv(mode, extra)
+                self.assertEqual(argv[argv.index("--prefill-staging") + 1], expected)
 
     def test_long_profile_forwards_to_server(self):
         argv = self._run_and_capture_argv("serve", ["--attention-profile", "long"])
@@ -701,7 +741,7 @@ class PackedMidParserTests(unittest.TestCase):
                 action = self._packed_action(parser)
                 self.assertIsInstance(action, argparse.BooleanOptionalAction)
                 self.assertIsNone(parser.get_default('packed_mid'))
-                for name in ('packed_prefill', 'mlp_pair'):
+                for name in ('packed_prefill', 'mlp_pair', 'narrow_gemm'):
                     self.assertIsNone(parser.get_default(name))
                     action = next(a for a in parser._actions if a.dest == name)
                     self.assertIsInstance(action, argparse.BooleanOptionalAction)

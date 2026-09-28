@@ -93,9 +93,10 @@ class Engine:
         os.environ.update(EXL3_BC_ATTN='1' if args.native_attention else '0', EXL3_GEMV='2', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
                           EXL3_SMALLM_GRAPH='1' if args.native_smallm_graph else '0')
         os.environ['EXL3_QC_DECODE_PROFILE'] = getattr(args, 'attention_profile', 'auto')
-        if (self.cache_k, self.cache_v) != ('f16', 'f16'):
-            # Packed attention without full-cache FP16 staging.
-            os.environ['EXL3_QC_STAGING'] = '0'
+        staging = _cache_precision().qc_staging_env(self.cache_k, self.cache_v,
+                                                     getattr(args, 'prefill_staging', 'on'))
+        if staging is not None:
+            os.environ['EXL3_QC_STAGING'] = staging
         if args.native_smallm_graph:
             os.environ['EXL3_GEMV_GRAPH'] = '1'
         if args.gemv_splitk_warps is not None:
@@ -118,7 +119,8 @@ class Engine:
             smallm_kernel=args.smallm_kernel, head_warps=args.head_warps,
             prefill_gemm=getattr(args, 'prefill_gemm', 'blas'), native_smallm=args.native_smallm,
             packed_mid=getattr(args, 'packed_mid', None), mlp_warps=getattr(args, 'smallm_mlp_warps', None),
-            packed_prefill=getattr(args, 'packed_prefill', None), mlp_pair=getattr(args, 'mlp_pair', None))
+            packed_prefill=getattr(args, 'packed_prefill', None), mlp_pair=getattr(args, 'mlp_pair', None),
+            narrow_gemm=getattr(args, 'narrow_gemm', None))
         self.record('native_optimizations', **native_options)
         sys.path.insert(0, str(args.source_dir))
         from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer, Generator, Job, ArgmaxSampler
@@ -236,6 +238,13 @@ class Engine:
             if args.cache_mtp != 'off':
                 from quantlab.methods.exl3.cached_projection import cache_mtp_projections
                 self.optimizations['mtp_projection_cache'] = cache_mtp_projections(self.draft, args.cache_mtp)
+            # Sampled requests draft from the MTP head's own distribution and verify with
+            # the speculative sampling rule; greedy requests are unchanged.
+            from quantlab.methods.exl3 import spec_sampling
+            Generator.quantlab_spec_sampling = (self.draft is not None
+                                                and getattr(args, 'spec_sampling', 'on') == 'on')
+            self.optimizations['spec_sampling'] = (spec_sampling.STATS if Generator.quantlab_spec_sampling
+                                                   else dict(enabled=False))
         self.record('optimizations', **self.optimizations)
         if self.vision_enabled:
             self.vision = Model.from_config(cfg, component='vision')
@@ -263,6 +272,17 @@ class Engine:
             template_source = 'file'
         from quantlab.tool_calls import protocol_for_template
         self.tool_protocol = protocol_for_template(self.tokenizer.hf_tokenizer.chat_template)
+        from quantlab.methods.exl3.warmup import monitor_jit
+        self.jit = monitor_jit()
+        self.jit_after_ready = 0
+        if getattr(args, 'warmup', 'on') == 'on':
+            with torch.inference_mode():
+                self._warmup()
+        else:
+            self.record('warmup', enabled=False)
+            _say('stage=warmup skipped=1')
+        if self.jit is not None:
+            self.jit.listener = self._jit_after_ready
         torch.cuda.synchronize()
         self.ready = True
         self.record('loaded', model_load_count=1, allocator=self.memory(),
@@ -302,6 +322,74 @@ class Engine:
         self.record('cpu_moe', layers=params.moe_cpu_offload, threads=threads)
         _say(f'stage=cpu-moe layers={params.moe_cpu_offload} threads={threads or "auto"} '
              'note=first-N-layers-only')
+
+    def _warmup(self):
+        """Compile and tune first-use GPU paths before ready=1, leaving no reusable state.
+
+        A throwaway generator prefills one full chunk with a few decode rounds,
+        then short prompts at the Triton row buckets; warm_attention covers the
+        attention variants that longer contexts reach. Failures abort startup;
+        --warmup off is the diagnostic override.
+        """
+        from exllamav3.modules.attention_fn import triton_paged
+        from quantlab.methods.exl3 import warmup
+        from quantlab.sampling import build_sampler
+        start = time.monotonic()
+        specializations = self.jit.count if self.jit is not None else 0
+        segments = warmup.prefill_segments(self.chunk_size)
+        _say(f'stage=warmup start=1 chunk={self.chunk_size} context={self.context} prompts={len(segments)}')
+        text = self.tokenizer.encode(warmup.WARMUP_TEXT, add_bos=False, add_eos=False).flatten().tolist()
+        with warmup.attention_telemetry_preserved(triton_paged):
+            gen = self._build_generator()
+            try:
+                for index, rows in enumerate(segments):
+                    # Distinct first tokens keep prompts from reusing earlier pages;
+                    # the generator prefills all but the last prompt token.
+                    ids = [text[(index + i) % len(text)] for i in range(rows + 1)]
+                    sampler = (self.Sampler() if index == 1 else
+                               build_sampler(self.sampling_defaults, ArgmaxSampler=self.Sampler,
+                                             ComboSampler=self.ComboSampler))
+                    gen.enqueue(self.Job(input_ids=self.torch.tensor([ids], dtype=self.torch.long),
+                                         max_new_tokens=(16 if index == 0 else 2) + 1 + self.depth,
+                                         sampler=sampler, seed=0, stop_conditions=[],
+                                         token_healing=False, return_logits=False))
+                    while gen.num_remaining_jobs():
+                        gen.iterate()
+                gen.clear_queue()
+                self.torch.cuda.synchronize()
+            finally:
+                self._release_generator(gen)
+                gen = None
+                gc.collect()
+            generation_seconds = time.monotonic() - start
+            from quantlab.methods.exl3 import spec_sampling
+            spec_launches = (spec_sampling.warm_kernels(self.torch.device('cuda:0'))
+                             if getattr(getattr(self, 'Generator', None), 'quantlab_spec_sampling', False) else 0)
+            spec_sampling.reset_stats()
+            shortlist = getattr(self.model, 'quantlab_shortlist', None)
+            if shortlist is not None:
+                shortlist.reset()
+            pairs = warmup.attention_layers(self.model, self.cache)
+            if self.draft is not None:
+                pairs += warmup.attention_layers(self.draft, self.draft_cache)
+            attention = warmup.warm_attention(self.torch, pairs, chunk=self.chunk_size)
+            self.torch.cuda.synchronize()
+        seconds = time.monotonic() - start
+        specializations = self.jit.count - specializations if self.jit is not None else None
+        self.record('warmup', enabled=True, seconds=seconds, generation_seconds=generation_seconds,
+                    attention_seconds=seconds - generation_seconds, prefill_segments=segments,
+                    attention=attention, spec_sampling_launches=spec_launches,
+                    jit_specializations=specializations, allocator=self.memory())
+        _say(f'stage=warmup done=1 seconds={seconds:.2f} generation_seconds={generation_seconds:.2f} '
+             f'attention_calls={attention["calls"]} attention_variants={attention["variants"]} '
+             f'specializations={specializations if specializations is not None else "n/a"}')
+
+    def _jit_after_ready(self, name):
+        # A Triton specialization first used while serving: a compile or cache-load stall.
+        self.jit_after_ready += 1
+        if not self.events.closed:
+            self.record('jit_after_ready', kernel=name, serial=self.started)
+        _say(f'stage=jit after_ready=1 kernel={name} request={self.started}')
 
     def record(self, stage, **fields):
         self.events.write(json.dumps(dict(stage=stage, elapsed_seconds=time.monotonic()-self.t0, **fields),
@@ -366,7 +454,9 @@ class Engine:
                     prefill_gemm=getattr(self.args, 'prefill_gemm', 'blas'),
                     cache_policy=getattr(self, 'cache_policy', None),
                     packed_head=getattr(self, 'optimizations', {}).get('packed_head', []),
-                    attention_profile=_cache_precision().attention_profile_status())
+                    spec_sampling=getattr(self, 'optimizations', {}).get('spec_sampling', dict(enabled=False)),
+                    attention_profile=_cache_precision().attention_profile_status(),
+                    jit_after_ready=getattr(self, 'jit_after_ready', 0))
 
     def shutdown(self):
         if self.events.closed:
@@ -824,6 +914,8 @@ def parser():
                    help='Automatically use validated tiled packed prefill; disable for diagnostics')
     p.add_argument('--mlp-pair', action=argparse.BooleanOptionalAction, default=None,
                    help='Automatically pair eligible MLP gate/up projections; disable for diagnostics')
+    p.add_argument('--narrow-gemm', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically use the verified narrow dense GEMM for decode-sized FP16/BF16 projections; disable for diagnostics')
     p.add_argument('--smallm-mlp-warps', type=int, choices=(4,8,16), help='Experimental packed MLP split-K scheduling override')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16))
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off')
@@ -860,6 +952,10 @@ def parser():
                    help='Prompt tokens processed per prefill step, 256-8192, multiple of 256; default 1024')
     p.add_argument('--prefix-cache', choices=('off', 'on'), default='off',
                    help='Reuse one generator across serialized requests so repeated prompt prefixes skip recompute; off rebuilds per request')
+    p.add_argument('--warmup', choices=('on', 'off'), default='on',
+                   help='Compile and tune first-use GPU kernels before reporting ready; off is a diagnostic override')
+    p.add_argument('--spec-sampling', choices=('on', 'off'), default='on',
+                   help='Speculative sampling for MTP drafts at temperature > 0; off keeps argmax drafts (diagnostic)')
     p.add_argument('-ncmoe', '--n-cpu-moe', dest='n_cpu_moe', type=int, default=0,
                    help='Keep routed experts of the first N MoE layers on CPU (llama.cpp -ncmoe analogue)')
     p.add_argument('-cmoe', '--cpu-moe', nargs='?', const='all', choices=('off', 'all'), default='off',

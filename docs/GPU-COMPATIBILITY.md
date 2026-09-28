@@ -85,6 +85,15 @@ existing one-row native kernel exactly. These are operator checks, not proof
 of full-model quality or a general speedup. See [MiMo MTP](MIMO-MTP.md) for the
 separate full-model qualification and precision constraints.
 
+## Narrow dense GEMM
+
+Narrow-GEMM ABI 1 adds a deterministic dense kernel for decode-sized
+projections: FP16 1–8 rows with 8–128 output columns (multiples of 8) through
+`hgemm`, and BF16 1–4 rows through `narrow_gemm_bf16` for the BF16 MTP draft.
+It is selected automatically from the verified binary; older binaries and
+`--no-narrow-gemm` keep BLAS. It is validated on gfx1101 only
+(`--checks narrow-gemm`); see [DECODE-PROFILING.md](DECODE-PROFILING.md).
+
 ## RDNA4 implementation
 
 `gfx1200` and `gfx1201` use RDNA4 WMMA intrinsics in the shared

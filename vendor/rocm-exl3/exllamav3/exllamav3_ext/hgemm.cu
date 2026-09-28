@@ -9,6 +9,7 @@
 #include <limits>
 #ifdef USE_ROCM
 #include "rocm/hgemm_wmma.hip.h"
+#include "rocm/narrow_gemm.hip.h"
 #include <cstdlib>
 #include <cstring>
 #endif
@@ -91,6 +92,7 @@ static void hgemm_gemmex_impl
     at::assert_no_overlap(c, a);
     at::assert_no_overlap(c, b);
 #ifdef USE_ROCM
+    if (narrow_gemm_try(a, b, c, stream)) return;
     if (hgemm_use_wmma() && hgemm_wmma_try(a, b, c, stream)) return;
 #endif
 

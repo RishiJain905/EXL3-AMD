@@ -31,6 +31,7 @@ controls are not uniformly faster.
 | `--prefill-gemm auto\|blas\|wmma` | Default auto selects verified FP32-output WMMA; unsupported shapes/devices and legacy binaries retain BLAS |
 | `--no-packed-prefill` | Disable automatic tiled packed prefill for diagnosis; primary policy admits FP16 rows 65–128 and FP32 rows 65–512, output width at most 32768 |
 | `--no-mlp-pair` | Disable automatic paired gate/up and fused output-Hadamard/SwiGLU work for diagnosis |
+| `--no-narrow-gemm` | Use BLAS instead of the automatic narrow dense GEMM for 1–8-row FP16 projections up to 128 outputs and 1–4-row BF16 MTP projections; diagnostic control |
 | `--warps`, `--head-warps` | Split-K scheduling overrides |
 | `--cache-mtp off\|fc\|attention\|mlp\|all` | Reconstructed draft projections with extra cache bound/checks |
 | `--shortlist-groups`, `--shortlist-mode` | Compact draft vocabulary; target still verifies full vocabulary |

@@ -130,4 +130,29 @@ class AttentionAdapterTests(unittest.TestCase):
         self.assertEqual(self.policy(a)['block_n'],16)
 
 
+class PrefillTileTests(unittest.TestCase):
+    def tiles(self, **changes):
+        return schedule.prefill_tiles(**(dict(arch='gfx1101', head_dim=256, query_rows=1024) | changes))
+
+    def test_measured_tiles_keep_sixteen_rows_per_warp(self):
+        for rows, expected in ((17, (64, 64, 4, 1)), (128, (64, 64, 4, 1)), (129, (128, 64, 8, 1)),
+                               (2048, (128, 64, 8, 1)), (8192, (128, 64, 8, 1))):
+            with self.subTest(rows=rows):
+                tiles = self.tiles(query_rows=rows)
+                self.assertEqual(tiles, expected)
+                self.assertEqual(tiles[0] // tiles[2], 16)
+
+    def test_unmeasured_cases_keep_the_inherited_tile(self):
+        for change in (dict(arch='gfx1151'), dict(arch='gfx1201'), dict(head_dim=128),
+                       dict(head_dim=512), dict(query_rows=0)):
+            with self.subTest(change=change):
+                self.assertIsNone(self.tiles(**change))
+
+    def test_dispatch_applies_tiles_only_to_the_fp16_kernel(self):
+        source = (DIRECTORY / 'triton_paged.py').read_text(encoding='utf-8')
+        self.assertIn('if qc is None and codebook is None:\n'
+                      '            cfg = _prefill_tiles(q.device, head_dim, q_len) or cfg', source)
+        self.assertIn('_prefill_tiles_env == "inherited"', source)
+
+
 if __name__=='__main__': unittest.main()

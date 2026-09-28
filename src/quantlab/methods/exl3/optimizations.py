@@ -3,7 +3,7 @@
 
 def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_gemm='auto',
                      native_smallm=False, packed_mid=None, mlp_warps=None,
-                     packed_prefill=None, mlp_pair=None):
+                     packed_prefill=None, mlp_pair=None, narrow_gemm=None):
     """Use supported packed kernels by default; verify explicit kernel requests."""
     import ctypes
     import os
@@ -13,8 +13,8 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
         raise ValueError('Unsupported prefill GEMM setting')
     if (packed_mid is not None and type(packed_mid) is not bool) or mlp_warps not in (None, 4, 8, 16):
         raise ValueError('Unsupported packed projection setting')
-    if any(value is not None and type(value) is not bool for value in (packed_prefill, mlp_pair)):
-        raise ValueError('Unsupported packed prefill/MLP setting')
+    if any(value is not None and type(value) is not bool for value in (packed_prefill, mlp_pair, narrow_gemm)):
+        raise ValueError('Unsupported packed prefill/MLP/narrow GEMM setting')
     if mlp_pair is True and smallm_kernel != 'dot':
         raise ValueError('Paired MLP requires the dot small-M kernel')
     if (packed_mid or packed_prefill or mlp_pair or mlp_warps is not None) and not native_smallm:
@@ -45,6 +45,23 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
                 raise ValueError('Unsupported prefill GEMM ABI')
     if prefill_gemm == 'auto':
         prefill_gemm = 'wmma' if hgemm_abi == 1 else 'blas'
+    # Decode-sized dense GEMMs: FP16 GatedDeltaNet in_proj_a/b through hgemm and the
+    # BF16 MTP draft projections. Automatic with the other native decode paths; an
+    # explicit request probes regardless.
+    narrow_gemm_abi = None
+    if narrow_gemm is True or (narrow_gemm is None and native_smallm):
+        try:
+            capability = ctypes.CDLL(str(binary)).quantlab_exl3_narrow_gemm_abi
+        except AttributeError as error:
+            if narrow_gemm is True:
+                raise ValueError('narrow_gemm requires a verified binary with ABI 1') from error
+        else:
+            capability.argtypes = []
+            capability.restype = ctypes.c_int
+            narrow_gemm_abi = capability()
+            if narrow_gemm_abi != 1:
+                raise ValueError('Unsupported narrow_gemm ABI')
+    narrow_gemm = narrow_gemm_abi == 1
     codebooks = [0]
     highbit_abi = None
     packed_mid_abi = None
@@ -122,6 +139,7 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
     os.environ['EXL3_SMALLM_WMMA'] = {'dot':'0', 'wmma':'1', 'wmma-register':'2'}[smallm_kernel]
     os.environ['EXL3_PACKED_MID'] = '1' if packed_mid else '0'
     os.environ['EXL3_PACKED_PREFILL'] = '1' if additional['packed_prefill'] else '0'
+    os.environ['EXL3_NARROW_GEMM'] = '1' if narrow_gemm else '0'
     if mlp_warps is None:
         os.environ.pop('EXL3_SMALLM_MLP_WARPS', None)
     else:
@@ -136,6 +154,7 @@ def configure_native(binary, *, smallm_kernel='dot', head_warps=None, prefill_ge
                 packed_mid=packed_mid, packed_mid_abi=packed_mid_abi, mlp_warps=mlp_warps,
                 head_repacked=head_repacked_abi == 3 and smallm_kernel == 'dot' and head_warps is None,
                 head_repacked_abi=head_repacked_abi,
+                narrow_gemm=narrow_gemm, narrow_gemm_abi=narrow_gemm_abi,
                 **additional, **additional_abis)
 
 

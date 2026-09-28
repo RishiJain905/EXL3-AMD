@@ -14,6 +14,9 @@ verified native build supports them. No kernel-selection flag is needed.
 Tiled prefill and paired MLP kernels are also automatic with a matching
 verified build. Their [shape policy](PREFILL-MLP-FUSION.md) keeps dense fallback
 where it is faster. `--no-packed-prefill` and `--no-mlp-pair` are diagnostic overrides.
+Decode-sized dense GEMMs (GatedDeltaNet `in_proj_a`/`in_proj_b` and the BF16 MTP
+draft projections) use the verified narrow GEMM automatically; `--no-narrow-gemm`
+restores BLAS for diagnosis. [Measurements](DECODE-PROFILING.md).
 Verified repacked-head ABI 3 also selects the supported compressed vocabulary
 head automatically. It preserves FP16 or FP32 logits and their intermediate
 rounding, shares the view with MTP when the head is shared, and falls back
@@ -88,6 +91,20 @@ Thinking models emit `<think>...</think>` before their answer. The server splits
 
 Greedy decoding is the default (`temperature: 0`, `top_p: 1`, `n: 1`). Serve flags set defaults and requests may override `temperature` [0,2], `top_p` (0,1], `top_k` [0,1000], `min_p` [0,1), `repetition_penalty` (0,2], `presence_penalty`/`frequency_penalty` [-2,2], and `seed` [0,2⁶³). Non-greedy requests use the vendored ComboSampler; `temperature: 0` or `top_k: 1` stays on the greedy path. `--batch-greedy` rejects stochastic sampling and penalties, including request overrides. Seeded sampling with MTP and penalties passed a dense Qwen-family GPU smoke test; broader sampling quality and determinism across devices or versions remain unvalidated.
 
+### Speculative sampling with MTP
+
+With `--mtp`, sampled requests (temperature > 0) use speculative sampling: the
+MTP draft samples its tokens from its own top-K proposal instead of taking the
+argmax, and verification accepts each draft with probability
+min(1, p/q) and resamples a rejection from the residual max(0, p − q). Output
+tokens follow exactly the same distribution as non-speculative sampling with the
+same settings; only draft acceptance changes. Greedy requests are unchanged and
+bit-identical. Requests with repetition, presence or frequency penalties keep
+the previous exact-match verification, which is equally exact but accepts less.
+It is on by default; `--spec-sampling off` is a diagnostic
+override. `/health` reports `spec_sampling` round counters. Details,
+distribution tests and measurements: [SPECULATIVE-SAMPLING.md](SPECULATIVE-SAMPLING.md).
+
 ## Backend controls
 
 `-b / --prefill-chunk` (256–8192 in multiples of 256, serve default 1024) sets prompt tokens per prefill step, the analogue of llama.cpp `-b`. Larger chunks need more temporary VRAM; `-b 256` retains the previous setting. Non-server modes retain their 256-token default. `-ncmoe / --n-cpu-moe N` keeps routed experts of the first N MoE layers on CPU and `--cpu-moe all` offloads every MoE layer, backed by `cfg.infer_params.moe_cpu_offload`; this pins whole layers, not dynamic inactive-expert caching. Offload is rejected on dense models and when the extension lacks the CPU-MoE symbols, and is not GPU-validated here. Draft-model offload, `ngl`, `mmap`, and RoPE overrides are not offered.
@@ -98,6 +115,30 @@ and output remain FP32. Other shapes and FP16 outputs keep the BLAS path.
 The default is `auto`, selecting WMMA with a hash-verified extension exporting
 prefill GEMM ABI 1 and BLAS otherwise. This is separate from `--smallm-kernel`, which controls
 packed decode projections.
+
+## Startup warm-up
+
+Before reporting `ready=1`, serve compiles and loads the GPU kernels that
+requests will need, so the first request runs at steady-state speed and no
+Triton compile stalls a request later as occupied context grows. It runs a few
+short throwaway generations (full prefill chunk, Triton row buckets, MTP
+decode), then compiles every paged-attention variant reachable up to the
+configured context without executing it. No pages, recurrent checkpoints or
+sampler state survive into serving. Details and measurements are in
+[COLD-START.md](COLD-START.md).
+
+Warm-up is on by default. `--warmup off` is a diagnostic override that
+restores the previous lazy behavior. A fully cached warm-up takes a few
+seconds; the first launch after a new extension, Triton or context/cache
+configuration compiles the new variants once (about 100 s for MiMo 9B at 131K
+Q6) and later launches reuse the Triton disk cache.
+
+The console prints `stage=warmup start=1 ...` and
+`stage=warmup done=1 seconds=... attention_variants=... specializations=...`.
+Any Triton specialization first used after ready prints
+`stage=jit after_ready=1 kernel=<name> request=<n>` and increments
+`jit_after_ready` in `/health` and `shutdown.json`. With warm-up on it should
+stay 0; a nonzero value identifies a path warm-up does not cover.
 
 ## Prefix reuse
 

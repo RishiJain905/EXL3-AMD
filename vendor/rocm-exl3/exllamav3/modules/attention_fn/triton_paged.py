@@ -1862,6 +1862,21 @@ def _paged_attn_prefill_combine_kernel(
 _qc_prefill_ns_cache = {}
 _qc_prefill_ns_env = int(os.environ.get("EXL3_QC_PREFILL_NS", "0") or "0")
 
+_prefill_tiles_env = os.environ.get("EXL3_PREFILL_TILES", "auto")
+_prefill_arch = {}
+
+def _prefill_tiles(device, head_dim, q_len):
+    """quantlab: measured FP16 prefill tiles (schedule.prefill_tiles), or None."""
+    if not _is_rocm or _prefill_tiles_env == "inherited":
+        return None
+    index = device.index
+    if index not in _prefill_arch:
+        arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "") or ""
+        _prefill_arch[index] = arch.split(":", 1)[0]
+    from .schedule import prefill_tiles
+    return prefill_tiles(arch=_prefill_arch[index], head_dim=head_dim, query_rows=q_len)
+
+
 def _pick_qc_prefill_num_stages(key, launch):
     num_stages = _qc_prefill_ns_cache.get(key)
     if num_stages is not None:
@@ -2045,6 +2060,13 @@ def paged_attn_triton_prefill(
         cfg = (128, 32, 8, 2) if narrow_kv else (128, 64, 8, 2)
     elif head_dim <= 256:
         cfg = (64, 32, 8, 2)
+        # quantlab: gfx1101 FP16 kernel (FP16 cache, or quantized cache after staging) at
+        # head_dim 256 runs ~15 TFLOP/s with the tile above (8 rows per warp, off the 16-row
+        # rule). One stage with BN 64 and 16 rows per warp measured 2.0-2.5x faster at 17-2048
+        # rows and 8K-128K context, same FP32-reference error (docs/PREFILL-ATTENTION.md).
+        # EXL3_PREFILL_TILES=inherited restores the tile above.
+        if qc is None and codebook is None:
+            cfg = _prefill_tiles(q.device, head_dim, q_len) or cfg
     else:
         cfg = (32, 16, 4, 2)
     num_stages_forced = num_stages is not None

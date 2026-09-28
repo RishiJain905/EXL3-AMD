@@ -82,6 +82,32 @@ class NativeOptionsTests(unittest.TestCase):
                         configure_native('unused', **{name: value})
                 library.assert_not_called()
 
+    def test_narrow_gemm_is_automatic_with_diagnostic_override(self):
+        import os
+        def version(): return 1
+        library = SimpleNamespace(quantlab_exl3_narrow_gemm_abi=version)
+        for native_smallm in (False, True):
+            for requested, enabled in ((None, native_smallm), (True, True), (False, False)):
+                with patch('ctypes.CDLL', return_value=library), patch.dict(os.environ, {}, clear=True):
+                    result = configure_native('verified.so', native_smallm=native_smallm, narrow_gemm=requested)
+                    self.assertIs(result['narrow_gemm'], enabled)
+                    self.assertEqual(result['narrow_gemm_abi'], 1 if enabled else None)
+                    self.assertEqual(os.environ['EXL3_NARROW_GEMM'], '1' if enabled else '0')
+        with patch('ctypes.CDLL', return_value=object()), patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(configure_native('legacy.so', native_smallm=True)['narrow_gemm'])
+            self.assertEqual(os.environ['EXL3_NARROW_GEMM'], '0')
+            with self.assertRaisesRegex(ValueError, 'narrow_gemm requires'):
+                configure_native('legacy.so', narrow_gemm=True)
+        def bad(): return 2
+        with patch('ctypes.CDLL', return_value=SimpleNamespace(quantlab_exl3_narrow_gemm_abi=bad)):
+            with self.assertRaisesRegex(ValueError, 'Unsupported narrow_gemm ABI'):
+                configure_native('unknown.so', native_smallm=True)
+            self.assertFalse(configure_native('unknown.so', native_smallm=True, narrow_gemm=False)['narrow_gemm'])
+        with patch('ctypes.CDLL') as library:
+            with self.assertRaises(ValueError):
+                configure_native('unused', narrow_gemm='yes')
+            library.assert_not_called()
+
     def test_mlp_pair_preserves_explicit_wmma_diagnostic(self):
         import os
         def version(): return 1

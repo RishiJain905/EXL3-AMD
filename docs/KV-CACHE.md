@@ -10,6 +10,19 @@ Short contexts and unsupported cases retain inherited scheduling.
 [Supported shapes and 9B/27B results](HEAD-ATTENTION-PERFORMANCE.md).
 Explicit `--attention-profile default` retains the inherited control path.
 
+With a quantized cache, prefill chunks of 256 or more rows are staged by
+default (`--prefill-staging on`). The referenced window is dequantized once
+into a shared FP16 scratch and attended with the FP16 kernel.
+
+- **Speed.** 2.2× faster at 122K occupied context on MiMo 9B Q6.
+- **Memory.** The scratch holds one layer's K/V for the whole pool:
+  2 × context × KV heads × head dim × 2 bytes. That is 512 MiB for MiMo 9B at
+  131072 tokens.
+- **Diagnostic override.** `--prefill-staging off` restores in-kernel
+  dequantization.
+
+[Measurements](PREFILL-ATTENTION.md).
+
 Experimental `--cache-policy POLICY.json` assigns precision per attention layer
 with explicit target/draft coverage. See the [Stage 2 contract and research
 gate](KVCache-Research/STAGE2.md). Profiles require a quantized base type and

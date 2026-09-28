@@ -29,6 +29,8 @@ A model-selectable EXL3 inference runtime for AMD GPUs, with a Python CLI and a 
   verification batches, with memory-bounded fallback.
 - Automatic compact GDN recurrent kernels for eligible multi-token ROCm calls.
   [Native kernel changes, 9B/27B measurements and limits](docs/NATIVE-KERNEL-PERFORMANCE.md).
+- Automatic narrow dense GEMM for decode-sized GatedDeltaNet gate projections and
+  BF16 MTP draft projections. [Per-kernel decode profile and measurements](docs/DECODE-PROFILING.md).
 - Opt-in [BF16 Qwen3.5 MTP projections and sequential verification attention](docs/MIMO-MTP.md), with explicit compatibility limits.
 - Optional [Qwen3.5 vision and image input](docs/VISION.md), with `--mmproj on|off` startup selection and measured image limits.
 - OpenAI Chat Completions tools for recognized Qwen XML and Hermes JSON templates.
@@ -101,6 +103,11 @@ The server has no overall lifetime timeout or default request deadline. Output c
 [Residual fusion and larger MTP graph investigation](docs/FUSION-DECODE-PERFORMANCE.md).
 [Native projection, prefill and GDN kernel qualification](docs/NATIVE-KERNEL-PERFORMANCE.md).
 [Mul1 model, speed and occupied 120K validation](docs/MUL1-VALIDATION.md).
+[Cold start: autotune cache, warm-up and SSD runtime](docs/COLD-START.md).
+[Ranked optimization plan and next ideas](docs/OPTIMIZATION-PLAN.md).
+[Decode kernel profiling and MiMo decode tuning](docs/DECODE-PROFILING.md).
+[Speculative sampling for MTP drafts](docs/SPECULATIVE-SAMPLING.md).
+[Long-context prefill: staged quantized KV and RDNA3 tiles](docs/PREFILL-ATTENTION.md).
 
 ## Main flags
 
@@ -120,12 +127,15 @@ The server has no overall lifetime timeout or default request deadline. Output c
 | `--spec-draft-n-max` | Draft depth 0–8; draft-mtp alone selects 2 |
 | `--draft-confidence` | Optional adaptive confidence, strictly between 0 and 1 |
 | `--attention-profile auto\|default\|long` | Automatic measured scheduling; inherited and legacy long profiles for diagnosis |
+| `--prefill-staging on\|off` | Quantized KV: stage each prefill window to an FP16 scratch (about 4 KiB per context token for MiMo 9B) for the faster FP16 kernel; default on, `off` is diagnostic. [Long-context prefill](docs/PREFILL-ATTENTION.md) |
 | `--no-packed-mid` | Diagnostic fallback for 10–64-row projections; compatible builds use packed kernels automatically |
 | `--output` | New private artifact directory; existing directories refused |
 | `--reasoning on\|off\|auto` | Serve thinking-template mode; default auto respects the template |
 | `--temperature`, `--top-p`, `--top-k`, `--min-p`, penalties, `--seed` | Serve sampling defaults with per-request overrides; default greedy |
 | `-b / --prefill-chunk` | Prompt tokens per prefill step, 256–8192 in multiples of 256; default 1024 for serve, 256 otherwise |
 | `--prefix-cache on\|off` | Serve: reuse matching KV/recurrent checkpoints; default off, up to 1 GiB host checkpoint memory |
+| `--warmup on\|off` | Serve: compile first-use GPU kernels before ready; default on, `off` is diagnostic. [Cold start](docs/COLD-START.md) |
+| `--spec-sampling on\|off` | Serve with MTP: speculative sampling for sampled requests (draft samples its own proposal, exact acceptance/resampling); default on, `off` is diagnostic. [Speculative sampling](docs/SPECULATIVE-SAMPLING.md) |
 | `-ncmoe / --n-cpu-moe`, `--cpu-moe all` | Keep first-N (or all) MoE-layer experts on CPU; MoE models only, not validated on GPU |
 
 Context must fit model metadata and memory, including output, reasoning, and draft reserve. Allocation alone is not useful-context validation. GGUF names such as `q8_0`, separate draft-model files, and most llama.cpp knobs (`ngl`, `mmap`, RoPE overrides) are unsupported; only the mapped `-b` and `-ncmoe` analogues exist. See [KV cache](docs/KV-CACHE.md) and [long context](docs/LONG-CONTEXT.md).

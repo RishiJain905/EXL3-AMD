@@ -141,6 +141,16 @@ class ParserSyntaxTests(unittest.TestCase):
         args = self._parser().parse_args(["--attention-profile", "default"])
         self.assertEqual(args.attention_profile, "default")
 
+    def test_prefill_staging_defaults_on_for_quantized_caches(self):
+        self.assertEqual(self._parser().parse_args([]).prefill_staging, "on")
+        for cache in ("q8", "q6", "q5", "q4", "aster5"):
+            with self.subTest(cache=cache):
+                self.assertIsNone(cache_precision.qc_staging_env(cache, cache, "on"))
+                self.assertEqual(cache_precision.qc_staging_env(cache, cache, "off"), "0")
+        self.assertIsNone(cache_precision.qc_staging_env("f16", "f16", "off"))
+        with self.assertRaises(ValueError):
+            cache_precision.qc_staging_env("q6", "q6", "auto")
+
     def test_attention_profile_malformed_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as caught:

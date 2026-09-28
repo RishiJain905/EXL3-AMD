@@ -37,6 +37,24 @@ class BF16ProjectionTests(unittest.TestCase):
         self.assertEqual(y.dtype, torch.float16)
         self.assertTrue(torch.equal(y, expected))
 
+    def test_narrow_gemm_serves_up_to_four_rows_when_enabled(self):
+        import os
+        inner = self.inner()
+        calls = []
+        def narrow(a, b, c):
+            calls.append(a.shape[0])
+            c.copy_(a @ b)
+        inner.bf16_narrow, inner.bf16_narrow_calls = narrow, 0
+        for rows, flag, used in ((1, '1', True), (4, '1', True), (5, '1', False), (2, '0', False)):
+            with patch.dict(os.environ, {'EXL3_NARROW_GEMM': flag}):
+                x = torch.ones((rows, 2), dtype=torch.float16)
+                y = m.bf16_projection_forward(inner, x, {})
+                self.assertTrue(torch.equal(y, (x.to(torch.bfloat16) @ inner.weight).float()))
+                self.assertEqual(bool(calls) and calls[-1] == rows, used)
+                calls.clear()
+        self.assertEqual(inner.bf16_narrow_calls, 2)
+        self.assertEqual(inner.bf16_calls, 4)
+
     def test_default_half_interface_and_bias(self):
         inner = self.inner()
         inner.out_dtype = None

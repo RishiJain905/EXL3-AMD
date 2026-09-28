@@ -104,7 +104,10 @@ def runtime_environment(runtime):
     env.update(LD_PRELOAD=runtime['hsa_preload'], ROCM_PATH=sdk, ROCM_HOME=sdk,
                HIP_PATH=sdk, EXL3_BACKEND='rocm', PYTORCH_ROCM_ARCH=runtime['gpu_arch'],
                GPU_ARCHS=runtime['gpu_arch'], MAX_JOBS='2', PYTHONUTF8='1', PYTHONUNBUFFERED='1',
-               HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
+               HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
+               # Persist Triton autotune winners (FLA GDN, paged attention) so
+               # later processes skip re-benchmarking. See docs/COLD-START.md.
+               TRITON_CACHE_AUTOTUNING='1')
     env['PATH'] = str(Path(runtime['python']).parent) + ':' + sdk + '/bin:' + sdk + '/llvm/bin:' + env.get('PATH','')
     env.pop('PYTHONPATH', None)
     if runtime.get('server_deps'):
@@ -265,6 +268,8 @@ def parser():
                    help='Automatically use validated tiled packed prefill; disable for diagnostics')
     p.add_argument('--mlp-pair', action=argparse.BooleanOptionalAction, default=None,
                    help='Automatically pair eligible MLP gate/up projections; disable for diagnostics')
+    p.add_argument('--narrow-gemm', action=argparse.BooleanOptionalAction, default=None,
+                   help='Automatically use the verified narrow dense GEMM for decode-sized FP16/BF16 projections; disable for diagnostics')
     p.add_argument('--smallm-mlp-warps', type=int, choices=(4,8,16), help='Experimental packed MLP split-K scheduling override')
     p.add_argument('--head-warps', type=int, choices=(1,4,8,16), help='Experimental wide-projection split-K override')
     p.add_argument('--cache-mtp', choices=('off','fc','attention','mlp','all'), default='off',
@@ -290,6 +295,10 @@ def parser():
                    help='serve: reasoning_content splitting; none keeps raw text')
     p.add_argument('--prefix-cache', choices=('off', 'on'), default='off',
                    help='serve: reuse matching prompt prefixes and recurrent checkpoints')
+    p.add_argument('--warmup', choices=('on', 'off'), default='on',
+                   help='serve: compile and tune first-use GPU kernels before ready (default on); off is a diagnostic override')
+    p.add_argument('--spec-sampling', choices=('on', 'off'), default='on',
+                   help='serve: speculative sampling for MTP drafts at temperature > 0 (default on); off is a diagnostic override')
     p.add_argument('--chat-template-file', type=Path, default=None, help='serve: local trusted Jinja template override')
     p.add_argument('--jinja', action='store_true', help='serve: accepted; rendering is always Jinja via Transformers')
     p.add_argument('--temp', '--temperature', dest='temperature', type=float, default=0.0, help='serve: sampling default in [0,2]')
@@ -337,7 +346,7 @@ def main():
         serve_defaults = dict(reasoning='auto', reasoning_format='auto', chat_template_file=None,
                               jinja=False, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0,
                               repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0,
-                              seed=None, prefix_cache='off')
+                              seed=None, prefix_cache='off', warmup='on', spec_sampling='on')
         for name, default in serve_defaults.items():
             if getattr(args, name) != default:
                 p.error('--' + name.replace('_', '-') + ' applies only to serve mode')
@@ -429,7 +438,8 @@ def main():
                       repetition_penalty=args.repetition_penalty != 1.0,
                       presence_penalty=args.presence_penalty != 0.0,
                       frequency_penalty=args.frequency_penalty != 0.0, seed=args.seed is not None,
-                      prefix_cache=args.prefix_cache != 'off')
+                      prefix_cache=args.prefix_cache != 'off', warmup=args.warmup != 'on',
+                      spec_sampling=args.spec_sampling != 'on')
     if args.mode != 'serve' and any(serve_only.values()):
         used = sorted(k for k, v in serve_only.items() if v)
         p.error('Options apply only to serve mode: ' + ', '.join('--' + u.replace('_', '-') for u in used))
@@ -536,7 +546,8 @@ def main():
         if args.alias:
             argv += ['--alias', args.alias]
         argv += ['--reasoning', args.reasoning, '--reasoning-format', args.reasoning_format,
-                 '--prefix-cache', args.prefix_cache]
+                 '--prefix-cache', args.prefix_cache, '--warmup', args.warmup,
+                 '--spec-sampling', args.spec_sampling]
         if args.chat_template_file is not None:
             argv += ['--chat-template-file', linux_path(args.chat_template_file.resolve())]
         if args.jinja: argv += ['--jinja']
@@ -557,7 +568,7 @@ def main():
     if args.warps: argv += ['--gemv-splitk-warps',str(args.warps)]
     if args.packed_mid is True: argv += ['--packed-mid']
     elif args.packed_mid is False: argv += ['--no-packed-mid']
-    for option in ('packed_prefill', 'mlp_pair'):
+    for option in ('packed_prefill', 'mlp_pair', 'narrow_gemm'):
         value = getattr(args, option)
         if value is not None:
             argv.append('--' + ('' if value else 'no-') + option.replace('_', '-'))
@@ -570,6 +581,7 @@ def main():
     if args.cache_policy is not None:
         argv += ['--cache-policy', linux_path(args.cache_policy.resolve())]
     argv += ['--attention-profile',args.attention_profile]
+    argv += ['--prefill-staging',args.prefill_staging]
     if args.cache_mtp != 'off': argv += ['--cache-mtp',args.cache_mtp]
     if args.draft_step_graph: argv += ['--draft-step-graph']
     if args.native_attention: argv += ['--native-attention']
