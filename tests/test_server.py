@@ -369,6 +369,43 @@ class ValidationTests(ServerTestBase):
         await run_app(app, make_scope(path), h)
         return status_of(h), json_of(h)
 
+    async def test_store_false_chat_json_and_stream(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                eng = FakeEngine()
+                app = create_app(eng)
+                h = Harness(chat_body(store=False, stream=stream))
+                await run_app(app, make_scope("/v1/chat/completions"), h)
+                self.assertEqual(status_of(h), 200, body_bytes_of(h))
+                self.assertEqual(len(eng.generate_calls), 1)
+                self.assertNotIn("store", eng.prepare_calls[0])
+                if stream:
+                    events = sse_of(h)
+                    self.assertEqual(events[-1], "[DONE]")
+                    text = "".join(event["choices"][0]["delta"].get("content", "")
+                                   for event in events[:-1] if event.get("choices"))
+                    self.assertEqual(text, "Hello world")
+                else:
+                    self.assertEqual(json_of(h)["choices"][0]["message"]["content"],
+                                     "Hello world")
+
+    async def test_store_values_rejected_before_generation(self):
+        for value in (True, None, 0, 1, "false", "true", {}, []):
+            with self.subTest(value=value):
+                eng = FakeEngine()
+                app = create_app(eng)
+                h = Harness(chat_body(store=value))
+                await run_app(app, make_scope("/v1/chat/completions"), h)
+                self.assertEqual(status_of(h), 400, json_of(h))
+                self.assertIn("store must be false", json_of(h)["error"]["message"])
+                self.assertEqual(eng.prepare_calls, [])
+                self.assertEqual(eng.generate_calls, [])
+
+    async def test_store_remains_unsupported_for_legacy_completions(self):
+        status, payload = await self._post("/v1/completions", completion_body(store=False))
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["error"]["message"], "unsupported parameter: 'store'")
+
     async def test_list_valued_role_rejected_400(self):
         # Unhashable role must be a 400, not an unhandled TypeError/500.
         status, payload = await self._post(
@@ -391,6 +428,8 @@ class ValidationTests(ServerTestBase):
     async def test_strict_matrix(self):
         cases = [
             ("extra-key-chat", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "stop": ["x"]}),
+            ("store-extra-key-chat", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "store": False, "stop": ["x"]}),
+            ("store-model-mismatch", "/v1/chat/completions", {"model": "other", "messages": [{"role": "user", "content": "hi"}], "store": False}),
             ("extra-key-tools-completion", "/v1/completions", {"prompt": "hi", "tools": []}),
             ("extra-key-logit", "/v1/completions", {"prompt": "hi", "logit_bias": {}}),
             ("model-mismatch", "/v1/chat/completions", {"model": "other", "messages": [{"role": "user", "content": "hi"}]}),

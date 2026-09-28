@@ -5,19 +5,28 @@
 The three qualified native-kernel stages and their public validators, reports
 and launch guidance were checked together before publication:
 
-- Windows: 804 tests successful, with 46 dependency/platform skips.
+- Windows: 807 tests successful, with 46 dependency/platform skips.
 - Linux inference environment with the registered HTTP dependency overlay:
-  804 tests successful, with 10 Windows-only skips. An initial run without
+  807 tests successful, with 10 Windows-only skips. An initial run without
   that overlay could not import four HTTP test modules because FastAPI was
   unavailable; using the existing configured overlay resolved those errors.
   No packages were installed.
-- CLI help, native-checker help, syntax parsing of all four changed Python
-  files, diff whitespace and 115 local Markdown links passed.
+- CLI help, native-checker help, syntax parsing of all six changed Python
+  files, diff whitespace and 125 local Markdown links passed.
 - The public-file audit found no model weights, compiled binaries, private
   installation records, workstation paths or credential-pattern matches.
 - All 332 recorded native-build source fingerprints match both the working
   files and the staged Git contents. The registered binary's SHA-256 remains
   `0ad3db65fcda9a59629a81d3a93b85f2af7dd40013207ced7088b19a6b0c132a`.
+
+The integration also fixes Chat Completions clients that explicitly send
+`store: false`. JSON and SSE regressions pass; unsupported persistence values
+are rejected before the engine runs, and model/unknown-field validation stays
+strict. Installed OpenCode 2.0.18 received a streamed response using its actual
+`store: false` payload against an isolated CPU fake engine. Its auxiliary
+`reasoning_effort` request remains unsupported; the client's default fallback
+succeeded. This checks request/stream interoperability, not live model output.
+The running inference server was not restarted.
 
 The GPU correctness and model-performance evidence below applies to this
 unchanged native source. Publication did not rebuild the extension or repeat
