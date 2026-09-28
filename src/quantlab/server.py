@@ -107,6 +107,7 @@ _CHAT_KEYS = frozenset(
         "max_completion_tokens",
         "stream",
         "stream_options",
+        "store",
         "n",
         "temperature",
         "top_p",
@@ -899,6 +900,9 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
         try:
             body = _parse(raw)
             _reject_unknown(body, allowed)
+            # Chat clients may explicitly disable provider-side completion storage.
+            if body.get("store", False) is not False:
+                raise _Invalid("store must be false; completion storage is not supported")
             sampling = _check_sampling(body)
             model = _check_model(body, engine.model_name)
             max_tokens = _check_max_tokens(body, allow_alias=(kind == "chat"))

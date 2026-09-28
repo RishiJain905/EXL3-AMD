@@ -16,6 +16,9 @@ checks with registered permissions, hash verification and GPU ownership.
 See [GPU compatibility](../../docs/GPU-COMPATIBILITY.md) for commands and limits.
 
 `check_highbit_smallm.py` covers the retained MiMo mul1 K5/K6 dot extension.
+It also exercises every individual K5/K6 packed bit position and trellis wrap
+boundary against the CPU oracle. See the [native kernel report](../../docs/NATIVE-KERNEL-PERFORMANCE.md)
+for the aligned unpacker and projection-loop qualification.
 `check_packed_mid.py` checks every row count from 10 through 64 against an
 independent CPU reference, including output/scratch guards, non-default streams
 and external graph replay with changed inputs. Select these suites with
@@ -37,6 +40,20 @@ options with shuffled pages, output guards and changed-length graph replay.
 Run `--checks head-tiled attention-schedule` with the matching verified build.
 The [head/attention report](../../docs/HEAD-ATTENTION-PERFORMANCE.md) separates
 operator checks from full-model and MTP evidence.
+
+`check_gdn_recurrent.py` compares native GDN outputs and recurrent state with
+an independent float64 NumPy recurrence. It covers saved history, native rewind
+and suffix replay, grouped heads, generic/unsplit fallbacks, canaries,
+non-default streams, changed-input/slot graph replay, and BF16 truncation.
+`check_gdn_conv.py` independently checks native convolution outputs, complete
+state windows, width fallbacks, bias/activation variants, graph replay and
+native rewind followed by suffix replay. Run
+`--checks gdn-recurrent gdn-conv` through the supervised validator. See the
+[native kernel report](../../docs/NATIVE-KERNEL-PERFORMANCE.md) for qualification.
+The compact recurrent implementation lives in the vendored `gdn.cu` and is
+automatic for eligible multi-token ROCm calls. Single-token recurrence and
+convolution retain their previous kernels; the independent convolution checker
+is retained to catch regressions in future changes.
 
 `check_hgemm.py` exposes `run_checks(torch, extension)` for the optional FP32-output
 prefill GEMM. The caller must already hold the GPU lease and supply a verified,

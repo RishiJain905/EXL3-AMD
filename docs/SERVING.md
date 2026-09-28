@@ -63,6 +63,12 @@ private artifacts. Loopback restrictions do not authenticate other local users.
 
 Supported roles: system, developer, user, assistant and tool. Content is text by default. With `--mmproj on`, supported Qwen3.5 models also accept PNG/JPEG data-URL images in user messages; see [vision inputs and memory limits](VISION.md). Output limits are 1–8192 tokens subject to remaining context, image tokens, reasoning, and draft reserve. Chat also accepts `max_completion_tokens`. Stop strings, audio/video, strict schemas and extra parameters are rejected. Bodies are capped at 1 MiB with vision off or 12 MiB with vision on. Send the full conversation with each request.
 
+Chat requests may include `store: false`, as sent by some compatible clients.
+The server has no stored-completions API: `true`, `null` and non-boolean values
+are rejected before generation. This field does not change local run artifacts
+or the separate `--prefix-cache` setting. Legacy `/v1/completions` does not
+accept `store`.
+
 ## Reasoning
 
 Thinking models emit `<think>...</think>` before their answer. The server splits that block into `reasoning_content`, separate from `content`, for both SSE deltas and non-streaming messages; tool-enabled turns buffer both channels the same way. Tool-looking text inside reasoning is never parsed as a call. No reasoning is invented: without markers the response is plain content.

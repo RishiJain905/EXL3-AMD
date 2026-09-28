@@ -34,6 +34,12 @@ Read `README.md` and relevant documentation before changing behavior. Consult `d
 - Keep platform-specific behavior explicit at the Windows, WSL, Linux, and native backend boundaries.
 - Keep credentials, local installation records, model weights, compiled binaries, and private run artifacts out of source control. Use ignored `.runtime/`, local configuration, and `artifacts/` locations as documented.
 
+## Local model storage
+
+- Before moving, copying, deleting, or measuring local model data, read `.runtime/MODEL-STORAGE.md` when present. It records this checkout's external storage mappings and validation evidence; keep machine-specific paths in that ignored note.
+- Model/cache directories may be junctions or symlinks to another drive. Inspect their resolved targets first. Do not follow those links when calculating this checkout's physical disk usage or cleaning its local files.
+- Preserve working model aliases and keep source, kernels, compiled runtime files, and unrelated artifacts in place unless the user authorizes their relocation. An unavailable external drive is not evidence that the model should be downloaded or copied again.
+
 ## Validation
 
 Run focused tests for changed behavior. Use the unit suite when shared runtime behavior changes:

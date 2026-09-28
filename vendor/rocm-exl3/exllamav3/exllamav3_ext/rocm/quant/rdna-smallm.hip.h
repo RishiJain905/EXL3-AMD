@@ -44,6 +44,9 @@ void exl3_smallm_dot(const half* __restrict__ A, const uint16_t* __restrict__ B,
     float acc_a[M] = {};
     float acc_b[M] = {};
 
+    // Keep accumulation order while overlapping tiles for narrow high-bit rows.
+    // Low-bit formats and wider rows retain the lower register footprint.
+    #pragma clang loop unroll_count(M <= 3 && BITS >= 4 && BITS <= 6 ? 2 : 1)
     for (int tile_k = begin; tile_k < end; ++tile_k)
     {
         const uint32_t* packed = (const uint32_t*)

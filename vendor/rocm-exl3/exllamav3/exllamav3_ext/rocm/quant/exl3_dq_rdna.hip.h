@@ -230,6 +230,81 @@ __device__ __forceinline__ void dq8_aligned_1bit(const uint32_t* ptr, int t_offs
     frag1[1] = decode_3inst_2<cb>(w6, w7);
 }
 
+// Aligned eight-value unpackers for 5 and 6 bits. Every in-tree caller passes
+// idx = lane*8 (GEMV/small-M/paired-dot/prefill/reconstruct host audit,
+// September 2026), so the eight words span at most three trellis words with
+// lane-closed-form shifts. This replaces two generic dq4 calls (four
+// constant-modulo word indices, four loads, eight multi-instruction 64-bit
+// funnel shifts) with one modulo, three loads, and single-instruction
+// funnels plus chained extracts. Extraction order and decode inputs are
+// bit-exact against 2x dq4 for all 32 lanes (job-local dq8_check.py).
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_5bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    uint32_t q = ((uint32_t) t_offset >> 3) & 3u; // (lane & 3): shift/pair selector
+    int b0 = (t_offset + 257) * 5 - 16;
+    int i0 = (b0 >> 5) % 40;
+    int i1 = i0 + 1; if (i1 == 40) i1 = 0;
+    int i2 = i1 + 1; if (i2 == 40) i2 = 0;
+    uint32_t w_lo = ptr[i0], w_mid = ptr[i1], w_hi = ptr[i2];
+    // First four words always sit in (w_lo, w_mid); 3*5+16 = 31 bits fit one
+    // 32-bit funnel output, so one funnel plus chained extracts suffices.
+    uint32_t f0, f1, w0, w1, w2, w3, w4, w5, w6, w7;
+    FSHF_IMM(f0, w_mid, w_lo, (12u - (q << 3)) & 31u);
+    w3 = f0 & 0xffff;
+    BFE16_IMM(w2, f0, 5);
+    BFE16_IMM(w1, f0, 10);
+    BFE16_IMM(w0, f0, 15);
+    // Last four words sit in (w_mid, w_hi) for q < 2, else (w_lo, w_mid).
+    uint32_t lo1 = (q < 2) ? w_hi : w_mid;
+    uint32_t hi1 = (q < 2) ? w_mid : w_lo;
+    FSHF_IMM(f1, lo1, hi1, (24u - (q << 3)) & 31u);
+    w7 = f1 & 0xffff;
+    BFE16_IMM(w6, f1, 5);
+    BFE16_IMM(w5, f1, 10);
+    BFE16_IMM(w4, f1, 15);
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
+template <int cb>
+__device__ __forceinline__ void dq8_aligned_6bits(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
+{
+    uint32_t p = ((uint32_t) t_offset >> 3) & 1u; // lane parity: shift/pair selector
+    int b0 = (t_offset + 257) * 6 - 16;
+    int i0 = (b0 >> 5) % 48;
+    int i1 = i0 + 1; if (i1 == 48) i1 = 0;
+    int i2 = i1 + 1; if (i2 == 48) i2 = 0;
+    uint32_t w_lo = ptr[i0], w_mid = ptr[i1], w_hi = ptr[i2];
+    // 3*6+16 = 34 bits exceed one 32-bit funnel output, so each group needs
+    // two funnels (align-2 style). First group always sits in (w_lo, w_mid);
+    // on odd lanes its second pair (shifts 36/42) lies in w_lo alone past
+    // the funnel window and is extracted with direct shifts.
+    uint32_t f0, fb, fc, fd, w0, w1, w2, w3, w4, w5, w6, w7;
+    FSHF_IMM(f0, w_mid, w_lo, p ? 24u : 8u);
+    w3 = f0 & 0xffff;
+    BFE16_IMM(w2, f0, 6);
+    FSHF_IMM(fb, w_mid, w_lo, 20);
+    w1 = p ? ((w_lo >> 4) & 0xffff) : (fb & 0xffff);
+    w0 = p ? ((w_lo >> 10) & 0xffff) : (((fb >> 6) & 0xffff));
+    // Last group sits in (w_mid, w_hi) on even lanes, (w_lo, w_mid) on odd.
+    uint32_t lo1 = p ? w_mid : w_hi;
+    uint32_t hi1 = p ? w_lo : w_mid;
+    uint32_t s1 = p ? 0u : 16u;
+    FSHF_IMM(fc, lo1, hi1, s1);
+    FSHF_IMM(fd, lo1, hi1, s1 + 12);
+    w7 = fc & 0xffff;
+    BFE16_IMM(w6, fc, 6);
+    w5 = fd & 0xffff;
+    BFE16_IMM(w4, fd, 6);
+    frag0[0] = decode_3inst_2<cb>(w0, w1);
+    frag0[1] = decode_3inst_2<cb>(w2, w3);
+    frag1[0] = decode_3inst_2<cb>(w4, w5);
+    frag1[1] = decode_3inst_2<cb>(w6, w7);
+}
+
 
 template <int cb>
 __device__ __forceinline__ void dq8_aligned_4bits_bfe64(const uint32_t* ptr, int t_offset, FragB& frag0, FragB& frag1)
@@ -273,13 +348,13 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
     }
     else if constexpr (bits == 5)
     {
-        dq4<bits, cb>(ptr, idx, frag0);
-        dq4<bits, cb>(ptr, idx + 4, frag1);
+        // All callers pass idx = lane*8; see dq8_aligned_5bits note.
+        dq8_aligned_5bits<cb>(ptr, idx, frag0, frag1);
     }
     else if constexpr (bits == 6)
     {
-        dq4<bits, cb>(ptr, idx, frag0);
-        dq4<bits, cb>(ptr, idx + 4, frag1);
+        // All callers pass idx = lane*8; see dq8_aligned_6bits note.
+        dq8_aligned_6bits<cb>(ptr, idx, frag0, frag1);
     }
     else if constexpr (bits == 7)
     {

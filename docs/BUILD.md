@@ -69,6 +69,15 @@ fraction. Shared target/MTP heads reuse one view. If memory, shape or format
 checks fail, the original projection remains available. No model-file
 conversion or enabling flag is required. [Head policy and measurements](HEAD-ATTENTION-PERFORMANCE.md).
 
+The latest sources also include specialized K5/K6 unpacking, format-qualified
+projection-loop unrolling, staged packed prefill and compact multi-token GDN
+recurrence. They are selected automatically within their supported geometry;
+single-token GDN and unsupported shapes keep the previous implementation.
+Rebuild and register the resulting binary to receive these changes. Native
+binaries and benchmark artifacts are not source dependencies or release assets.
+See [native kernel qualification](NATIVE-KERNEL-PERFORMANCE.md) for the measured
+9B/27B gains, rejected experiments and hardware limits.
+
 ```powershell
 python scripts/register_runtime.py configs/local.toml
 python run.py --help

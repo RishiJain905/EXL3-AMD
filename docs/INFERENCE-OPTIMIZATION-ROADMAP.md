@@ -13,6 +13,29 @@ additional graph caching was not promoted. Items 5–6 are now covered by the
 automatic selection for validated shapes. Persistent scheduling remains
 outside this follow-up.
 
+The subsequent [residual fusion and larger MTP graph investigation](FUSION-DECODE-PERFORMANCE.md)
+refreshes profiling on the optimized 9B and 27B before testing the remaining
+fusion, graph-region and token-readback candidates.
+That investigation is complete: residual/readback changes did not establish
+a useful repeatable gain, and a wider graph's 0.41–0.79% warmed 9B decode gain
+did not produce a consistent latency win once capture was included. No new
+runtime path was promoted. Cache-write fusion was deferred because measured
+27B quantized cache updates were under 1% of draft/verify intervals. Better
+GPU kernel timing and counters remain the prerequisite for choosing the next
+projection or persistent-scheduling change.
+
+The follow-up [native kernel source audit](NATIVE-KERNEL-NEXT-STEPS.md) identifies
+remaining work before a megakernel: packed projection/dequantization inner
+loops, pipelined packed prefill and shape-specific dense WMMA, then the GDN
+recurrent core. The [implementation and qualification report](NATIVE-KERNEL-PERFORMANCE.md)
+records the completed sequential follow-up: format-qualified projection
+changes, staged packed prefill and compact multi-token GDN recurrence are now
+primary. The GDN stage qualified modest MTP decode gains on both models;
+single-token replacement, cross-token state retention and convolution changes
+were rejected after model regressions. All three native-kernel stages are
+complete. The historical ranking below is not a list of unfinished
+implementations; persistent scheduling and a megakernel remain unimplemented.
+
 ## Recommendation
 
 Build a set of EXL3- and gfx1101-specific projection/fusion kernels, with

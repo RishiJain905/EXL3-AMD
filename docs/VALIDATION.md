@@ -1,5 +1,136 @@
 # Release validation
 
+## Native kernel integration into main: 2026-09-27
+
+The three qualified native-kernel stages and their public validators, reports
+and launch guidance were checked together before publication:
+
+- Windows: 807 tests successful, with 46 dependency/platform skips.
+- Linux inference environment with the registered HTTP dependency overlay:
+  807 tests successful, with 10 Windows-only skips. An initial run without
+  that overlay could not import four HTTP test modules because FastAPI was
+  unavailable; using the existing configured overlay resolved those errors.
+  No packages were installed.
+- CLI help, native-checker help, syntax parsing of all six changed Python
+  files, diff whitespace and 125 local Markdown links passed.
+- The public-file audit found no model weights, compiled binaries, private
+  installation records, workstation paths or credential-pattern matches.
+- All 332 recorded native-build source fingerprints match both the working
+  files and the staged Git contents. The registered binary's SHA-256 remains
+  `0ad3db65fcda9a59629a81d3a93b85f2af7dd40013207ced7088b19a6b0c132a`.
+
+The integration also fixes Chat Completions clients that explicitly send
+`store: false`. JSON and SSE regressions pass; unsupported persistence values
+are rejected before the engine runs, and model/unknown-field validation stays
+strict. Installed OpenCode 2.0.18 received a streamed response using its actual
+`store: false` payload against an isolated CPU fake engine. Its auxiliary
+`reasoning_effort` request remains unsupported; the client's default fallback
+succeeded. This checks request/stream interoperability, not live model output.
+The running inference server was not restarted.
+
+The GPU correctness and model-performance evidence below applies to this
+unchanged native source. Publication did not rebuild the extension or repeat
+those GPU benchmarks. Other installations must build and register a compatible
+extension to use the new kernels; pulling source does not replace a registered
+binary. Raw integration evidence stays in ignored
+`artifacts/main-native-integration-20260927/`.
+
+## Native kernel follow-up: 2026-09-27
+
+Stage one is qualified and primary on the local RX 7800 XT / gfx1101 runtime:
+specialized K5/K6 unpackers and conservative format-qualified narrow-row loop
+unrolling. Both the initial and refined binaries passed 2,013 native checks.
+The Windows unit suite completed 804 tests with 46 dependency/platform skips.
+The highbit validator adds an independent packed-bit boundary regression.
+
+The refined build preserved all 13,824 measured output tokens and exact MTP
+draft windows across bracketed 9B and 27B comparisons. MiMo decode improved
+4.8–8.8% against the faster control; the 27B result stayed within control
+variation and is not a claimed speedup. The lower-bit loop regression from
+the initial candidate was removed before promotion. The stage-one binary
+had SHA-256 `8e9120b06a67d095b59851f066b3094a7409eea40c0c07678aec34ab9283cab9`.
+
+Stage two is also qualified and primary: next-tile register staging in packed
+prefill, selected automatically by format and geometry. The slower dense-tile
+experiment was reverted. The refined and final builds each passed 288 native
+GPU checks; all 216 real-weight operator cases per model were byte-identical
+across the candidate and both controls. All eight 9B and seven original 27B
+complete-model cases matched inputs, tokens and MTP windows exactly: 135
+measured continuations / 17,280 tokens.
+
+The original 27B 256-token case diverged between two unchanged-baseline
+processes; the candidate matched the first control. It is excluded from speed
+claims. A separate baseline/candidate/baseline diagnostic matched all nine
+continuations / 1,152 tokens and draft windows. The original discrepancy's
+cause is unresolved and remains a reproducibility limitation.
+
+Short-prompt prefill improved 9.4–11.5% on MiMo and 10.0–12.1% on Qwenseek
+against the faster control. Long-prompt prefill was largely unchanged; this
+is not a new decode-speed claim. Small decode and total-time regressions in
+individual cases are retained in the detailed report. Final line-ending cleanup
+preserved GPU instructions/constants and host instructions/relocations exactly;
+compiler-generated internal identifiers changed. The stage-two source-matched
+primary included both stages and had SHA-256
+`b286d3fbe4752425868a7c363893e19777e90d40d7560236fe913a065444e6c2`.
+CLI help and diff whitespace checks passed.
+
+Stage three is also qualified and primary: compact 128-thread GDN recurrence
+for ROCm, batch one, 128-by-128 heads, at most 64 value heads and more than one
+token. Its 75 recurrent and 60 convolution checks passed against independent
+CPU references, including state/history, rewind, graph replay and rounding.
+The final 9B/27B comparisons preserved all 108 measured continuations / 13,824
+tokens and exact MTP draft windows. This total includes a reused preceding 27B
+control, followed by a new candidate and a fresh control.
+
+Qualifying MTP decode cases improved 0.86–1.32% on MiMo and 2.68–2.89% on
+Qwenseek against the faster controls. Other cases were effectively unchanged
+or within control variation; 27B 16K does not establish a gain. Small total-time
+regressions and all case results are retained in the report. This stage does
+not claim a general prefill speedup. Broader single-token replacement,
+cross-token state retention and width-four convolution were rejected after
+model regressions despite favorable isolated timings.
+
+The current source-matched primary includes all three stages and has SHA-256
+`0ad3db65fcda9a59629a81d3a93b85f2af7dd40013207ced7088b19a6b0c132a`.
+All 14 preserved GDN kernel instruction bodies match the previous primary;
+none of the 1,574 inspected selected specializations spills to private memory.
+A fresh check through the promoted default registration passed all 75 recurrent
+tests. Four focused validator CPU tests, CLI/checker help and diff whitespace
+checks also passed. The full 804-test suite was not repeated for stage three.
+See the [native kernel report](NATIVE-KERNEL-PERFORMANCE.md) for exact shapes,
+model settings, measurements and limits. These results do not establish
+other-GPU compatibility or hardware bandwidth saturation.
+
+## Residual fusion and larger MTP graphs: 2026-09-26
+
+Fresh profiles on the optimized MiMo 9B BF16-MTP/F16-cache and Qwenseek 27B
+quantized-MTP/Q6-cache configurations preceded the next fusion and dispatch
+experiments. Both ran on RX 7800 XT / gfx1101 using the existing verified
+head/attention ABI-3 binary. No native rebuild was needed.
+
+- The native residual/RMSNorm qualification passed 324 bit-exact comparisons.
+  FP32 normalized output and FP16-residual/FP32-update combinations remain
+  outside the new fusion's qualified envelope.
+- Six completed comparison suites preserved all 28,672 output tokens across
+  224 measured continuations, including exact MTP draft windows. Warmups and
+  early trials that failed to activate the candidates are excluded.
+- Residual fusion and batched readback did not establish useful repeatable
+  gains. The wider graph improved warmed 9B decode by 0.41–0.79%, but fresh
+  captures added first-token latency without a consistent total-request win.
+  The 27B graph results were neutral or slower. No candidate was promoted.
+- The final focused Linux suite passed 36 tests. After archiving and removing
+  the experimental hooks, the primary runtime passed 804 tests on Windows
+  (46 dependency/platform skips) and 804 on Linux (10 Windows-only skips).
+  CLI help and diff whitespace checks passed.
+
+The runtime source and registered binary remain unchanged by this round;
+the retained repository changes are documentation. GPU profiling returned
+inclusive event intervals but no usable kernel self-time or bandwidth
+counters. These results do not establish memory-bandwidth saturation, broad
+model compatibility, or a benefit from a persistent scheduler. Full tables,
+capture costs, numerical limits and private evidence locations are in the
+[investigation report](FUSION-DECODE-PERFORMANCE.md).
+
 ## Consolidated runtime integration: 2026-09-26
 
 The pending packed-kernel/cache changes and the complete MiMo branch chain
