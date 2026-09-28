@@ -388,7 +388,7 @@ class Engine:
         _say(f"shutdown=1 completed={snapshot['completed']} cancelled={snapshot['cancelled']} "
              f"failed={snapshot['failed']}")
 
-    def prepare(self, *, messages=None, prompt=None, max_tokens=256,
+    def prepare(self, *, messages=None, prompt=None, max_tokens=None,
                 tools=None, tool_choice=None, parallel_tool_calls=True,
                 sampling=None, template_kwargs=None):
         from quantlab.methods.exl3.vision import close_images
@@ -454,7 +454,12 @@ class Engine:
         ids = self.tokenizer.encode(counted, add_bos=False, add_eos=False, encode_special_tokens=True)
         if ids.numel() < 1:
             raise ValueError('Prompt must encode at least one token')
-        if ids.numel() + max_tokens + self.depth + 8 > self.context:
+        available = self.context - ids.numel() - self.depth - 8
+        if max_tokens is None:
+            max_tokens = available
+        elif type(max_tokens) is not int or max_tokens < 1:
+            raise ValueError('max_tokens must be a positive integer or None')
+        if available < 1 or max_tokens > available:
             if images:
                 from quantlab.methods.exl3.vision import close_images
                 close_images(images)
@@ -833,7 +838,8 @@ def parser():
     p.add_argument('--host', choices=('127.0.0.1',), default='127.0.0.1')
     p.add_argument('--port', type=int, default=8000)
     p.add_argument('--alias')
-    p.add_argument('--request-timeout', type=int, default=120)
+    p.add_argument('--request-timeout', type=int, default=0,
+                   help='Optional per-request seconds including queue wait; 0 disables (default)')
     p.add_argument('--reasoning', choices=('on', 'off', 'auto'), default='auto',
                    help='Thinking templates: force on/off or respect the template default')
     p.add_argument('--reasoning-format', choices=('auto', 'deepseek', 'none'), default='auto',
@@ -963,8 +969,10 @@ def main():
             p.error('--chat-template-file exceeds 1 MiB')
     if args.context < 1024 or args.context % 256:
         p.error('Context must be a multiple of 256 and at least 1024')
-    if not 1 <= args.port <= 65535 or not 1 <= args.request_timeout <= 900:
-        p.error('Invalid port or request timeout')
+    if not 1 <= args.port <= 65535:
+        p.error('Port must be in [1,65535]')
+    if args.request_timeout < 0:
+        p.error('Request timeout must be non-negative; 0 disables it')
     candidate, output = args.candidate.resolve(), args.output.resolve()
     if candidate == output or candidate in output.parents or output in candidate.parents:
         p.error('Output and model must be separate nonnested paths')

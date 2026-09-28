@@ -78,6 +78,72 @@ class RuntimeControlsTests(unittest.TestCase):
             with self.subTest(params=params), self.assertRaisesRegex(ValueError, 'batch-greedy'):
                 engine.prepare(prompt='hello', sampling=params)
 
+    def test_output_budget_defaults_to_remaining_context(self):
+        for context in (4096, 131072, 262144):
+            for depth in (0, 2, 4):
+                for prompt_tokens in (4, context - depth - 9):
+                    with self.subTest(context=context, depth=depth, prompt_tokens=prompt_tokens):
+                        engine = self.make_engine()
+                        engine.context, engine.depth = context, depth
+                        engine.tokenizer.encode = lambda *a, **kw: Tokens([1] * prompt_tokens)
+                        for request in ({'prompt': 'hello'}, {'messages': [{'role': 'user', 'content': 'hello'}]}):
+                            prepared = engine.prepare(**request)
+                            self.assertEqual(prepared['max_tokens'], context - prompt_tokens - depth - 8)
+
+    def test_explicit_output_budget_has_no_8192_ceiling(self):
+        engine = self.make_engine()
+        engine.context = 131072
+        engine.depth = 2
+        for limit in (1, 256, 8193, 16384, 131058):
+            with self.subTest(limit=limit):
+                self.assertEqual(engine.prepare(prompt='hello', max_tokens=limit)['max_tokens'], limit)
+        with self.assertRaisesRegex(ValueError, 'context'):
+            engine.prepare(prompt='hello', max_tokens=131059)
+
+    def test_full_context_rejected_before_generation(self):
+        engine = self.make_engine()
+        engine.depth = 2
+        for prompt_tokens in (4086, 4096):
+            with self.subTest(prompt_tokens=prompt_tokens):
+                engine.tokenizer.encode = lambda *a, **kw: Tokens([1] * prompt_tokens)
+                with self.assertRaisesRegex(ValueError, 'context'):
+                    engine.prepare(prompt='hello')
+
+    def test_invalid_explicit_output_budget_rejected(self):
+        engine = self.make_engine()
+        for limit in (True, 0, -1, 1.5, '256'):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError, 'max_tokens'):
+                engine.prepare(prompt='hello', max_tokens=limit)
+
+    def test_default_budget_generates_beyond_8192_and_stops_at_eos(self):
+        engine = self.make_engine()
+        engine.context = 16384
+        _, jobs, clock = PrefixCacheTests().backend(engine, [{}], [{'fragments': ['x'] * 9000}])
+        prepared = engine.prepare(prompt='hello')
+        cache = SimpleNamespace(attention_backends=lambda _: {}, attention_profile_status=lambda: {})
+
+        async def consume():
+            items = []
+            gen = engine.generate(prepared)
+            try:
+                async for item in gen:
+                    items.append(item)
+            finally:
+                await gen.aclose()
+            return items
+
+        with patch.object(serving, 'time', SimpleNamespace(monotonic=lambda: clock[0])), \
+             patch.object(serving, '_say', lambda message: None), \
+             patch.object(serving, '_cache_precision', lambda: cache):
+            items = asyncio.run(consume())
+        self.assertEqual(jobs[0].kwargs['max_new_tokens'], 16373)
+        self.assertEqual(items[-1]['usage']['completion_tokens'], 9000)
+        self.assertEqual(items[-1]['finish_reason'], 'stop')
+        self.assertEqual(len(''.join(item['text'] for item in items)), 9000)
+        self.assertEqual(engine.completed, 1)
+        self.assertEqual(engine.failed, 0)
+        self.assertFalse(engine.active)
+
     def run_generation(self, fragments, *, policy=None, prefix_open=False, split=True):
         engine = self.make_engine()
         clock = [100.0]

@@ -11,12 +11,12 @@ Tool support is automatic for a recognized chat template; no extra launch flag i
 Select a local model directory; the installed backend is selected automatically:
 
 ```powershell
-python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --alias exl3 --port 8000 --request-timeout 900
+python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 -c 4096 --alias exl3 --port 8000
 ```
 
-Normal launches need no `--config`. First build and register a compatible backend using [BUILD.md](BUILD.md). Wait for `/health` before connecting a harness. The server has no overall lifetime timeout; `--request-timeout 900` applies to each request separately.
+Normal launches need no `--config`. First build and register a compatible backend using [BUILD.md](BUILD.md). Wait for `/health` before connecting a harness. The server has no overall lifetime timeout or default request deadline. `--request-timeout SECONDS` is optional; `0` disables it.
 
-Cache and MTP flags also apply to tools when supported by the model. Keep client context and output budgets within the server allocation, including tool definitions and draft reserve. [Cache options and limitations](KV-CACHE.md).
+Cache and MTP flags also apply to tools when supported by the model. Output uses the remaining context unless the client explicitly sends a positive `max_tokens` or `max_completion_tokens`. Omitting the field or sending `null` adds no output cap. Keep explicit client context and output budgets within the server allocation, including tool definitions and draft reserve. [Cache options and limitations](KV-CACHE.md).
 
 Configure a compatible client with these values:
 
@@ -44,8 +44,7 @@ OpenCode's provider model entry must advertise `tool_call: true`. A minimal exam
       "name": "EXL3 AMD (local)",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "local",
-        "timeout": 900000
+        "apiKey": "local"
       },
       "models": {
         "exl3": {

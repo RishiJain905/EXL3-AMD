@@ -36,7 +36,6 @@ python run.py serve `
   --mmproj off `
   --reasoning auto `
   --temperature 0 `
-  --request-timeout 900 `
   --alias qwenseek-27b `
   --port 8000
 ```
@@ -62,7 +61,6 @@ python run.py serve `
   --mmproj off `
   --reasoning auto `
   --temperature 0 `
-  --request-timeout 900 `
   --alias mimo-9b `
   --port 8000
 ```
@@ -80,10 +78,12 @@ reserve. The latest kernel qualification used capacity 16,896 to accommodate
 an occupied 16K prompt and its continuation. Choose context capacity for the
 actual workload; a larger capacity is not itself a speed optimization.
 
-The 900-second request timeout accommodates longer requests and adds no speed
-improvement. Serving has no overall lifetime timeout. Generation length is
-specified by the API request's `max_tokens` or `max_completion_tokens`, not by
-adding `-n` to a `serve` command. See [SERVING.md](SERVING.md).
+Serving has no default request deadline or overall lifetime timeout. Generation
+uses the remaining context unless the API request explicitly supplies
+`max_tokens` or `max_completion_tokens`; omit them or send `null` for no client
+output cap. `-n` applies to generate mode. Remove an old `--request-timeout 900`
+argument or use `--request-timeout 0` to disable that explicit deadline.
+See [SERVING.md](SERVING.md).
 
 ### Jinja and GPU memory allowance
 
@@ -149,7 +149,6 @@ python run.py serve `
   --smallm-kernel dot --prefill-gemm auto --attention-profile auto `
   --prefix-cache off --mmproj off `
   --reasoning auto --temperature 0 `
-  --request-timeout 900 `
   --alias Mimo9B-131k --port 8093
 ```
 
@@ -165,7 +164,6 @@ python run.py serve `
   --smallm-kernel dot --prefill-gemm auto --attention-profile auto `
   --prefix-cache off --mmproj off `
   --reasoning auto --temperature 0 `
-  --request-timeout 900 `
   --alias Mimo9B-256k --port 8094
 ```
 
@@ -239,7 +237,7 @@ the draft-step graph and reconstructed MTP projection caching.
 | `--mmproj` | `off`, `on`; enables compatible bundled vision support with its additional memory requirements. See [VISION.md](VISION.md). |
 | `--jinja` | Accepted, but templating already uses Jinja. |
 | `--chat-template-file` | Overrides the model's template with a local file. |
-| `--request-timeout` | `1`-`900` seconds per request, including queue time. |
+| `--request-timeout` | `0` disables (default); any positive integer sets seconds per request, including queue time. |
 | `--alias`, `--port` | API model name and listening port. |
 
 Requests can override the supported sampling and reasoning defaults; keep

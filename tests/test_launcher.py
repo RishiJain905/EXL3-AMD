@@ -555,6 +555,13 @@ class CachePrecisionForwardingTests(unittest.TestCase):
         argv = self._run_and_capture_argv("speed", [])
         self.assertNotIn("--prefix-cache", argv)
 
+    def test_serve_timeout_is_disabled_by_default_and_explicit_has_no_ceiling(self):
+        for extra, expected in (([], '0'), (['--request-timeout', '0'], '0'),
+                                (['--request-timeout', '3600'], '3600')):
+            with self.subTest(extra=extra):
+                argv = self._run_and_capture_argv('serve', extra)
+                self.assertEqual(argv[argv.index('--request-timeout') + 1], expected)
+
 
     def test_prefill_defaults_preserve_benchmark_protocol(self):
         for mode, extra, expected in (("serve", [], "1024"), ("speed", [], "256"),

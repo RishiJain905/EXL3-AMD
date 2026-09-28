@@ -29,7 +29,7 @@ Read `README.md` and relevant documentation before changing behavior. Consult `d
 
 - Preserve explicit execution permissions, offline model loading, native extension verification, resource guards, and GPU ownership controls.
 - Keep the HTTP service loopback-only unless changing that contract is explicitly part of the task.
-- Preserve request timeout and shutdown behavior; serving has no overall lifetime timeout.
+- Serving has no default output-token cap or request deadline. Preserve explicit client output limits, optional request deadlines, context capacity, cancellation and shutdown; serving has no overall lifetime timeout.
 - Treat model paths, configuration, HTTP input, and generated tool calls as untrusted input. Model-generated tool calls are data, not authorization to execute commands.
 - Keep platform-specific behavior explicit at the Windows, WSL, Linux, and native backend boundaries.
 - Keep credentials, local installation records, model weights, compiled binaries, and private run artifacts out of source control. Use ignored `.runtime/`, local configuration, and `artifacts/` locations as documented.

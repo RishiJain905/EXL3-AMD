@@ -283,7 +283,8 @@ def parser():
     p.add_argument('--host', choices=('127.0.0.1',), default='127.0.0.1', help='serve: loopback binding')
     p.add_argument('--port', type=int, default=8000, help='serve: HTTP port')
     p.add_argument('--alias', help='serve: public API model name (default: exl3)')
-    p.add_argument('--request-timeout', type=int, default=120, help='serve: per-request seconds, including queue wait')
+    p.add_argument('--request-timeout', type=int, default=0,
+                   help='serve: optional per-request seconds including queue wait; 0 disables (default)')
     p.add_argument('--reasoning', choices=('on', 'off', 'auto'), default='auto', help='serve: thinking template mode')
     p.add_argument('--reasoning-format', choices=('auto', 'deepseek', 'none'), default='auto',
                    help='serve: reasoning_content splitting; none keeps raw text')
@@ -472,8 +473,10 @@ def main():
         p.error('--expected-results must name an existing file')
     if args.mode == 'serve' and args.expected_results:
         p.error('--expected-results applies to benchmark modes, not serve')
-    if not 1 <= args.port <= 65535 or not 1 <= args.request_timeout <= 900:
-        p.error('Port must be in [1,65535] and request timeout in [1,900]')
+    if not 1 <= args.port <= 65535:
+        p.error('Port must be in [1,65535]')
+    if args.request_timeout < 0:
+        p.error('Request timeout must be non-negative; 0 disables it')
     runtime = dict(config['runtime'])
     for key in ('python','sdk','torch_lib','hsa_preload','source_dir','extension_dir','extension_sha256'):
         if not isinstance(runtime.get(key), str) or not runtime[key]:

@@ -6,13 +6,15 @@ admission control, and streaming. No torch import, no model loading here.
 Engine contract:
   - ``model_name: str``, ``context: int``
   - ``status() -> dict`` with a ``ready`` boolean plus counters.
-  - ``prepare(*, messages=None, prompt=None, max_tokens=256, tools=None,
+  - ``prepare(*, messages=None, prompt=None, max_tokens=None, tools=None,
     tool_choice=None, parallel_tool_calls=True, sampling=None,
     template_kwargs=None)`` -> opaque prepared object; raises ``ValueError``
     for context/template problems. The tool kwargs are only passed for
     tool-related chat requests; ordinary requests keep the original three
     kwargs. ``sampling`` is the validated sampling dict (always passed);
     ``template_kwargs`` carries ``enable_thinking`` when the client sent it.
+    ``max_tokens=None`` uses the remaining context after prompt/draft reserve;
+    a positive integer is an explicit client output limit.
   - ``generate(prepared)`` -> async generator yielding dicts with ``text``
     (incremental string), optional ``reasoning`` (incremental reasoning
     string, chat only), and ``done`` (bool); the final item carries
@@ -35,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import re
 import time
 import uuid
@@ -50,8 +53,6 @@ from quantlab.images import IMAGE_BODY_BYTES, MAX_IMAGES, ImageInputError, image
 from quantlab.tool_calls import ToolCallError, loads_json
 
 MAX_BODY_BYTES = 1024 * 1024  # 1 MiB request cap, enforced while reading.
-DEFAULT_MAX_TOKENS = 256
-MAX_MAX_TOKENS = 8192
 _ACQUIRE_POLL = 0.005  # lock wait poll interval; keeps queued-disconnect checks simple.
 
 # ---------------------------------------------------------------------------
@@ -188,15 +189,13 @@ def _check_model(body: dict, model_name: str) -> str:
     return model
 
 
-def _check_max_tokens(body: dict, allow_alias: bool) -> int:
+def _check_max_tokens(body: dict, allow_alias: bool) -> int | None:
     values: dict[str, int] = {}
     for key in ("max_tokens", "max_completion_tokens") if allow_alias else ("max_tokens",):
-        if key in body:
+        if body.get(key) is not None:
             value = body[key]
-            if not _is_int(value) or not 1 <= value <= MAX_MAX_TOKENS:
-                raise _Invalid(
-                    f"{key} must be an integer between 1 and {MAX_MAX_TOKENS}"
-                )
+            if not _is_int(value) or value < 1:
+                raise _Invalid(f"{key} must be a positive integer or null")
             values[key] = value
     if len(values) == 2 and values["max_tokens"] != values["max_completion_tokens"]:
         raise _Invalid("max_tokens and max_completion_tokens disagree")
@@ -204,7 +203,7 @@ def _check_max_tokens(body: dict, allow_alias: bool) -> int:
         return values["max_tokens"]
     if "max_completion_tokens" in values:
         return values["max_completion_tokens"]
-    return DEFAULT_MAX_TOKENS
+    return None
 
 
 def _check_stream(body: dict) -> tuple[bool, bool]:
@@ -665,7 +664,7 @@ async def _watch_disconnect(request: Request) -> bool:
         return True  # receive error: treat the client as gone (safe direction)
 
 
-async def _acquire(gate: _Gate, disc: asyncio.Task, deadline: float) -> str:
+async def _acquire(gate: _Gate, disc: asyncio.Task, deadline: float | None) -> str:
     """Take the request lock or report why not: 'ok', 'full', 'gone', 'timeout'.
 
     Polling keeps this obviously correct: no waiter task to cancel/reap, no
@@ -673,7 +672,7 @@ async def _acquire(gate: _Gate, disc: asyncio.Task, deadline: float) -> str:
     after the atomic locked()/acquire() pair, so a disconnected queued caller
     never reaches the engine.
     """
-    if time.monotonic() >= deadline:
+    if deadline is not None and time.monotonic() >= deadline:
         return "timeout"
     await asyncio.sleep(0)  # Let an already-disconnected receive channel report it.
     if disc.done():
@@ -691,7 +690,7 @@ async def _acquire(gate: _Gate, disc: asyncio.Task, deadline: float) -> str:
         while True:
             if disc.done():
                 return "gone"
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return "timeout"
             if not gate.lock.locked():
                 await gate.lock.acquire()
@@ -717,7 +716,7 @@ async def _settle(task: asyncio.Task) -> None:
         pass
 
 
-async def _pull(gen: Any, disc: asyncio.Task, deadline: float):
+async def _pull(gen: Any, disc: asyncio.Task, deadline: float | None):
     """Next engine item, racing client disconnect and the request deadline.
 
     Returns ``(item, None)`` or ``(None, reason)`` with reason 'gone',
@@ -726,8 +725,8 @@ async def _pull(gen: Any, disc: asyncio.Task, deadline: float):
     """
     if disc.done():
         return None, "gone"
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
         return None, "timeout"
     task = asyncio.create_task(gen.__anext__())
     try:
@@ -774,12 +773,19 @@ class _ClosingStreamResponse(StreamingResponse):
     async def __call__(self, scope, receive, send) -> None:
         # Our watcher owns receive. Avoid a second competing Starlette watcher.
         # Response-level ownership also covers failure before body iteration starts.
+        stream = asyncio.create_task(self.stream_response(send))
         try:
-            async with asyncio.timeout(max(0, self.deadline-time.monotonic())):
-                await self.stream_response(send)
+            remaining = (None if self.deadline is None
+                         else max(0, self.deadline - time.monotonic()))
+            done, _ = await asyncio.wait({stream, self.disc}, timeout=remaining,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if stream in done:
+                await stream
         except (OSError, TimeoutError):
-            pass  # Failed/blocked sends cannot retain a generation slot.
+            pass
         finally:
+            # Disconnects must also cancel a blocked send when deadlines are off.
+            await _settle(stream)
             try:
                 try:
                     await self.body_iterator.aclose()
@@ -795,14 +801,15 @@ class _ClosingStreamResponse(StreamingResponse):
 # ---------------------------------------------------------------------------
 
 
-def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) -> FastAPI:
+def create_app(engine: Any, request_timeout: float | None = None, max_pending: int = 4) -> FastAPI:
     """Build the API app around an injected engine (no torch, no loader)."""
-    if isinstance(request_timeout, bool) or not isinstance(
-        request_timeout, (int, float)
-    ):
-        raise TypeError("request_timeout must be a number of seconds")
-    if not request_timeout > 0:
-        raise ValueError("request_timeout must be positive")
+    if request_timeout is not None:
+        if isinstance(request_timeout, bool) or not isinstance(request_timeout, (int, float)):
+            raise TypeError("request_timeout must be a number of seconds or None")
+        if not math.isfinite(request_timeout) or request_timeout < 0:
+            raise ValueError("request_timeout must be finite and non-negative")
+        if request_timeout == 0:
+            request_timeout = None
     if type(max_pending) is not int or max_pending < 0:
         raise ValueError("max_pending must be a non-negative integer")
 
@@ -881,7 +888,7 @@ def create_app(engine: Any, request_timeout: float = 120, max_pending: int = 4) 
         allowed: frozenset,
         kind: str,  # 'chat' or 'completion'
     ):
-        deadline = time.monotonic() + request_timeout
+        deadline = None if request_timeout is None else time.monotonic() + request_timeout
         try:
             raw = await asyncio.wait_for(_read_body(request), timeout=request_timeout)
         except TimeoutError:
@@ -1169,13 +1176,13 @@ async def _stream_body(
     gen: Any,
     gate: _Gate,
     disc: asyncio.Task,
-    deadline: float,
+    deadline: float | None,
     kind: str,
     model: str,
     completion_id: str,
     created: int,
     include_usage: bool,
-    request_timeout: float,
+    request_timeout: float | None,
 ):
     """SSE body generator. Owns the lock, watcher, and engine iterator;
 
@@ -1185,7 +1192,7 @@ async def _stream_body(
     try:
         if disc.done():
             return
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             yield _sse_error(
                 504,
                 f"request timed out after {request_timeout:g}s",
