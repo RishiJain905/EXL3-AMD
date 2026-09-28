@@ -88,7 +88,7 @@ python run.py serve -m "MODEL_DIRECTORY" --cache-type q8 --spec-type draft-mtp -
 
 Omit MTP flags for models without MTP. Wait for `http://127.0.0.1:8000/health`, then use OpenAI Chat Completions with base URL `http://127.0.0.1:8000/v1`, model `exl3` and `n: 1`. Greedy decoding is the default; sampling, reasoning, and prefill-chunk controls are documented under [HTTP API](docs/SERVING.md).
 
-The server has no overall lifetime timeout. Explicit shutdown and resource/error safeguards remain active. `--request-timeout` applies to individual requests. Serving is loopback-only, with one active GPU request and four queued requests.
+The server has no overall lifetime timeout or default request deadline. Output can use the remaining context unless the client supplies a token limit; there is no fixed server output ceiling. `--request-timeout SECONDS` optionally sets a request deadline (`0` disables it, the default). Explicit shutdown and resource/error safeguards remain active. Serving is loopback-only, with one active GPU request and four queued requests.
 
 [HTTP API](docs/SERVING.md) · [Client-independent function tools](docs/TOOL-CALLING.md)
 

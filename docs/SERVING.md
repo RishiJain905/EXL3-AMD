@@ -45,7 +45,6 @@ Invoke-RestMethod http://127.0.0.1:8000/v1/models
 $body = @{
   model = 'exl3'
   messages = @(@{role='user'; content='Write Python binary search.'})
-  max_tokens = 1024
   temperature = 0
 } | ConvertTo-Json -Depth 5
 $response = Invoke-RestMethod http://127.0.0.1:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body
@@ -61,7 +60,17 @@ before GPU admission. Native API clients normally send no Origin. Unexpected
 engine exceptions return a fixed public error; diagnostic details remain in the
 private artifacts. Loopback restrictions do not authenticate other local users.
 
-Supported roles: system, developer, user, assistant and tool. Content is text by default. With `--mmproj on`, supported Qwen3.5 models also accept PNG/JPEG data-URL images in user messages; see [vision inputs and memory limits](VISION.md). Output limits are 1–8192 tokens subject to remaining context, image tokens, reasoning, and draft reserve. Chat also accepts `max_completion_tokens`. Stop strings, audio/video, strict schemas and extra parameters are rejected. Bodies are capped at 1 MiB with vision off or 12 MiB with vision on. Send the full conversation with each request.
+Supported roles: system, developer, user, assistant and tool. Content is text by default. With `--mmproj on`, supported Qwen3.5 models also accept PNG/JPEG data-URL images in user messages; see [vision inputs and memory limits](VISION.md). Stop strings, audio/video, strict schemas and extra parameters are rejected. Bodies are capped at 1 MiB with vision off or 12 MiB with vision on. Send the full conversation with each request.
+
+There is **no default output-token cap or fixed server output ceiling**. Omitting
+`max_tokens`, or sending `null`, lets generation use the remaining context after
+the rendered prompt, image tokens and draft reserve. Generation stops at the
+model's end-of-sequence token, context capacity, or cancellation. Chat also
+accepts `max_completion_tokens`; a positive integer in either field sets an
+explicit client limit. Two non-null limits must agree. An explicit limit that
+does not fit the remaining context is rejected before generation. Reasoning and
+visible output share the same context budget. Clients may impose their own
+limits or deadlines independently of these server defaults.
 
 Chat requests may include `store: false`, as sent by some compatible clients.
 The server has no stored-completions API: `true`, `null` and non-boolean values
@@ -136,7 +145,15 @@ is the useful comparison when evaluating prefix-reuse gains.
 
 ## Lifecycle
 
-There is **no overall server lifetime timeout**. Stop with Ctrl+C or create the `stop` file in the printed run artifact directory. Resource and error safeguards remain active. `--request-timeout` defaults to 120 seconds (range 1–900), including body upload, queueing and generation. This is separate from server lifetime. Non-server modes retain a bounded capture duration.
+There is **no overall server lifetime timeout or default request deadline**.
+Stop with Ctrl+C or create the `stop` file in the printed run artifact directory.
+`--request-timeout` defaults to `0` (disabled). A positive integer explicitly sets
+a deadline in seconds covering body upload, queueing, generation and streaming;
+there is no 900-second ceiling. Remove an old `--request-timeout 900` argument,
+or set it to `0`, to disable that explicitly requested deadline. Disconnects,
+cancellation, shutdown, and resource/error safeguards remain active even with
+deadlines disabled. Non-server measurement modes retain a bounded capture
+duration and their own generation settings.
 
 A confirmed clean shutdown after Ctrl+C or an explicit stop exits successfully.
 The private `monitor.json` records `stop_reason: "user_stop"` and retains the

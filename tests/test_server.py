@@ -2,7 +2,9 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from quantlab.server import MAX_BODY_BYTES, ToolCallError, create_app
 
@@ -42,7 +44,7 @@ class FakeEngine:
     def status(self):
         return {"ready": self.ready, "context": self.context}
 
-    def prepare(self, *, messages=None, prompt=None, max_tokens=256, **tool_kw):
+    def prepare(self, *, messages=None, prompt=None, max_tokens=None, **tool_kw):
         self.prepare_calls.append(
             {"messages": messages, "prompt": prompt, "max_tokens": max_tokens, **tool_kw}
         )
@@ -369,6 +371,27 @@ class ValidationTests(ServerTestBase):
         await run_app(app, make_scope(path), h)
         return status_of(h), json_of(h)
 
+    async def test_output_limit_is_optional_and_has_no_fixed_ceiling(self):
+        for path, prompt in (("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+                             ("/v1/completions", {"prompt": "hi"})):
+            cases = [({}, None), ({"max_tokens": None}, None), ({"max_tokens": 16384}, 16384)]
+            if "chat" in path:
+                cases += [({"max_completion_tokens": None}, None),
+                          ({"max_completion_tokens": 16384}, 16384),
+                          ({"max_tokens": None, "max_completion_tokens": 16384}, 16384),
+                          ({"max_tokens": 16384, "max_completion_tokens": None}, 16384)]
+            for limits, expected in cases:
+                for stream in (False, True):
+                    with self.subTest(path=path, limits=limits, stream=stream):
+                        eng = FakeEngine()
+                        eng.context = 32768
+                        app = create_app(eng)
+                        h = Harness(json.dumps(dict(prompt, **limits, stream=stream)).encode())
+                        await run_app(app, make_scope(path), h)
+                        self.assertEqual(status_of(h), 200, body_bytes_of(h))
+                        self.assertEqual(eng.prepare_calls[0]["max_tokens"], expected)
+                        self.assertFalse(app.state.gate.lock.locked())
+
     async def test_store_false_chat_json_and_stream(self):
         for stream in (False, True):
             with self.subTest(stream=stream):
@@ -446,7 +469,8 @@ class ValidationTests(ServerTestBase):
             ("missing-prompt", "/v1/completions", {"max_tokens": 5}),
             ("prompt-nonstring", "/v1/completions", {"prompt": ["hi"]}),
             ("max-tokens-zero", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 0}),
-            ("max-tokens-huge", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8193}),
+            ("max-tokens-negative", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": -1}),
+            ("max-tokens-bool", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": True}),
             ("max-tokens-float", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1.5}),
             ("max-tokens-str", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": "16"}),
             ("alias-disagree", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5, "max_completion_tokens": 6}),
@@ -664,9 +688,13 @@ class AdmissionTests(ServerTestBase):
         )
         eng.hang_event = gate_event
         eng.hang_at = 0
-        app = create_app(eng, request_timeout=0.05, max_pending=4)
+        # Leave setup margin on WSL: this exercises an active decoder timeout,
+        # not a deadline that expires before the generator has ever started.
+        app = create_app(eng, request_timeout=1, max_pending=4)
         h = Harness(chat_body(stream=True))
-        await run_app(app, make_scope("/v1/chat/completions"), h, timeout=5)
+        task = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h, timeout=5))
+        self.assertTrue(await wait_until(lambda: eng.concurrent == 1, timeout=2))
+        await task
         self.assertEqual(status_of(h), 200)  # headers already sent
         payloads = sse_of(h)
         # Truncated: never a successful [DONE]; an in-band timeout error may
@@ -686,6 +714,116 @@ class AdmissionTests(ServerTestBase):
 # Disconnects
 # ---------------------------------------------------------------------------
 
+class NoDeadlineTests(ServerTestBase):
+    async def test_default_and_zero_survive_elapsed_request_time(self):
+        # Advance only the server's clock; asyncio and harness deadlines stay real.
+        for options in ({}, {"request_timeout": 0}, {"request_timeout": None}):
+            for stream in (False, True):
+                with self.subTest(options=options, stream=stream):
+                    clock = [100.0]
+
+                    class SlowUpload(Harness):
+                        async def receive(self):
+                            value = await super().receive()
+                            if value["type"] == "http.request":
+                                clock[0] += 1000
+                            return value
+
+                    class SlowEngine(FakeEngine):
+                        async def _gen(self):
+                            async for item in super()._gen():
+                                clock[0] += 1000
+                                yield item
+
+                    eng = SlowEngine()
+                    app = create_app(eng, **options)
+                    h = SlowUpload(chat_body(stream=stream))
+                    with patch("quantlab.server.time", SimpleNamespace(
+                            monotonic=lambda: clock[0], time=time.time)):
+                        await run_app(app, make_scope("/v1/chat/completions"), h)
+                    self.assertEqual(status_of(h), 200, body_bytes_of(h))
+                    if stream:
+                        self.assertEqual(sse_of(h)[-1], "[DONE]")
+                    else:
+                        self.assertEqual(json_of(h)["choices"][0]["message"]["content"], "Hello world")
+                    self.assertTrue(eng.closed.is_set())
+                    self.assertFalse(app.state.gate.lock.locked())
+
+    async def test_queued_request_survives_elapsed_time(self):
+        clock = [100.0]
+        eng = FakeEngine()
+        eng.hang_event = asyncio.Event()
+        eng.hang_at = 0
+        app = create_app(eng)
+        h1, h2 = Harness(chat_body()), Harness(chat_body())
+        with patch("quantlab.server.time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time)):
+            t1 = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h1))
+            self.assertTrue(await wait_until(eng.started.is_set))
+            t2 = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h2))
+            self.assertTrue(await wait_until(lambda: app.state.gate.waiting == 1))
+            clock[0] += 1000
+            eng.hang_event.set()
+            await asyncio.gather(t1, t2)
+        self.assertEqual(status_of(h1), 200, body_bytes_of(h1))
+        self.assertEqual(status_of(h2), 200, body_bytes_of(h2))
+        self.assertEqual(eng.max_concurrent, 1)
+        self.assertEqual(app.state.gate.waiting, 0)
+        self.assertFalse(app.state.gate.lock.locked())
+
+    async def test_disconnect_cancels_blocked_send_without_deadline(self):
+        for at_header in (True, False):
+            with self.subTest(at_header=at_header):
+                blocked = asyncio.Event()
+
+                class BlockedSend(Harness):
+                    async def send(self, message):
+                        if ((at_header and message["type"] == "http.response.start") or
+                                (not at_header and b"Hello" in message.get("body", b""))):
+                            blocked.set()
+                            await asyncio.Event().wait()
+                        await super().send(message)
+
+                eng = FakeEngine()
+                app = create_app(eng)
+                h = BlockedSend(chat_body(stream=True))
+                task = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h))
+                await asyncio.wait_for(blocked.wait(), 2)
+                h.disconnect()
+                await asyncio.wait_for(task, 2)
+                if not at_header:
+                    self.assertTrue(eng.closed.is_set())
+                self.assertNotIn("[DONE]", body_bytes_of(h).decode())
+                self.assertFalse(app.state.gate.lock.locked())
+                h2 = Harness(chat_body())
+                await run_app(app, make_scope("/v1/chat/completions"), h2)
+                self.assertEqual(status_of(h2), 200)
+
+    async def test_task_cancellation_without_deadline_releases_slot(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                eng = FakeEngine()
+                eng.hang_event = asyncio.Event()
+                eng.hang_at = 1
+                app = create_app(eng)
+                h = Harness(chat_body(stream=stream))
+                task = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h))
+                self.assertTrue(await wait_until(lambda: eng.concurrent == 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(eng.closed.is_set())
+                self.assertFalse(app.state.gate.lock.locked())
+
+    def test_invalid_timeouts_rejected_and_long_explicit_timeout_accepted(self):
+        for value in (-1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                create_app(FakeEngine(), request_timeout=value)
+        for value in (True, "0"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                create_app(FakeEngine(), request_timeout=value)
+        create_app(FakeEngine(), request_timeout=3600)
+
+
 class DisconnectTests(ServerTestBase):
     async def test_queued_disconnect_never_starts(self):
         gate_event = asyncio.Event()
@@ -695,7 +833,7 @@ class DisconnectTests(ServerTestBase):
         )
         eng.hang_event = gate_event
         eng.hang_at = 0
-        app = create_app(eng, request_timeout=5, max_pending=4)
+        app = create_app(eng, max_pending=4)
         h1 = Harness(chat_body())
         t1 = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h1, timeout=5))
         self.assertTrue(await wait_until(lambda: eng.started.is_set(), timeout=2))
@@ -719,7 +857,7 @@ class DisconnectTests(ServerTestBase):
         eng = FakeEngine(script=[{"text": "part", "done": False}])
         eng.hang_event = gate_event
         eng.hang_at = 1  # yield one token, then stall mid-generation
-        app = create_app(eng, request_timeout=5, max_pending=4)
+        app = create_app(eng, max_pending=4)
         h = Harness(chat_body())
         t = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h, timeout=5))
         self.assertTrue(await wait_until(lambda: eng.started.is_set(), timeout=2))
@@ -737,7 +875,7 @@ class DisconnectTests(ServerTestBase):
         eng = FakeEngine(script=[{"text": "part", "done": False}])
         eng.hang_event = gate_event
         eng.hang_at = 1
-        app = create_app(eng, request_timeout=5, max_pending=4)
+        app = create_app(eng, max_pending=4)
         h = Harness(chat_body(stream=True))
         t = asyncio.create_task(run_app(app, make_scope("/v1/chat/completions"), h, timeout=5))
         # Wait for headers + first SSE chunk, then drop the client.
