@@ -18,6 +18,8 @@ CHECKERS = {"smallm": "check_smallm", "hgemm": "check_hgemm",
             "packed-prefill": "check_packed_prefill", "mlp-pair": "check_mlp_pair",
             "head-tiled": "check_head_tiled",
             "attention-schedule": "check_attention_schedule",
+            "gdn-recurrent": "check_gdn_recurrent",
+            "gdn-conv": "check_gdn_conv",
             "kv-cache": "check_kv_cache", "asterkv": "check_asterkv"}
 
 

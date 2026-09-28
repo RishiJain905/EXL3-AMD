@@ -4,8 +4,12 @@
 // accumulators per wave). Each packed 16x16 weight tile is decoded once per
 // block into padded LDS and reused across 128 M rows, instead of decoding per
 // 16-row tile. M tails masked; K/N are host-gated to multiples of 128.
-// Borrows the proven dq_dispatch unswizzle from rdna-smallm-mid.hip.h and the
-// dense hgemm_wmma.hip accumulation scheme (fold FP32 partials every 256 K).
+// Pipelined following dense hgemm_wmma.hip: stage tile 0 once, then each K
+// slice prefetches next A globals plus decoded B fragments into registers,
+// computes the current tile, and publishes next via barrier/commit/barrier.
+// Serial fallback uses the same tile and arithmetic. All barriers are uniform.
+// Borrows dq_dispatch unswizzle
+// from rdna-smallm-mid.hip.h and folds FP32 partials every 256 K.
 // No full FP16 weight reconstruction, cooperative launch, atomics, global
 // software barriers, JIT allocation or autotuning.
 // Derived from ExLlamaV3 / the CarouselAether ROCm fork. MIT, Copyright (c)
@@ -22,7 +26,42 @@ __device__ __forceinline__ static half4 exl3_prefill_half4_zero()
     return half4(z2, z2);
 }
 
-template <int BITS, int CB, bool FP32>
+// Commits one decoded 16x16 weight tile from registers to LDS row-major at
+// stride SB. Shared by initial staging and the pipelined commit so the proven
+// shuffle/unswizzle mapping stays in one place. Caller guards !(lane & 4).
+__device__ __forceinline__ static void exl3_prefill_store_b16(half* dst, int lane, int SB,
+    half2 f00, half2 f01, half2 f10, half2 f11,
+    half2 n0l, half2 n1l, half2 n2l, half2 n3l)
+{
+    const int r0 = (lane % 4) * 2;
+    const int r1 = r0 + 1;
+    const int r2 = r0 + 8;
+    const int r3 = r0 + 9;
+    const int c0 = (lane / 8) * 2;
+    const int c1 = c0 + 8;
+
+    dst[r0 * SB + c0]     = __low2half (f00);
+    dst[r0 * SB + c0 + 1] = __low2half (n0l);
+    dst[r1 * SB + c0]     = __high2half(f00);
+    dst[r1 * SB + c0 + 1] = __high2half(n0l);
+
+    dst[r2 * SB + c0]     = __low2half (f01);
+    dst[r2 * SB + c0 + 1] = __low2half (n1l);
+    dst[r3 * SB + c0]     = __high2half(f01);
+    dst[r3 * SB + c0 + 1] = __high2half(n1l);
+
+    dst[r0 * SB + c1]     = __low2half (f10);
+    dst[r0 * SB + c1 + 1] = __low2half (n2l);
+    dst[r1 * SB + c1]     = __high2half(f10);
+    dst[r1 * SB + c1 + 1] = __high2half(n2l);
+
+    dst[r2 * SB + c1]     = __low2half (f11);
+    dst[r2 * SB + c1 + 1] = __low2half (n3l);
+    dst[r3 * SB + c1]     = __high2half(f11);
+    dst[r3 * SB + c1 + 1] = __high2half(n3l);
+}
+
+template <int BITS, int CB, bool FP32, bool PREFETCH>
 static __global__ __launch_bounds__(256)
 __attribute__((amdgpu_flat_work_group_size(256, 256)))
 void exl3_packed_prefill_wmma(const half* __restrict__ A, const uint16_t* __restrict__ B,
@@ -35,6 +74,13 @@ void exl3_packed_prefill_wmma(const half* __restrict__ A, const uint16_t* __rest
     constexpr int SA = TILE_K + 16;
     constexpr int SB = TILE_N + 8;
     constexpr int A4 = TILE_M * TILE_K / 4;
+    constexpr int NTHREADS = 256;
+    // Fixed per-thread A half4 slots for the register prefetch (1024/256=4).
+    // Divisibility keeps every thread's slots fixed and the unrolled loops
+    // indexed by constants, as in dense hgemm_wmma.hip.
+    constexpr int kLoadsA4 = A4 / NTHREADS;
+    static_assert(A4 % NTHREADS == 0,
+        "A half4 slots must split evenly for fixed prefetch registers");
 
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
@@ -61,79 +107,119 @@ void exl3_packed_prefill_wmma(const half* __restrict__ A, const uint16_t* __rest
     const int k_tiles = size_k / TILE_K;
     const int n_tiles = size_n / 16;
 
+    // Pipelined K loop: tile 0 is staged into LDS once, then each iteration
+    // prefetches the next tile's A globals plus decoded B fragments into
+    // registers, computes the current tile from LDS, and publishes next via
+    // barrier/commit/barrier. has_next is uniform (kt/k_tiles block-uniform),
+    // so the guarded barriers never diverge and no nonexistent tile is read.
     for (int kt = 0; kt < k_tiles; ++kt)
     {
         const int k0 = kt * TILE_K;
-
-        // Stage the dense A tile (half4-vectorized, M-tail zero-fill). K is a
-        // full tile by the host gate. LDS base is 32-byte aligned and
-        // (row*SA+col) is a multiple of 4 (SA % 4 == 0, col % 4 == 0).
-        for (int i = tid; i < A4; i += 256)
+        if (!PREFETCH || kt == 0)
         {
-            const int e = i * 4;
-            const int row = e / TILE_K;
-            const int col = e % TILE_K;
-            const int grow = m0 + row;
-            half4 v = exl3_prefill_half4_zero();
-            if (grow < size_m)
-                v = *(const half4*)(A + (size_t)grow * size_k + k0 + col);
-            *(half4*)(sh_a + (size_t)row * SA + col) = v;
+            // Stage the dense A tile (half4-vectorized, M-tail zero-fill). K is a
+            // full tile by the host gate. LDS base is 32-byte aligned and
+            // (row*SA+col) is a multiple of 4 (SA % 4 == 0, col % 4 == 0).
+            for (int i = tid; i < A4; i += NTHREADS)
+            {
+                const int e = i * 4;
+                const int row = e / TILE_K;
+                const int col = e % TILE_K;
+                const int grow = m0 + row;
+                half4 v = exl3_prefill_half4_zero();
+                if (grow < size_m)
+                    v = *(const half4*)(A + (size_t)grow * size_k + k0 + col);
+                *(half4*)(sh_a + (size_t)row * SA + col) = v;
+            }
+
+            // Decode the 2x4 weight tiles covering this K slice into sh_b. Wave w
+            // owns tile (ki = w>>2, ni = w&3); the proven shuffle/unswizzle from
+            // exl3_gemm_inner_rdna.hip.h writes it row-major at stride SB. All
+            // lanes call __shfl_down; only !(lane & 4) store.
+            {
+                const int ki = wave >> 2;
+                const int ni = wave & 3;
+                const int k_tile = k0 / 16 + ki;
+                const int tile_n = n0 / 16 + ni;
+                const uint32_t* packed = (const uint32_t*)
+                    (B + (k_tile * n_tiles + tile_n) * (16 * BITS));
+                FragB frag0, frag1;
+                dq_dispatch<BITS, CB>(packed, lane << 3, frag0, frag1);
+
+                half2 n0l = __shfl_down(frag0[0], 4, 32);
+                half2 n1l = __shfl_down(frag0[1], 4, 32);
+                half2 n2l = __shfl_down(frag1[0], 4, 32);
+                half2 n3l = __shfl_down(frag1[1], 4, 32);
+
+                if (!(lane & 4))
+                {
+                    half* dst = sh_b + (size_t)ki * 16 * SB + ni * 16;
+                    exl3_prefill_store_b16(dst, lane, SB,
+                        frag0[0], frag0[1], frag1[0], frag1[1],
+                        n0l, n1l, n2l, n3l);
+                }
+            }
+            // sh_b is block-shared (each wave reads tiles decoded by other waves),
+            // so the whole block barriers before compute. No mem_fence needed.
+            __syncthreads();
         }
 
-        // Decode the 2x4 weight tiles covering this K slice into sh_b. Wave w
-        // owns tile (ki = w>>2, ni = w&3); the proven shuffle/unswizzle from
-        // exl3_gemm_inner_rdna.hip.h writes it row-major at stride SB. All
-        // lanes call __shfl_down; only !(lane & 4) store.
+        const bool has_next = PREFETCH && (kt + 1 < k_tiles);
+        half4 pref_a[kLoadsA4];
+        // Decoded next-tile B fragments per storing lane: 4 own plus 4 shuffled
+        // half2 (16 halves = one 16x16 tile's share). Dead for (lane & 4) lanes,
+        // which only decode to feed the shuffle and then discard.
+        half2 pref_b_f[4];
+        half2 pref_b_n[4];
+
+        // Prefetch NEXT tile into registers (no LDS touch, no barrier). A uses
+        // the same addresses as staged loads with k0_next; M-tail zero-fills.
+        // B decodes plus shuffles here so packed global reads overlap compute;
+        // storing lanes retain the 8 half2 for the commit below.
+        if (has_next)
         {
-            const int ki = wave >> 2;
-            const int ni = wave & 3;
-            const int k_tile = k0 / 16 + ki;
-            const int tile_n = n0 / 16 + ni;
-            const uint32_t* packed = (const uint32_t*)
-                (B + (k_tile * n_tiles + tile_n) * (16 * BITS));
-            FragB frag0, frag1;
-            dq_dispatch<BITS, CB>(packed, lane << 3, frag0, frag1);
-
-            half2 n0l = __shfl_down(frag0[0], 4, 32);
-            half2 n1l = __shfl_down(frag0[1], 4, 32);
-            half2 n2l = __shfl_down(frag1[0], 4, 32);
-            half2 n3l = __shfl_down(frag1[1], 4, 32);
-
-            if (!(lane & 4))
+            const int k0_next = (kt + 1) * TILE_K;
+            #pragma unroll
+            for (int j = 0; j < kLoadsA4; ++j)
             {
-                half* dst = sh_b + (size_t)ki * 16 * SB + ni * 16;
-                const int r0 = (lane % 4) * 2;
-                const int r1 = r0 + 1;
-                const int r2 = r0 + 8;
-                const int r3 = r0 + 9;
-                const int c0 = (lane / 8) * 2;
-                const int c1 = c0 + 8;
+                const int i = tid + j * NTHREADS;
+                const int e = i * 4;
+                const int row = e / TILE_K;
+                const int col = e % TILE_K;
+                const int grow = m0 + row;
+                half4 v = exl3_prefill_half4_zero();
+                if (grow < size_m)
+                    v = *(const half4*)(A + (size_t)grow * size_k + k0_next + col);
+                pref_a[j] = v;
+            }
+            {
+                const int ki = wave >> 2;
+                const int ni = wave & 3;
+                const int k_tile = k0_next / 16 + ki;
+                const int tile_n = n0 / 16 + ni;
+                const uint32_t* packed = (const uint32_t*)
+                    (B + (k_tile * n_tiles + tile_n) * (16 * BITS));
+                FragB frag0_n, frag1_n;
+                dq_dispatch<BITS, CB>(packed, lane << 3, frag0_n, frag1_n);
 
-                dst[r0 * SB + c0]     = __low2half (frag0[0]);
-                dst[r0 * SB + c0 + 1] = __low2half (n0l);
-                dst[r1 * SB + c0]     = __high2half(frag0[0]);
-                dst[r1 * SB + c0 + 1] = __high2half(n0l);
+                half2 n0l_n = __shfl_down(frag0_n[0], 4, 32);
+                half2 n1l_n = __shfl_down(frag0_n[1], 4, 32);
+                half2 n2l_n = __shfl_down(frag1_n[0], 4, 32);
+                half2 n3l_n = __shfl_down(frag1_n[1], 4, 32);
 
-                dst[r2 * SB + c0]     = __low2half (frag0[1]);
-                dst[r2 * SB + c0 + 1] = __low2half (n1l);
-                dst[r3 * SB + c0]     = __high2half(frag0[1]);
-                dst[r3 * SB + c0 + 1] = __high2half(n1l);
-
-                dst[r0 * SB + c1]     = __low2half (frag1[0]);
-                dst[r0 * SB + c1 + 1] = __low2half (n2l);
-                dst[r1 * SB + c1]     = __high2half(frag1[0]);
-                dst[r1 * SB + c1 + 1] = __high2half(n2l);
-
-                dst[r2 * SB + c1]     = __low2half (frag1[1]);
-                dst[r2 * SB + c1 + 1] = __low2half (n3l);
-                dst[r3 * SB + c1]     = __high2half(frag1[1]);
-                dst[r3 * SB + c1 + 1] = __high2half(n3l);
+                if (!(lane & 4))
+                {
+                    pref_b_f[0] = frag0_n[0];
+                    pref_b_f[1] = frag0_n[1];
+                    pref_b_f[2] = frag1_n[0];
+                    pref_b_f[3] = frag1_n[1];
+                    pref_b_n[0] = n0l_n;
+                    pref_b_n[1] = n1l_n;
+                    pref_b_n[2] = n2l_n;
+                    pref_b_n[3] = n3l_n;
+                }
             }
         }
-
-        // sh_b is block-shared (each wave reads tiles decoded by other waves),
-        // so the whole block barriers before compute. No mem_fence needed.
-        __syncthreads();
 
         #pragma unroll
         for (int s = 0; s < TILE_K / 16; ++s)
@@ -168,7 +254,35 @@ void exl3_packed_prefill_wmma(const half* __restrict__ A, const uint16_t* __rest
                     acc[mr][nc].clear();
                 }
         }
-        if (kt + 1 < k_tiles)
+
+        // Publish prefetched tile for the next iteration. First barrier: all
+        // LDS reads of the current tile are done. Second barrier: the commit
+        // is visible to the whole block. Skipped on the last tile (nothing
+        // prefetched, stores do not use LDS).
+        if (has_next)
+        {
+            __syncthreads();
+            #pragma unroll
+            for (int j = 0; j < kLoadsA4; ++j)
+            {
+                const int i = tid + j * NTHREADS;
+                const int e = i * 4;
+                const int row = e / TILE_K;
+                const int col = e % TILE_K;
+                *(half4*)(sh_a + (size_t)row * SA + col) = pref_a[j];
+            }
+            if (!(lane & 4))
+            {
+                const int ki = wave >> 2;
+                const int ni = wave & 3;
+                half* dst = sh_b + (size_t)ki * 16 * SB + ni * 16;
+                exl3_prefill_store_b16(dst, lane, SB,
+                    pref_b_f[0], pref_b_f[1], pref_b_f[2], pref_b_f[3],
+                    pref_b_n[0], pref_b_n[1], pref_b_n[2], pref_b_n[3]);
+            }
+            __syncthreads();
+        }
+        else if (!PREFETCH && kt + 1 < k_tiles)
             __syncthreads();
     }
 
@@ -211,8 +325,19 @@ static void exl3_packed_prefill_launch(const half* a, const uint16_t* b, void* c
     hipLaunchKernelGGL((exl3_smallm_had<false, false>), dim3((k / 128 + 7) / 8, 1, m),
         dim3(256), 0, stream, a, ah, suh, k, nullptr);
     int m_tiles = (m + 127) / 128;
-    hipLaunchKernelGGL((exl3_packed_prefill_wmma<BITS, CB, FP32>),
-        dim3(n / 64, m_tiles), dim3(256), 0, stream, ah, b, c, m, k, n);
+    // Register staging has a format/geometry-dependent occupancy cost.
+    // Keep the serial kernel for the unqualified regions (including the
+    // two-M-tile K5 case and narrow-row QKV widths). No model-name policy.
+    const bool narrow_pipeline = m <= 128 && (n <= 6144 || n >= 12288);
+    const bool prefetch = (BITS == 2 && CB == 0 && (m > 128 || narrow_pipeline)) ||
+                          (BITS == 5 && CB == 2 &&
+                           (narrow_pipeline || (m >= 512 && n >= 8192)));
+    if (prefetch)
+        hipLaunchKernelGGL((exl3_packed_prefill_wmma<BITS, CB, FP32, true>),
+            dim3(n / 64, m_tiles), dim3(256), 0, stream, ah, b, c, m, k, n);
+    else
+        hipLaunchKernelGGL((exl3_packed_prefill_wmma<BITS, CB, FP32, false>),
+            dim3(n / 64, m_tiles), dim3(256), 0, stream, ah, b, c, m, k, n);
     hipLaunchKernelGGL((exl3_smallm_had<true, FP32>), dim3((n / 128 + 7) / 8, 1, m),
         dim3(256), 0, stream, c, c, svh, n, nullptr);
 }

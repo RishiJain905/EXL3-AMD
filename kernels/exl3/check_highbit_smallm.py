@@ -10,9 +10,37 @@ from quantlab.methods.exl3.oracle import decode_trellis, reconstruct
 from kernels.exl3.check_smallm import environment
 
 
+def _check_unpack_boundaries(torch, extension):
+    """Exercise every packed bit position, including circular-word seams."""
+    records = []
+    for bits in (5, 6):
+        bit_count = 256 * bits
+        # One tile per set-bit position. Eight columns of tiles keep both
+        # reconstructed dimensions divisible by the transform width.
+        walking = np.zeros((bit_count // 8, 8, 16 * bits), dtype=np.int16)
+        words = walking.view(np.uint16).reshape(bit_count, 16 * bits)
+        positions = np.arange(bit_count)
+        words[positions, positions // 16] = (1 << (positions % 16)).astype(np.uint16)
+        fixtures = [('walking-bit', walking),
+                    ('zeros', np.zeros((8, 8, 16 * bits), dtype=np.int16)),
+                    ('ones', np.full((8, 8, 16 * bits), -1, dtype=np.int16))]
+        for cb in (0, 2):
+            for name, packed in fixtures:
+                k, n = packed.shape[0] * 16, packed.shape[1] * 16
+                storage = torch.full((k * n + 32,), 23.0, device='cuda', dtype=torch.float16)
+                decoded = storage[16:-16].view(k, n)
+                extension.reconstruct(decoded, torch.from_numpy(packed).cuda(), bits, False, cb == 2)
+                expected = decode_trellis(packed, bits, codebook=cb)
+                np.testing.assert_array_equal(decoded.float().cpu().numpy(), expected)
+                assert bool((storage[:16] == 23).all() and (storage[-16:] == 23).all())
+                records.append(dict(kind='unpack-boundary', fixture=name, bits=bits,
+                                    codebook=cb, shape=[k, n], exact=True))
+    return records
+
+
 def run_checks(torch, extension, real_slices=()):
     rng = np.random.default_rng(925)
-    records = []
+    records = _check_unpack_boundaries(torch, extension)
     fixtures = []
     for bits in (5, 6):
         packed = rng.integers(-32768, 32768, (8, 16, 16*bits), dtype=np.int16)

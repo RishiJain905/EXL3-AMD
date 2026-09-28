@@ -27,6 +27,8 @@ A model-selectable EXL3 inference runtime for AMD GPUs, with a Python CLI and a 
   context. [9B/27B measurements and supported shapes](docs/HEAD-ATTENTION-PERFORMANCE.md).
 - Automatic compressed vocabulary-head layout for supported decode and MTP
   verification batches, with memory-bounded fallback.
+- Automatic compact GDN recurrent kernels for eligible multi-token ROCm calls.
+  [Native kernel changes, 9B/27B measurements and limits](docs/NATIVE-KERNEL-PERFORMANCE.md).
 - Opt-in [BF16 Qwen3.5 MTP projections and sequential verification attention](docs/MIMO-MTP.md), with explicit compatibility limits.
 - Optional [Qwen3.5 vision and image input](docs/VISION.md), with `--mmproj on|off` startup selection and measured image limits.
 - OpenAI Chat Completions tools for recognized Qwen XML and Hermes JSON templates.
@@ -90,10 +92,14 @@ The server has no overall lifetime timeout. Explicit shutdown and resource/error
 
 [HTTP API](docs/SERVING.md) · [Client-independent function tools](docs/TOOL-CALLING.md)
 
+[27B and MiMo launch commands and flag reference](docs/MODEL-CLI.md).
+
 [llama.cpp flag mapping and limits](docs/LLAMA-CPP-COMPATIBILITY.md).
 [Storage, chunk tuning, and prefix-reuse measurements](docs/PREFILL-PERFORMANCE.md).
 [Native prefill GPU measurements](docs/GPU-PERFORMANCE.md).
 [Full CLI decode and prefill follow-up](docs/RUNTIME-PERFORMANCE.md).
+[Residual fusion and larger MTP graph investigation](docs/FUSION-DECODE-PERFORMANCE.md).
+[Native projection, prefill and GDN kernel qualification](docs/NATIVE-KERNEL-PERFORMANCE.md).
 [Mul1 model, speed and occupied 120K validation](docs/MUL1-VALIDATION.md).
 
 ## Main flags

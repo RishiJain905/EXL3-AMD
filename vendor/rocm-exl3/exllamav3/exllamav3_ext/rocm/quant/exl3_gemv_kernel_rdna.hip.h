@@ -285,6 +285,9 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_direct
     float accA = 0.0f;                 // column cA
     float accB = 0.0f;                 // column cB = cA + 8
 
+    // Overlap adjacent tiles without changing the fdot2 accumulation order.
+    // Low-bit formats keep a rolled loop: extra live fragments slowed K2.
+    #pragma clang loop unroll_count(bits >= 4 && bits <= 6 ? 2 : 1)
     for (int k_tile = kb_begin; k_tile < kb_end; k_tile++)
     {
         const uint32_t* b_ptr = (const uint32_t*)
